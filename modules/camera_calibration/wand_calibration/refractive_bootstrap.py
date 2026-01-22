@@ -127,9 +127,8 @@ class PinholeBootstrapP0Config:
     """Configuration for P0 bootstrap."""
     wand_length_mm: float = 10.0
     ui_focal_px: float = 9000.0  # UI-provided focal length (FROZEN)
-    max_iterations: int = 100
-    ftol: float = 1e-6
-    xtol: float = 1e-6
+    ftol: float = 1e-8
+    xtol: float = 1e-8
 
 
 class PinholeBootstrapP0:
@@ -389,9 +388,8 @@ class PinholeBootstrapP0:
             x_scale='jac',
             f_scale=1.0,
             verbose=1,
-            ftol=1e-4,
-            xtol=1e-4,
-            max_nfev=100,
+            ftol=self.config.ftol,
+            xtol=self.config.xtol,
         )
 
         
@@ -721,8 +719,8 @@ class PinholeBootstrapP0:
             result = least_squares(
                 residuals_cam, x0_cam,
                 method='lm',
-                ftol=1e-5,
-                max_nfev=100
+                ftol=self.config.ftol,
+                xtol=self.config.xtol,
             )
             
             rvec_opt = result.x[:3]
@@ -993,9 +991,8 @@ class PinholeBootstrapP0:
             x_scale='jac',
             f_scale=1.0,
             verbose=1,
-            ftol=1e-4,
-            xtol=1e-4,
-            max_nfev=200,
+            ftol=self.config.ftol,
+            xtol=self.config.xtol,
         )
         
         print(f"  Phase 3 cost: {result.cost:.2e}")

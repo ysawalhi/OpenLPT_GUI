@@ -5,6 +5,7 @@ import logging
 import json
 from datetime import datetime
 from pathlib import Path
+import random
 
 try:
     import pyopenlpt as lpt
@@ -278,7 +279,7 @@ class RefractiveWandCalibrator:
             cam_params: Current camera params (for hash validation)
             
         Returns:
-            (window_planes, True) if cache is valid
+            (window_planes, True) if cache is valid & loaded
             (None, False) if cache is invalid/missing
         """
         import json
@@ -354,7 +355,7 @@ class RefractiveWandCalibrator:
                     print(f"[P1][CACHE] RI mismatch for window {wid}: {cached_ri} != {current_ri}")
                     return None, False
             
-            # Validate normal is unit length
+        # Validate normal is unit length
             plane_n = np.array(wdata["plane_normal"], dtype=np.float64)
             if abs(np.linalg.norm(plane_n) - 1.0) > 0.01:
                 print(f"[P1][CACHE] Invalid normal for window {wid}: not unit length")
@@ -381,9 +382,10 @@ class RefractiveWandCalibrator:
         print(f"[P1][CACHE] Loaded plane cache successfully from: {path}")
         print(f"  Windows: {list(window_planes.keys())}")
         print(f"  Timestamp: {cache.get('timestamp', 'unknown')}")
+        print(f"  Note: Using cached planes with FRESH dataset observations.")
         if summary:
-            print(f"  Ray RMSE: {summary.get('ray_residual_rmse', 'N/A'):.4f}")
-            print(f"  Wand RMSE: {summary.get('wand_length_rmse', 'N/A'):.4f}")
+            print(f"  [Prior] Ray RMSE: {summary.get('ray_residual_rmse', 'N/A'):.4f}")
+            print(f"  [Prior] Wand RMSE: {summary.get('wand_length_rmse', 'N/A'):.4f}")
         
         return window_planes, True
 
@@ -1155,17 +1157,10 @@ class RefractiveWandCalibrator:
             
         return out_dir
 
-    def _update_camera_cpp_via_assign(self, cam_obj, pinplate_params_dict):
+    def _update_camera_cpp_via_assign(self, cam_obj, plane_pt, plane_n, n_air, n_glass, n_medium, thickness):
         """
         Force update a C++ Camera object by explicitly daisy-chaining assignments.
         This handles pybind11's value-copy behavior for nested structs.
-        
-        Logic:
-          pp = cam.param         (Copy A)
-          pl = pp.plane          (Copy B)
-          pl.pt = ...            (Modify B)
-          pp.plane = pl          (Update A with B)
-          cam.param = pp         (Update Camera with A)
         """
         # 1. Get Main Param Copy
         pp = cam_obj._pinplate_param
@@ -1174,28 +1169,20 @@ class RefractiveWandCalibrator:
         pl = pp.plane
         
         # 3. Modify Plane Copy
-        # Inputs are lists [x,y,z], need to match pybind type (likely list/array compatible)
-        # ERROR FIX: Must convert list to lpt.Pt3D explicit object if pybind doesn't auto-convert
-        # Try lpt.Pt3D(x, y, z) constructor if available, or just verify type.
-        # Given error: (self: pyopenlpt.Plane3D, arg0: pyopenlpt.Pt3D) -> None
-        # We must instantiate lpt.Pt3D.
+        # Use lpt.Pt3D constructors as required by pybind11
+        pl.pt = lpt.Pt3D(plane_pt[0], plane_pt[1], plane_pt[2])
+        pl.norm_vector = lpt.Pt3D(plane_n[0], plane_n[1], plane_n[2])
         
-        pt_list = pinplate_params_dict['plane_pt']
-        n_list = pinplate_params_dict['plane_n']
-        
-        # Check if lpt is imported available? It is at top level.
-        # Use * unpacking if constructor takes 3 args, or list if 1 arg.
-        # Usually Pt3D(x, y, z).
-        pl.pt = lpt.Pt3D(pt_list[0], pt_list[1], pt_list[2])
-        pl.norm_vector = lpt.Pt3D(n_list[0], n_list[1], n_list[2])
-        
-        # 4. Assign Plane Back to Param (Crucial Step!)
+        # 4. Assign Plane and Media Back to Param
         pp.plane = pl
+        pp.refract_array = [n_air, n_glass, n_medium]
+        pp.w_array = [thickness]
+        pp.n_plate = 1
         
-        # 5. Assign Param Back to Camera (Crucial Step!)
+        # 5. Assign Param Back to Camera
         cam_obj._pinplate_param = pp
         
-        # 6. Trigger internal update if needed
+        # 6. Trigger internal update
         cam_obj.updatePt3dClosest()
 
     def optimize_planes(self, dataset, cam_to_window, window_media, window_planes, cam_params, cams_cpp, active_cam_ids, verbosity: int = 0, progress_callback=None):
@@ -1286,11 +1273,127 @@ class RefractiveWandCalibrator:
              thick = window_media.get(wid, {}).get('thickness', 0)
              print(f"  Win {wid}: d_key={d_key:.2f}mm, thick={thick:.1f}mm, n={n.round(4)}")
 
+        # [CRITICAL] Final Sync to C++ objects (Ensures next stage stars from P1 results)
+        optimizer._apply_planes_to_cpp(opt_planes)
+        
         if verbosity >= 1:
             optimizer.print_diagnostics()
             print("\n[Refractive] P1 Optimization Complete.")
         
         return opt_planes
+
+    def _init_cams_cpp_in_memory(self, cam_params, window_media, cam_to_window, window_planes):
+        """
+        Initialize lpt.Camera objects directly in memory as PINPLATE models.
+        Bypasses the 'export to file and reload' cycle.
+        Ensures perfect geometric consistency with the C++ engine.
+        """
+        cams_cpp = {}
+        if lpt is None:
+            print("[Warning] pyopenlpt not available. Skipping C++ initialization.")
+            return cams_cpp
+
+        print("\n[Refractive] Initializing C++ Camera objects in-memory...")
+        for cid in sorted(cam_params.keys()):
+            # 1. Create a new default Camera instance
+            cam = lpt.Camera()
+            
+            # 2. Set Model Type to PINPLATE
+            # Matches CameraType enum in Camera.h (PINHOLE=0, POLYNOMIAL=1, PINPLATE=2)
+            try:
+                cam._type = lpt.PINPLATE
+            except AttributeError:
+                cam._type = 2 # Fallback
+            
+            # 3. Access the PinplateParam struct
+            pp = cam._pinplate_param
+            
+            # Unpack parameters
+            p = cam_params[cid] 
+            rvec, tvec = p[0:3], p[3:6]
+            f, cx, cy = p[6], p[7], p[8]
+            k1, k2 = p[9], p[10]
+            
+            wid = cam_to_window[cid]
+            media = window_media[wid]
+            thick_mm = media.get('thickness', 10.0)
+            n_air = media.get('n_air', media.get('n1', 1.0))
+            n_win = media.get('n_window', media.get('n2', 1.49))
+            n_obj = media.get('n_object', media.get('n3', 1.33))
+
+            # Image Size
+            image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
+            pp.n_row, pp.n_col = int(image_size[0]), int(image_size[1])
+
+            # Intrinsics (K)
+            K = lpt.MatrixDouble(3, 3, 0.0)
+            K[0, 0], K[1, 1] = float(f), float(f)
+            K[0, 2], K[1, 2] = float(cx), float(cy)
+            K[2, 2] = 1.0
+            pp.cam_mtx = K
+
+            # Distortion
+            pp.dist_coeff = [float(k1), float(k2), 0.0, 0.0, 0.0]
+            pp.is_distorted = (abs(k1) > 1e-9 or abs(k2) > 1e-9)
+            pp.n_dist_coeff = 5
+
+            # Extrinsics (Forward)
+            R, _ = cv2.Rodrigues(rvec)
+            R_lpt = lpt.MatrixDouble(3, 3, 0.0)
+            for i in range(3):
+                for j in range(3):
+                    R_lpt[i, j] = float(R[i, j])
+            pp.r_mtx = R_lpt
+            pp.t_vec = lpt.Pt3D(float(tvec[0]), float(tvec[1]), float(tvec[2]))
+
+            # Extrinsics (Inverse)
+            R_inv = R.T
+            t_inv = -R_inv @ tvec
+            R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
+            for i in range(3):
+                for j in range(3):
+                    R_inv_lpt[i, j] = float(R_inv[i, j])
+            pp.r_mtx_inv = R_inv_lpt
+            pp.t_vec_inv = lpt.Pt3D(float(t_inv[0]), float(t_inv[1]), float(t_inv[2]))
+
+            # Plane Geometry
+            wp = window_planes[wid]
+            if 'plane_pt' not in wp or 'plane_n' not in wp:
+                raise RuntimeError(f"Cam {cid} (Win {wid}): Missing initialized plane data ('plane_pt' or 'plane_n') in window_planes.")
+            
+            plane_pt = np.array(wp['plane_pt'])
+            plane_norm = np.array(wp['plane_n'])
+            
+            # [CRITICAL] Coordinate Alignment: Shift to Farthest Interface for C++ engine
+            p_farthest = plane_pt + plane_norm * thick_mm
+            
+            pl = pp.plane
+            pl.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
+            pl.norm_vector = lpt.Pt3D(float(plane_norm[0]), float(plane_norm[1]), float(plane_norm[2]))
+            pp.plane = pl
+
+            # Refract Array & Thickness
+            # Convention: [n_obj, n_win, n_air] (Farthest -> Nearest)
+            pp.refract_array = [float(n_obj), float(n_win), float(n_air)]
+            pp.w_array = [float(thick_mm)]
+            pp.n_plate = 1
+            
+            # Pre-calculate Max Refract Ratio for C++ ray-tracer radius check
+            pp.refract_ratio_max = max(n_obj / n_win, n_obj / n_air, 1.0)
+
+            # Solver Config
+            pp.proj_tol = 1e-6
+            pp.proj_nmax = 100
+            pp.lr = 0.1
+
+            # Commit Struct and Refresh Internal State
+            cam._pinplate_param = pp
+            cam.updatePt3dClosest()
+            
+            cams_cpp[cid] = cam
+
+        print(f"  Initialized {len(cams_cpp)} C++ Camera objects.")
+        return cams_cpp
 
     def calibrate(self, num_windows, cam_to_window, window_media, out_path, verbosity: int = 1, progress_callback=None):
 
@@ -1438,10 +1541,10 @@ class RefractiveWandCalibrator:
                     # params is [rvec(3), tvec(3)]
                     cam_params[cid] = np.concatenate([params, [initial_focal, cx, cy, 0.0, 0.0]])
                 
-                # Extract 3D points from report
                 points_3d = report.get('points_3d', {})
                 X_A_scaled = {fid: XA for fid, (XA, XB) in points_3d.items()}
                 X_B_scaled = {fid: XB for fid, (XA, XB) in points_3d.items()}
+                
                 active_cam_ids = list(cam_params.keys())
                 err_px = {}  # P0 doesn't compute per-camera pixel error
                 
@@ -1463,6 +1566,11 @@ class RefractiveWandCalibrator:
                         print(f"[BOOT][CACHE] Saved bootstrap cache to: {bootstrap_cache_path}")
                     except Exception as e:
                         print(f"[BOOT][CACHE] Warning: Failed to save cache: {e}")
+            
+            
+            # [CRITICAL] Ensure bootstrap points are always in dataset for P1 d_max
+            dataset['X_A_bootstrap'] = X_A_scaled
+            dataset['X_B_bootstrap'] = X_B_scaled
             
             inactive_cam_ids = [cid for cid in dataset['cam_ids'] if cid not in active_cam_ids]
             
@@ -1660,14 +1768,10 @@ class RefractiveWandCalibrator:
                  
         print("-" * 30 + "\n")
 
-        try:
-            stored_dir = self.export_camfile_with_refraction(out_path, cam_params, window_media, cam_to_window, self.window_planes)
-            print(f"[Refractive] Configuration snapshot exported to: {stored_dir}")
-        except Exception as e:
-            print(f"  [Error] Export failed: {e}")
-            raise
-
         # === Phase 2/3: Build Refracted Rays (C++ Authority) ===
+        # REPLACED: Export/Reload loop with direct in-memory initialization
+        cams_cpp = self._init_cams_cpp_in_memory(cam_params, window_media, cam_to_window, self.window_planes)
+        
         print("\n" + "-"*30)
         print("[Refractive] Phase 2/3: Building Rays (C++ Kernel)")
         
@@ -1677,16 +1781,6 @@ class RefractiveWandCalibrator:
                 progress_callback("Phase 2/3: Building Rays", 0.0, 0.0, 0.0)
             except:
                 pass
-
-        
-        cams_cpp = {}
-        for cid in dataset['cam_ids']:
-            cam_path = os.path.join(stored_dir, f"cam{cid}.txt")
-            if lpt and os.path.exists(cam_path):
-                try:
-                    cams_cpp[cid] = lpt.Camera(cam_path)
-                except Exception as e:
-                    print(f"  [Warning] Cam {cid} C++ load failed: {e}")
 
 
         # === Phase P1: Refractive Plane Optimization ===
@@ -1736,33 +1830,15 @@ class RefractiveWandCalibrator:
                 dataset, cam_params, p1_diagnostics
             )
         
-        # Re-export camfiles with optimized planes and reload C++ objects
-        if verbosity >= 0:
-            print("\n[Refractive] Exporting P1-optimized parameters to camFiles...")
-            
-        try:
-            stored_dir = self.export_camfile_with_refraction(
-                out_path, 
-                cam_params, 
-                window_media, 
-                cam_to_window, 
-                window_planes=self.window_planes
-            )
-            if verbosity >= 1:
-                print(f"  Updated camFiles in: {stored_dir}")
-            
-            # Reload C++ cameras with updated planes
-            for cid in dataset['cam_ids']:
-                cam_path = os.path.join(stored_dir, f"cam{cid}.txt")
-                if lpt and os.path.exists(cam_path):
-                    try:
-                        cams_cpp[cid] = lpt.Camera(cam_path)
-                    except Exception as e:
-                        print(f"  [Warning] Cam {cid} reload failed: {e}")
-        except Exception as e:
-            print(f"  [Error] Plane export failed: {e}")
 
         # === Phase PR4: Bundle Adjustment (Selective BA) ===
+        # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
+        if X_A_scaled and X_B_scaled:
+            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="PR4 Pre-Calc")
+            dataset['est_radius_small_mm'] = rs
+            dataset['est_radius_large_mm'] = rl
+            print(f"[PR4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
+
         # Pass verbosity to config
         pr4_config = PR4Config(
             skip_pr4=False,
@@ -1795,63 +1871,15 @@ class RefractiveWandCalibrator:
             self.window_planes, cam_params = pr4_optimizer.optimize()
             # Save PR4 cache
             pr4_optimizer.save_cache(out_path)
-        
-        # [Refractive][CAMFILE] Export CamFiles (Initial / P1)
-        if verbosity >= 0:
-             print("\n[Refractive][CAMFILE] Exporting PR4-optimized parameters to camFiles...")
-             
-        try:
-            # Pass self.window_planes explicitly
-            stored_dir = self.export_camfile_with_refraction(
-                out_path, 
-                cam_params, 
-                window_media, 
-                cam_to_window, 
-                window_planes=self.window_planes
-            )
-            if verbosity >= 1:
-                print(f"  Updated camFiles in: {stored_dir}")
-            
-            # Reload C++ cameras with PR4-optimized planes AND VERIFY
-            for cid in dataset['cam_ids']:
-                cam_path = os.path.join(stored_dir, f"cam{cid}.txt")
-                if lpt and os.path.exists(cam_path):
-                    try:
-                        cams_cpp[cid] = lpt.Camera(cam_path)
-                        
-                        # --- CONSISTENCY CHECK ---
-                        # Verify plane_pt shift and unit normal
-                        pp = cams_cpp[cid]._pinplate_param
-                        pl = pp.plane
-                        
-                        n_cpp = np.array([pl.norm_vector[0], pl.norm_vector[1], pl.norm_vector[2]])
-                        pt_cpp = np.array([pl.pt[0], pl.pt[1], pl.pt[2]])
-                        
-                        # Fix: PinPlateParam uses w_array for thickness
-                        w_arr = pp.w_array
-                        thick_cpp = w_arr[0] if w_arr else 0.0
-                        
-                        wid = cam_to_window.get(cid, 0)
-                        wp = self.window_planes.get(wid)
-                        
-                        if wp:
-                            n_py = np.array(wp['plane_n'])
-                            pt_py = np.array(wp['plane_pt'])
-                            
-                            # Shift along n
-                            # s = dot(n, pt_cpp - pt_py)
-                            shift = np.dot(n_cpp, pt_cpp - pt_py)
-                            norm_n = np.linalg.norm(n_cpp)
-                            
-                            if verbosity >= 0: # Always check, print summary per cam
-                                print(f"[CAMFILE][CHECK] Cam {cid}: shift={shift:.3f}mm (exp. {thick_cpp:.3f}mm); ||n||={norm_n:.6f} ok")
-                                
-                    except Exception as e:
-                        print(f"  [Warning] Cam {cid} reload/check failed: {e}")
-        except Exception as e:
-            print(f"  [Error] PR4 export failed: {e}")
 
         # === Phase PR5: Robust Bundle Adjustment (Geometric) ===
+        # [USER REQUEST] Re-estimate Radii with latest params (PR4 result)
+        if X_A_scaled and X_B_scaled:
+            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="PR5 Pre-Calc")
+            dataset['est_radius_small_mm'] = rs
+            dataset['est_radius_large_mm'] = rl
+            print(f"[PR5] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
+
         # Optimize planes, thickness, intrinsics, extrinsics with strong priors
         pr5_config = PR5Config(
             pr5_stage=2,
@@ -1868,7 +1896,8 @@ class RefractiveWandCalibrator:
             window_planes=self.window_planes,
             wand_length=wand_len_target,
             config=pr5_config,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            freeze_table=pr4_optimizer.freeze_table if pr4_optimizer else None
         )
 
         
@@ -1889,20 +1918,132 @@ class RefractiveWandCalibrator:
             # Run Optimization
             self.window_planes, cam_params, window_media = pr5_optimizer.optimize()
             # Save Cache
-            pr5_optimizer.save_cache(out_path)
-            
-        # Re-export camFiles with PR5 results
+
+        # Re-export camFiles with Final (PR5 or Polish) results
         if verbosity >= 0:
-             print("\n[Refractive] Exporting PR5-optimized parameters to camFiles...")
+             print("\n[Refractive] Exporting Final parameters to camFiles...")
         
         # Coordinate Alignment: Align Y-axis with plane intersection line
         if len(self.window_planes) >= 2:
             try:
-                cam_params, self.window_planes, _, R_align = align_world_y_to_plane_intersection(
-                    self.window_planes, cam_params, points_3d=None
+                # [VERIIFICATION PRE-STEP]
+                # Pick a verification frame to validate coordinate transformation vs C++ engine consistency
+                v_fid = None
+                v_X_raw = None
+                if dataset['frames']:
+                    v_fid = dataset['frames'][len(dataset['frames'])//2] # Pick middle frame
+                    # Triangulate using CURRENT (Unaligned) C++ objects
+                    v_rays = []
+                    for cid in cams_cpp:
+                        if cid not in cam_params: continue
+                        wid = cam_to_window.get(cid)
+                        uv = dataset['obsA'][v_fid].get(cid)
+                        if uv is not None:
+                            r = build_pinplate_ray_cpp(cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=v_fid, endpoint="A")
+                            if r.valid: v_rays.append(r)
+                    
+                    if len(v_rays) >= 2:
+                         v_X_raw, _, _, _ = triangulate_point(v_rays)
+                         if verbosity >= 1:
+                             print(f"[Verification] Frame {v_fid} Raw 3D (Unaligned): {v_X_raw}")
+
+                # [ALIGNMENT PRE-STEP] Collect all 3D points for Centering
+                points_3d_for_align = []
+                obsA = dataset.get('obsA', {})
+                obsB = dataset.get('obsB', {})
+                
+                def _tri_all(obs_dict):
+                    pts = []
+                    for fid, cam_obs in obs_dict.items():
+                        rays = []
+                        for cid, uv in cam_obs.items():
+                            if cid in cams_cpp:
+                                wid = cam_to_window.get(cid)
+                                r = build_pinplate_ray_cpp(cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=fid, endpoint="?")
+                                if r.valid: rays.append(r)
+                        if len(rays) >= 2:
+                            X, _, valid, _ = triangulate_point(rays)
+                            if valid: pts.append(X)
+                    return pts
+
+                points_3d_for_align.extend(_tri_all(obsA))
+                points_3d_for_align.extend(_tri_all(obsB))
+                
+                if verbosity >= 1:
+                    print(f"[Coordinate Alignment] Collected {len(points_3d_for_align)} points for centroid.")
+
+                cam_params, self.window_planes, _, R_align, t_shift = align_world_y_to_plane_intersection(
+                    self.window_planes, cam_params, points_3d=points_3d_for_align
                 )
                 if verbosity >= 1:
-                    print("[Coordinate Alignment] Y-axis aligned with plane intersection line.")
+                    print("[Coordinate Alignment] Aligned Y-axis and Centered at Cloud Centroid.")
+                
+                # [USER REQUEST] Sync aligned parameters back to C++ memory
+                # This ensures the in-memory state matches the exported camFiles.
+                # Reuse PR5 optimizer's sync logic if available, or manual apply.
+                if pr5_optimizer:
+                    # Update optimizer's internal state first (optional but good practice)
+                    pr5_optimizer.cam_params = cam_params
+                    pr5_optimizer.window_planes = self.window_planes
+                    
+                    # Use _apply_params_to_cpp for reliable C++ sync
+                    # Build parameter maps expected by _apply_params_to_cpp
+                    planes_update = {}
+                    for wid in pr5_optimizer.window_ids:
+                        # d_delta=0, alpha=0, beta=0 since planes are already updated in window_planes
+                        planes_update[wid] = (0.0, 0.0, 0.0)
+                    
+                    thick_map = {wid: window_media[wid]['thickness'] for wid in pr5_optimizer.window_ids}
+                    f_map = {cid: cam_params[cid][6] for cid in pr5_optimizer.active_cam_ids}
+                    rvec_map = {cid: cam_params[cid][0:3] for cid in pr5_optimizer.active_cam_ids}
+                    tvec_map = {cid: cam_params[cid][3:6] for cid in pr5_optimizer.active_cam_ids}
+                    
+                    # Call the reliable update method
+                    pr5_optimizer._apply_params_to_cpp(planes_update, thick_map, f_map, rvec_map, tvec_map)
+
+                    if verbosity >= 1:
+                         print("[Coordinate Alignment] Synced C++ objects with aligned parameters.")
+                         
+                    # [USER REQUEST] Also update PR5 cache with aligned parameters
+                    # pr5_optimizer.cam_params and .window_planes were updated above
+                    pr5_optimizer.save_cache(out_path)
+                    if verbosity >= 1:
+                        print(f"[Coordinate Alignment] Saved ALIGNED parameters to PR5 cache: {out_path}")
+
+                # [VERIFICATION POST-STEP]
+                # Validate the consistency
+                if v_X_raw is not None and R_align is not None:
+                    # 1. Expected Position (Translation + Rotation)
+                    # X_new = R @ (X_old + t_shift)
+                    if t_shift is None: t_shift = np.zeros(3)
+                    v_X_expected = R_align @ (v_X_raw + t_shift)
+                    
+                    # 2. Recalculated Position (Using Updated C++ Cams)
+                    v_rays_new = []
+                    for cid in cams_cpp:
+                        if cid not in cam_params: continue
+                        wid = cam_to_window.get(cid)
+                        uv = dataset['obsA'][v_fid].get(cid)
+                        if uv is not None:
+                            # Note: build_pinplate_ray_cpp uses the internal state of cams_cpp[cid]
+                            r = build_pinplate_ray_cpp(cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=v_fid, endpoint="A")
+                            if r.valid: v_rays_new.append(r)
+                    
+                    if len(v_rays_new) >= 2:
+                        v_X_recalc, _, _, _ = triangulate_point(v_rays_new)
+                        
+                        diff = np.linalg.norm(v_X_recalc - v_X_expected)
+                        print(f"\n[Verification] End-to-End Consistency Check (Frame {v_fid}):")
+                        print(f"  X_raw (Unaligned) : {v_X_raw}")
+                        print(f"  X_expected (R*X)  : {v_X_expected}")
+                        print(f"  X_recalc (C++ Tri): {v_X_recalc}")
+                        print(f"  Difference        : {diff:.6f} mm")
+                        
+                        if diff < 1e-4:
+                            print("  [SUCCESS] C++ Engine is perfectly synced with Coordinate Alignment!")
+                        else:
+                            print("  [WARNING] Discrepancy detected! Check C++ parameter updates.")
+
             except Exception as e:
                 print(f"[Coordinate Alignment] Warning: alignment failed: {e}")
         
@@ -2365,22 +2506,84 @@ class RefractiveWandCalibrator:
         if not loaded_pr5:  # Only if we ran optimization (not loaded from cache)
             pr5_optimizer.save_cache(out_path, points_3d=all_points_3d)
 
-        # === FINAL COORDINATE ALIGNMENT FOR VISUALIZATION ===
-        # Align Y-axis with plane intersection line for 3D view
-        if len(self.window_planes) >= 2:
+        # [Coordinate Alignment] Duplicate block removed. 
+        # Alignment is already performed after optimization (Phase 5).
+
+        # === FINAL CLOSE-LOOP VERIFICATION (USER REQUEST) ===
+        if tri_data and cam_params:
             try:
-                cam_params, self.window_planes, aligned_pts, R_align = align_world_y_to_plane_intersection(
-                    self.window_planes, cam_params, points_3d=all_points_3d
-                )
-                # Update report and dataset with aligned data
-                report['window_planes'] = {wid: {k: v.tolist() if isinstance(v, np.ndarray) else v 
-                                                 for k, v in pl.items()} 
-                                           for wid, pl in self.window_planes.items()}
-                if aligned_pts is not None:
-                    dataset['points_3d'] = aligned_pts
-                print("[Coordinate Alignment] Y-axis aligned with plane intersection for visualization.")
+                print("\n" + "="*50)
+                print("[Verification] Starting Final Close-loop Validation...")
+                
+                # 1. Sync one more time to ensure in-memory cams match ALIGNED parameters
+                v_cams_cpp = self._init_cams_cpp_in_memory(cam_params, window_media, cam_to_window, self.window_planes)
+                
+                # 2. Pick a random valid frame
+                valid_fids = [fid for fid, res in tri_data.items() if res['validA'] and res['validB']]
+                if not valid_fids:
+                    valid_fids = list(tri_data.keys())
+                
+                v_fid = random.choice(valid_fids)
+                v_res = tri_data[v_fid]
+                
+                # 3. Calculate offset in dataset['points_3d']
+                offset = 0
+                for f in dataset['frames']:
+                    if f == v_fid: break
+                    if tri_data[f]['XA'] is not None: offset += 1
+                    if tri_data[f]['XB'] is not None: offset += 1
+                
+                v_idx_A = offset if v_res['XA'] is not None else -1
+                v_idx_B = (offset + (1 if v_res['XA'] is not None else 0)) if v_res['XB'] is not None else -1
+                
+                print(f"[Verification] Selected Frame: {v_fid}")
+                
+                for label, k, v_idx in [('A', 0, v_idx_A), ('B', 1, v_idx_B)]:
+                    if v_idx == -1: continue
+                    
+                    # Manual Triangulation Path
+                    v_rays = []
+                    obs_map = dataset['obsA' if k==0 else 'obsB'][v_fid]
+                    for cid, uv in obs_map.items():
+                        if cid in v_cams_cpp:
+                            r = build_pinplate_ray_cpp(v_cams_cpp[cid], uv, cam_id=cid, window_id=cam_to_window[cid], frame_id=v_fid, endpoint=label)
+                            if r.valid: v_rays.append(r)
+                    
+                    if len(v_rays) >= 2:
+                        X_manual, _, _, _ = triangulate_point(v_rays)
+                        # Calculate Ray RMSE for this point
+                        resids = [point_to_ray_dist(X_manual, r.o, r.d) for r in v_rays]
+                        ray_rmse = np.sqrt(np.mean(np.square(resids)))
+                        
+                        # Aligned Point Path (from dataset)
+                        # Dataset stores flattened [x, y, z, x, y, z...], so slice with stride 3
+                        X_aligned = np.array(dataset['points_3d'][v_idx*3 : v_idx*3+3])
+                        
+                        # Comparison
+                        dist = np.linalg.norm(X_manual - X_aligned)
+                        
+                        print(f"  Point {label}:")
+                        print(f"    Manual 3D (Refract) : {X_manual.round(4)}")
+                        print(f"    Aligned 3D (Dataset): {X_aligned.round(4)}")
+                        print(f"    Ray RMSE            : {ray_rmse:.6f} mm ({len(v_rays)} cams)")
+                        print(f"    L2 Distance Error   : {dist:.8e} mm")
+                        
+                        if dist < 1e-6:
+                            print(f"    [OK] Point {label} is perfectly consistent.")
+                        else:
+                            print(f"    [WARNING] Point {label} has discrepancy!")
+
+                # Calculate Wand Length for this frame
+                if v_idx_A != -1 and v_idx_B != -1:
+                    pA = np.array(dataset['points_3d'][v_idx_A*3 : v_idx_A*3+3])
+                    pB = np.array(dataset['points_3d'][v_idx_B*3 : v_idx_B*3+3])
+                    L_dataset = np.linalg.norm(pB - pA)
+                    print(f"  Frame Wand Length: {L_dataset:.4f} mm (Target: {wand_len_target:.4f} mm, Error: {L_dataset-wand_len_target:.4f} mm)")
+                
+                print("="*50 + "\n")
             except Exception as e:
-                print(f"[Coordinate Alignment] Warning: final alignment failed: {e}")
+                print(f"[Verification] Close-loop check failed: {e}")
+                # import traceback; traceback.print_exc()
 
         return True, cam_params, report, dataset
 

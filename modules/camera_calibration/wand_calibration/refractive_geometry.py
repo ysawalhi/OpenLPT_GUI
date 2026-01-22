@@ -78,27 +78,6 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
                 # print(f"[Refractive] lineOfSight: Input ({u:.1f},{v:.1f}) pixel coords")
                 _PROBE_LOGGED = True
             
-            # === [C] RAY ORIGIN AUDIT (first 10 rays) ===
-            _RAY_ORIGIN_AUDIT_COUNT += 1
-            if _RAY_ORIGIN_AUDIT_COUNT <= 10:
-                # Get camera center from t_vec_inv
-                try:
-                    pp = cam._pinplate_param
-                    t_vec_inv = pp.t_vec_inv
-                    C_cam = np.array([t_vec_inv[0], t_vec_inv[1], t_vec_inv[2]])
-                    dist_O_C = np.linalg.norm(o - C_cam)
-                    
-                    if not _RAY_ORIGIN_AUDIT_PRINTED:
-                        print("\n=== RAY ORIGIN AUDIT (first 10 rays) ===")
-                        _RAY_ORIGIN_AUDIT_PRINTED = True
-                    
-                    print(f"Ray {_RAY_ORIGIN_AUDIT_COUNT}: O=[{o[0]:.2f},{o[1]:.2f},{o[2]:.2f}], C_cam=[{C_cam[0]:.2f},{C_cam[1]:.2f},{C_cam[2]:.2f}], ||O-C||={dist_O_C:.3f}mm")
-                    
-                    if _RAY_ORIGIN_AUDIT_COUNT == 10:
-                        print("=== END RAY ORIGIN AUDIT ===\n")
-                except:
-                    pass  # Silently skip if C_cam extraction fails
-            
             # Sanity check on direction z (should be >> 0 for forward facing)
             d_norm = normalize(d)
             if abs(d_norm[2]) < 0.1:
@@ -392,30 +371,35 @@ def apply_coordinate_rotation(
     R_world: np.ndarray,
     cam_params: dict,
     window_planes: dict,
-    points_3d: Optional[list] = None
+    points_3d: Optional[list] = None,
+    t_shift: Optional[np.ndarray] = None
 ) -> Tuple[dict, dict, Optional[list]]:
     """
-    Apply world coordinate rotation to all calibration data.
+    Apply world coordinate rotation AND translation to all calibration data.
     
-    Transforms all coordinates so that Y-axis aligns with a specified direction.
+    Transforms all coordinates: P_new = R_world @ (P_old + t_shift)
     
     Args:
-        R_world: 3x3 rotation matrix to apply to world coordinates
+        R_world: 3x3 rotation matrix
         cam_params: Dict of cam_id -> [rvec(3), tvec(3), ...]
         window_planes: Dict of window_id -> {'plane_pt': [...], 'plane_n': [...]}
         points_3d: Optional list of 3D points
+        t_shift: Optional (3,) vector to shift world origin BEFORE rotation.
         
     Returns:
         (new_cam_params, new_window_planes, new_points_3d)
     """
     import cv2
     
+    if t_shift is None:
+        t_shift = np.zeros(3)
+    else:
+        t_shift = np.array(t_shift).flatten()
+    
     new_cam_params = {}
     new_window_planes = {}
     
     # Transform camera extrinsics
-    # If R_old transforms world->camera, new is: R_new = R_old @ R_world.T
-    # t_new = R_world @ t_old (since t is in camera frame pointing to origin)
     for cid, params in cam_params.items():
         params = np.array(params).flatten()
         rvec_old = params[0:3]
@@ -424,15 +408,14 @@ def apply_coordinate_rotation(
         R_old = cv2.Rodrigues(rvec_old.reshape(3, 1))[0]
         
         # C_world = -R_old.T @ t_old (camera center in world)
-        # C_new = R_world @ C_world
-        # t_new = -R_new @ C_new = -R_new @ R_world @ (-R_old.T @ t_old)
+        # C_new = R_world @ (C_world + t_shift)
         
-        # Simpler: R_new = R_old @ R_world.T, t_new stays same in new world
+        # Rotations just compose: R_new = R_old @ R_world.T
         R_new = R_old @ R_world.T
         
-        # Camera center transforms: C_new = R_world @ C_old
+        # Camera center transforms
         C_old = -R_old.T @ tvec_old
-        C_new = R_world @ C_old
+        C_new = R_world @ (C_old + t_shift)
         
         # t_new = -R_new @ C_new
         t_new = -R_new @ C_new
@@ -449,7 +432,9 @@ def apply_coordinate_rotation(
         pt_old = np.array(pl['plane_pt'])
         n_old = np.array(pl['plane_n'])
         
-        pt_new = R_world @ pt_old
+        # Plane point shifts and rotates
+        pt_new = R_world @ (pt_old + t_shift)
+        # Normal vector only rotates
         n_new = R_world @ n_old
         
         new_window_planes[wid] = {
@@ -462,7 +447,9 @@ def apply_coordinate_rotation(
     new_points_3d = None
     if points_3d is not None and len(points_3d) > 0:
         pts = np.array(points_3d).reshape(-1, 3)
-        pts_new = (R_world @ pts.T).T
+        # Shift then Rotate
+        pts_shifted = pts + t_shift
+        pts_new = (R_world @ pts_shifted.T).T
         new_points_3d = pts_new.tolist()
     
     return new_cam_params, new_window_planes, new_points_3d
@@ -505,21 +492,56 @@ def align_world_y_to_plane_intersection(
     
     print(f"[Coordinate Alignment] Intersection line direction: [{line_dir[0]:.4f}, {line_dir[1]:.4f}, {line_dir[2]:.4f}]")
     
-    # Build rotation: R_y2dir rotates Y-axis to line_dir
-    # We need R_world that rotates line_dir to Y-axis (inverse rotation)
-    R_y2dir = build_rotation_align_y_to_dir(line_dir)
-    R_world = R_y2dir.T  # Inverse rotation: line_dir -> +Y
+    print(f"[Coordinate Alignment] Intersection line direction: [{line_dir[0]:.4f}, {line_dir[1]:.4f}, {line_dir[2]:.4f}]")
+    
+    # [USER REQUEST] Strict Alignment:
+    # 1. Y-axis = Intersection Line (lies on Plane 0)
+    # 2. X-axis = Parallel to Plane 0 (orthogonal to n0)
+    # 3. Z-axis = Normal of Plane 0 (n0)
+    
+    # New Basis Vectors (in Old Frame)
+    y_new = line_dir
+    z_new = n0 / (np.linalg.norm(n0) + 1e-12)
+    
+    # Check if Z points roughly "Forward" (usually Z > 0). If n0 is pointing back, flip it?
+    # But usually window normal points Out or In. 
+    # Let's verify orthogonality. Y is on Plane 0, so Y.dot(n0) should be 0.
+    # Force strict orthogonality for numerical stability
+    z_new = z_new - np.dot(z_new, y_new) * y_new
+    z_new = z_new / (np.linalg.norm(z_new) + 1e-12)
+    
+    # Construct X = Y cross Z (Right-handed)
+    x_new = np.cross(y_new, z_new)
+    x_new = x_new / (np.linalg.norm(x_new) + 1e-12)
+    
+    # Construct Rotation Matrix R_world (Old -> New)
+    # Rows are the new basis vectors expressed in old frame
+    R_world = np.vstack([x_new, y_new, z_new])
     
     # Verification: R_world @ line_dir should be [0, 1, 0]
     line_dir_new = R_world @ line_dir
-    print(f"[ALIGN CHECK] R_world @ line_dir = [{line_dir_new[0]:.6f}, {line_dir_new[1]:.6f}, {line_dir_new[2]:.6f}]")
+    # Verification: R_world @ n0 should be [0, 0, 1] (or -1)
+    n0_new = R_world @ n0
+    
+    print(f"[ALIGN CHECK] Y-Axis (Intersection): {line_dir_new}")
+    print(f"[ALIGN CHECK] Z-Axis (Plane 0 Normal): {n0_new}")
+    
+    # [USER REQUEST] Translation: Center World Origin at 3D Cloud Centroid
+    t_shift = np.zeros(3)
+    if points_3d is not None and len(points_3d) > 0:
+        pts = np.array(points_3d).reshape(-1, 3)
+        centroid = np.mean(pts, axis=0)
+        t_shift = -centroid
+        print(f"[Coordinate Alignment] Centering World at Cloud Centroid: {centroid}")
+    else:
+        print("[Coordinate Alignment] No 3D points provided, skipping Centering (Translation = 0).")
     
     # Apply transformation
     new_cam_params, new_window_planes, new_points_3d = apply_coordinate_rotation(
-        R_world, cam_params, window_planes, points_3d
+        R_world, cam_params, window_planes, points_3d, t_shift=t_shift
     )
     
-    print(f"[Coordinate Alignment] Applied rotation to align Y-axis with plane intersection.")
+    print(f"[Coordinate Alignment] Applied rotation and translation to align coordinates.")
     
-    return new_cam_params, new_window_planes, new_points_3d, R_world
+    return new_cam_params, new_window_planes, new_points_3d, R_world, t_shift
 
