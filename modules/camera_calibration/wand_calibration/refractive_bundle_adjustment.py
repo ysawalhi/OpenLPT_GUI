@@ -289,12 +289,10 @@ class PR5Config:
     
     # Lambda Weights
     lambda_ray: float = 1.0     # Base weight for ray residuals
-    lambda_len_init: float = 200.0  # Initial weight for length residuals
-    lambda_len_min: float = 50.0
-    lambda_len_max: float = 2000.0
+    lambda_len_init: float = 100.0  # Initial weight for length residuals
+    lambda_len_min: float = 10.0
+    lambda_len_max: float = 1000.0
     
-    # Side Gate (Hysteresis-Based Feasibility Constraint)
-    # Stable round-level gate with zero cost when feasible
     # Side Gate (Hysteresis-Based Feasibility Constraint)
     # Stable round-level gate with zero cost when feasible
     margin_side_mm: float = 0.05     # Margin for side constraint (mm); sX < margin is violation
@@ -321,11 +319,11 @@ class PR5Config:
     # Residual = (val - init) / sigma.
     # We will compute sigmas dynamically based on Observability.
     
-    # Configuration for Priors (Sigmas)
-    sigma_plane_ang_single: float = 0.0035  # ~0.2 deg
-    sigma_plane_ang_weak: float = 0.006     # ~0.35 deg (<15 deg)
-    sigma_plane_ang_mid: float = 0.010      # ~0.6 deg (<25 deg)
-    sigma_plane_ang_strong: float = 0.026   # ~1.5 deg (>=25 deg)
+    # Configuration for Priors (Sigmas) 
+    sigma_plane_ang_single: float = 0.0035  # ~1 deg original: 0.0035
+    sigma_plane_ang_weak: float = 0.006     # ~1 deg (<15 deg) original: 0.006
+    sigma_plane_ang_mid: float = 0.010      # ~2 deg (<25 deg) original: 0.010
+    sigma_plane_ang_strong: float = 0.026   # ~3 deg (>=25 deg) original: 0.026
     
     sigma_d_single: float = 1.0
     sigma_d_weak: float = 2.0  # <25 deg

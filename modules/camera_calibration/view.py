@@ -438,7 +438,6 @@ class RefractiveCalibWorker(QObject):
                                           float(c))
             
             # Run calibration
-            # Run calibration
             success, cam_params, report, dataset = calibrator.calibrate(
                 num_windows=self.num_windows,
                 cam_to_window=self.cam_to_window,
@@ -447,6 +446,9 @@ class RefractiveCalibWorker(QObject):
                 verbosity=1,
                 progress_callback=cb
             )
+            
+            # [FIX] Propagate per-frame errors back to main thread
+            dataset['per_frame_errors'] = getattr(calibrator.base, 'per_frame_errors', {})
             
             self.finished.emit(success, cam_params, report, dataset)
             
@@ -740,7 +742,7 @@ class Calibration3DViewer(QWidget):
             wids = list(plane_data.keys())
             intersection_line = None
             
-            if len(wids) >= 2:
+            if len(wids) == 2:
                 p0 = plane_data[wids[0]]
                 p1 = plane_data[wids[1]]
                 n0, n1 = p0['n'], p1['n']
@@ -3717,7 +3719,7 @@ class CameraCalibrationView(QWidget):
         if not errors:
             self.frozen_table.setRowCount(0)
             return
-
+        
         # Identify filtered frames to persist checkbox state
         filtered_out_frames = set()
         if getattr(self.wand_calibrator, 'wand_points_filtered', None) is not None:
@@ -4005,7 +4007,19 @@ class CameraCalibrationView(QWidget):
                 cv2.circle(img, (x, y), 3, (0, 255, 0), -1)
             
             # Draw reprojections (red cross) if calibration done
-            if pt3d_A is not None and cam_idx in self.wand_calibrator.final_params:
+            # Check for refractive per_frame_errors with pre-computed proj_pts first
+            if hasattr(self.wand_calibrator, 'per_frame_errors') and frame_id in self.wand_calibrator.per_frame_errors:
+                err_data = self.wand_calibrator.per_frame_errors[frame_id]
+                proj_pts = err_data.get('proj_pts', {})
+                
+                if cam_idx in proj_pts:
+                    proj_A, proj_B = proj_pts[cam_idx]
+                    for proj in [proj_A, proj_B]:
+                        if proj is not None:
+                            px, py = int(proj[0]), int(proj[1])
+                            cv2.drawMarker(img, (px, py), (0, 0, 255), cv2.MARKER_CROSS, 15, 2)
+            # Fallback to pinhole cv2.projectPoints (for pinhole calibration mode)
+            elif pt3d_A is not None and cam_idx in self.wand_calibrator.final_params:
                 p = self.wand_calibrator.final_params[cam_idx]
                 R, T, K, dist = p['R'], p['T'], p['K'], p['dist']
                 rvec, _ = cv2.Rodrigues(R)
@@ -5611,6 +5625,12 @@ class CameraCalibrationView(QWidget):
             if hasattr(self, 'status_label'):
                 self.status_label.setText("Refractive Calibration Successful")
             
+            # [FIX] Inject computed errors into main calibrator for table display
+            errors = dataset.get('per_frame_errors', {})
+            if errors:
+                self.wand_calibrator.per_frame_errors = errors
+                print(f"[Refractive] Injected {len(errors)} frames of error data into UI calibrator.")
+            
             # 3D Visualization
             try:
                 # Add window planes and 3D points
@@ -5633,6 +5653,12 @@ class CameraCalibrationView(QWidget):
                     
             except Exception as e:
                 print(f"[Refractive] Visualization Error: {e}")
+            
+            # Populate Error Analysis table (per_frame_errors was computed in calibrator)
+            try:
+                self._populate_error_table()
+            except Exception as e:
+                print(f"[Refractive] Error table population failed: {e}")
         else:
             QMessageBox.warning(self, "Result", "Calibration finished but no params returned.")
             

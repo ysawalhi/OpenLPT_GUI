@@ -2506,17 +2506,25 @@ class RefractiveWandCalibrator:
         if not loaded_pr5:  # Only if we ran optimization (not loaded from cache)
             pr5_optimizer.save_cache(out_path, points_3d=all_points_3d)
 
+
         # [Coordinate Alignment] Duplicate block removed. 
         # Alignment is already performed after optimization (Phase 5).
 
+        # Use C++ cameras from pr5_optimizer directly (already synced with final params)
+        v_cams_cpp = pr5_optimizer.cams_cpp if pr5_optimizer else None
+        
+        # [User Request] Update proj_nmax for accurate projection
+        if v_cams_cpp:
+            for cam in v_cams_cpp.values():
+                pp = cam._pinplate_param
+                pp.proj_nmax = 1000
+                cam._pinplate_param = pp
+
         # === FINAL CLOSE-LOOP VERIFICATION (USER REQUEST) ===
-        if tri_data and cam_params:
+        if tri_data and cam_params and v_cams_cpp:
             try:
                 print("\n" + "="*50)
                 print("[Verification] Starting Final Close-loop Validation...")
-                
-                # 1. Sync one more time to ensure in-memory cams match ALIGNED parameters
-                v_cams_cpp = self._init_cams_cpp_in_memory(cam_params, window_media, cam_to_window, self.window_planes)
                 
                 # 2. Pick a random valid frame
                 valid_fids = [fid for fid, res in tri_data.items() if res['validA'] and res['validB']]
@@ -2585,7 +2593,121 @@ class RefractiveWandCalibrator:
                 print(f"[Verification] Close-loop check failed: {e}")
                 # import traceback; traceback.print_exc()
 
+        # === CALCULATE PER-FRAME REPROJECTION ERRORS FOR UI ===
+        self.calculate_per_frame_errors_refractive(
+            dataset, tri_data, v_cams_cpp, wand_len_target
+        )
+        
         return True, cam_params, report, dataset
 
+    def calculate_per_frame_errors_refractive(self, dataset, tri_data, cams_cpp, wand_len_target):
+        """
+        Calculate per-frame reprojection and wand length errors for UI Error Analysis table.
+        
+        Uses C++ cam.project() for accurate PINPLATE projection (handles refraction).
+        Stores results in self.base.per_frame_errors (same format as pinhole calibration).
+        
+        Format: {frame_idx: {'cam_errors': {cam_id: max_err_px}, 'len_error': abs_mm}}
+        
+        Args:
+            dataset: dict with 'frames', 'obsA', 'obsB', 'points_3d' keys
+            tri_data: dict {fid: {'XA': np.ndarray, 'XB': np.ndarray, 'validA': bool, 'validB': bool}}
+            cams_cpp: dict {cid: lpt.Camera} - loaded C++ camera objects
+            wand_len_target: target wand length in mm
+        """
+        if lpt is None:
+            print("[per_frame_errors] pyopenlpt not available, skipping.")
+            return
+        
+        if not dataset or not tri_data or not cams_cpp:
+            print("[per_frame_errors] Missing required data, skipping.")
+            return
+        
+        print("\n[per_frame_errors] Calculating reprojection errors for all frames...")
+        
+        self.base.per_frame_errors = {}
+        
+        # Statistics accumulators per camera
+        cam_error_sums = {cid: [] for cid in cams_cpp.keys()}
+        total_frames = 0
+        
+        for fid in dataset['frames']:
+            if fid not in tri_data:
+                continue
+            
+            res = tri_data[fid]
+            XA = res.get('XA')
+            XB = res.get('XB')
+            
+            # Skip frames without valid 3D points
+            if XA is None and XB is None:
+                continue
+            
+            # Calculate wand length error (if both points valid)
+            len_err = 0.0
+            if XA is not None and XB is not None:
+                wand_len = np.linalg.norm(XB - XA)
+                len_err = abs(wand_len - wand_len_target)
+            
+            # Calculate per-camera reprojection errors
+            cam_errors = {}
+            proj_pts = {}  # Store projected points for visualization
+            
+            obsA = dataset['obsA'].get(fid, {})
+            obsB = dataset['obsB'].get(fid, {})
+            
+            for cid, cam in cams_cpp.items():
+                err_max = 0.0
+                proj_A = None
+                proj_B = None
+                
+                try:
+                    # [CPP_PROTOCOL] Project A point
+                    if XA is not None and cid in obsA:
+                        pt_world_A = lpt.Pt3D(float(XA[0]), float(XA[1]), float(XA[2]))
+                        uv_proj_A = cam.project(pt_world_A)
+                        proj_A = (float(uv_proj_A[0]), float(uv_proj_A[1]))
+                        
+                        uv_obs_A = obsA[cid]
+                        err_A = np.sqrt((proj_A[0] - uv_obs_A[0])**2 + (proj_A[1] - uv_obs_A[1])**2)
+                        err_max = max(err_max, err_A)
+                    
+                    # [CPP_PROTOCOL] Project B point
+                    if XB is not None and cid in obsB:
+                        pt_world_B = lpt.Pt3D(float(XB[0]), float(XB[1]), float(XB[2]))
+                        uv_proj_B = cam.project(pt_world_B)
+                        proj_B = (float(uv_proj_B[0]), float(uv_proj_B[1]))
+                        
+                        uv_obs_B = obsB[cid]
+                        err_B = np.sqrt((proj_B[0] - uv_obs_B[0])**2 + (proj_B[1] - uv_obs_B[1])**2)
+                        err_max = max(err_max, err_B)
+                    
+                    if err_max > 0:
+                        cam_errors[cid] = err_max
+                        cam_error_sums[cid].append(err_max)
+                    
+                    # Store projected points for visualization
+                    proj_pts[cid] = (proj_A, proj_B)
+                    
+                except Exception as e:
+                    # Silently skip projection failures
+                    pass
+            
+            if cam_errors:
+                self.base.per_frame_errors[fid] = {
+                    'cam_errors': cam_errors,
+                    'len_error': len_err,
+                    'proj_pts': proj_pts  # For overlay visualization
+                }
+                total_frames += 1
+        
+        # Log summary per camera
+        print(f"[per_frame_errors] Computed errors for {total_frames} frames.")
+        for cid in sorted(cam_error_sums.keys()):
+            errs = cam_error_sums[cid]
+            if errs:
+                mean_err = np.mean(errs)
+                max_err = np.max(errs)
+                print(f"  Cam {cid}: Mean={mean_err:.3f} px, Max={max_err:.3f} px ({len(errs)} samples)")
 
 

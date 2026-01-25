@@ -127,8 +127,8 @@ class PinholeBootstrapP0Config:
     """Configuration for P0 bootstrap."""
     wand_length_mm: float = 10.0
     ui_focal_px: float = 9000.0  # UI-provided focal length (FROZEN)
-    ftol: float = 1e-8
-    xtol: float = 1e-8
+    ftol: float = 1e-6
+    xtol: float = 1e-6
 
 
 class PinholeBootstrapP0:

@@ -438,12 +438,12 @@ class WandCalibrator:
         Must be called after successful calibration (self.final_params and self.points_3d exist).
         Returns: {frame_idx: {'cam_errors': {cam_id: max_err_px}, 'len_error': abs_mm}}
         """
-        if not self.final_params or self.points_3d is None:
-            return {}
-            
-        # Optimization: Use cached errors if available
+        # Optimization: Use cached errors if available (e.g. from Refractive calibration)
         if self.per_frame_errors:
             return self.per_frame_errors
+
+        if not self.final_params or self.points_3d is None:
+            return {}
         
         # Get current wand data
         wand_data = self.wand_points_filtered if self.wand_points_filtered else self.wand_points
