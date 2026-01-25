@@ -53,7 +53,7 @@ from .refractive_geometry import (
     point_to_ray_dist_vec,  # Vectorized version for performance
     update_normal_tangent, rodrigues_to_R, camera_center, angle_between_vectors,
 
-    optical_axis_world
+    optical_axis_world, update_cpp_camera_state
 )
 from datetime import datetime
 from pathlib import Path
@@ -768,68 +768,11 @@ class RefractiveBAOptimizerPR4:
             
             print(f"    Win {wid}: d_key={d_key:.2f} mm (from opt C_mean), normal_shift={delta_n_deg:.2f} deg")
 
-    def _update_cpp_camera_extrinsics(self, cam_obj, rvec: np.ndarray, tvec: np.ndarray):
-        """Update C++ camera's extrinsics."""
-        try:
-            pp = cam_obj._pinplate_param
-            
-            # Update R
-            R_mat, _ = cv2.Rodrigues(rvec)
-            # [Fix] Element-wise assignment for pybind11 compatibility
-            for i in range(3):
-                for j in range(3):
-                    pp.r_mtx[i, j] = float(R_mat[i, j])
-            
-            # Update T
-            for i in range(3):
-                pp.t_vec[i] = float(tvec[i])
-            
-            # Recalculate inverses
-            R_inv = R_mat.T
-            t_inv = -R_inv @ tvec
-            
-            for i in range(3):
-                for j in range(3):
-                    pp.r_mtx_inv[i, j] = float(R_inv[i, j])
-                    
-            for i in range(3):
-                pp.t_vec_inv[i] = float(t_inv[i])
-            
-            cam_obj._pinplate_param = pp
-            
-        except Exception as e:
-            print(f"[Warning] Extrinsics update failed for cam {cam_obj}: {e}")
 
-    def _update_cpp_camera(self, cam_obj, plane_pt: List[float], plane_n: List[float]):
-        """Update C++ camera's plane parameters using daisy-chain assignment."""
-        try:
-            pp = cam_obj._pinplate_param
-            
-            # [CRITICAL] Coordinate Alignment: PINPLATE model in C++ expects Farthest Interface
-            # Python optimization uses Closest Interface as base.
-            # Shift point along normal by thickness.
-            thick_mm = pp.w_array[0] if pp.w_array else 0.0
-            p_n = np.array(plane_n)
-            p_pt = np.array(plane_pt)
-            p_farthest = p_pt + p_n * thick_mm
-            
-            pl = pp.plane
-            pl.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
-            pl.norm_vector = lpt.Pt3D(float(p_n[0]), float(p_n[1]), float(p_n[2]))
-            pp.plane = pl
-            cam_obj._pinplate_param = pp
-            cam_obj.updatePt3dClosest() # Refresh internal geometric state
-        except Exception as e:
-            print(f"[Warning] Plane update failed for cam {cam_obj}: {e}")
 
-    def _apply_planes_to_cpp(self, planes: Dict[int, Dict]):
-        """Apply plane parameters to all C++ camera objects."""
-        for wid, pl in planes.items():
-            pt_list = pl['plane_pt'].tolist()
-            n_list = pl['plane_n'].tolist()
-            for cid in self.window_to_cams.get(wid, []):
-                if cid in self.cams_cpp:
-                    self._update_cpp_camera(self.cams_cpp[cid], pt_list, n_list)
+
+
+
 
     def _build_rays_frame(self, fid: int) -> Tuple[List[Ray], List[Ray]]:
         """Build rays for a frame using current C++ camera state."""
@@ -865,8 +808,29 @@ class RefractiveBAOptimizerPR4:
         Evaluate residuals with fixed-size padding for Scipy least_squares compatibility.
         """
         # Apply planes and extrinsics
-        self._apply_planes_to_cpp(planes)
-        self._apply_extrinsics_to_cpp(cam_params)
+        # Apply to C++ objects (Consolidated Update)
+        for cid in self.active_cam_ids:
+            if cid not in self.cams_cpp: continue
+            
+            # Prepare update arguments
+            update_kwargs = {}
+            
+            # 1. Extrinsics
+            if cid in cam_params:
+                p = cam_params[cid]
+                update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+            
+            # 2. Plane Geometry
+            wid = self.cam_to_window.get(cid)
+            if wid in planes:
+                pl = planes[wid]
+                update_kwargs['plane_geom'] = {
+                    'pt': pl['plane_pt'].tolist(), 
+                    'n': pl['plane_n'].tolist()
+                }
+            
+            if update_kwargs:
+                update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
         
         # 1. Pre-calculate total possible counts for FIXED size
         # Ray slots: sum of cameras per frame * 2
@@ -1061,13 +1025,7 @@ class RefractiveBAOptimizerPR4:
         
         return lambda_new
 
-    def _apply_extrinsics_to_cpp(self, cam_params: Dict[int, np.ndarray]):
-        """Apply extrinsic parameters to C++ cameras."""
-        for cid, p in cam_params.items():
-            if cid in self.cams_cpp:
-                rvec = p[0:3]
-                tvec = p[3:6]
-                self._update_cpp_camera_extrinsics(self.cams_cpp[cid], rvec, tvec)
+
 
     def _get_param_layout(self, mode: str) -> List[Tuple]:
         """
@@ -1748,12 +1706,30 @@ class RefractiveBAOptimizerPR4:
                      self.window_planes[wid]['plane_n'] = np.array(pl['plane_n'])
             
             # Apply to C++ objects
-            self._apply_planes_to_cpp(self.window_planes)
+            # Apply to C++ objects
+            # Apply to C++ objects (Consolidated Update)
             for cid in self.active_cam_ids:
-                cam = self.cams_cpp[cid]
-                # Update Extrinsics
-                p = self.cam_params[cid]
-                self._update_cpp_camera_extrinsics(cam, p[0:3], p[3:6])
+                if cid not in self.cams_cpp: continue
+                
+                # Prepare update arguments
+                update_kwargs = {}
+                
+                # 1. Extrinsics
+                if cid in self.cam_params:
+                    p = self.cam_params[cid]
+                    update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+                
+                # 2. Plane Geometry
+                wid = self.cam_to_window.get(cid)
+                if wid in self.window_planes:
+                    pl = self.window_planes[wid]
+                    update_kwargs['plane_geom'] = {
+                        'pt': pl['plane_pt'].tolist(), 
+                        'n': pl['plane_n'].tolist()
+                    }
+                
+                if update_kwargs:
+                    update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
                 
             
             print(f"[PR4][CACHE] Loaded parameters successfully from {cache_path}")
@@ -2647,7 +2623,29 @@ class RefractiveBAOptimizerPR5:
                 
             # 4. Update C++ objects
             # Use internal helper to push everything to C++
-            self._apply_all_to_cpp()
+            # 4. Update C++ objects
+            for cid in self.active_cam_ids:
+                if cid not in self.cams_cpp: continue
+                
+                # Prepare update arguments
+                update_kwargs = {}
+                
+                # 1. Extrinsics
+                if cid in self.cam_params:
+                    p = self.cam_params[cid]
+                    update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+                
+                # 2. Plane Geometry
+                wid = self.cam_to_window.get(cid)
+                if wid in self.window_planes:
+                    pl = self.window_planes[wid]
+                    update_kwargs['plane_geom'] = {
+                        'pt': pl['plane_pt'].tolist(), 
+                        'n': pl['plane_n'].tolist()
+                    }
+                
+                if update_kwargs:
+                    update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
             
             # 5. RE-BUILD OBSERVATION CACHE (Important!)
             # Ensure obs_cache matches the FRESH dataset, not whatever was implicitly loaded
@@ -2665,103 +2663,7 @@ class RefractiveBAOptimizerPR5:
         except Exception as e:
             print(f"[PR5][CACHE] Save failed: {e}")
 
-    def _update_cpp_camera(self, cid):
-        """Update a single C++ camera from self.cam_params."""
-        if cid not in self.cams_cpp: return
-        cam = self.cams_cpp[cid]
-        cp = self.cam_params[cid]
-        
-        # Unpack params
-        rvec = cp[0:3]
-        tvec = cp[3:6]
-        f = cp[6]
-        dist = cp[7:] 
-        
-        try:
-            # [CPP_PROTOCOL] Manual Update via _pinplate_param
-            pp = cam._pinplate_param
-            
-            # 1. Extrinsics
-            R_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            R_np, _ = cv2.Rodrigues(rvec)
-            for i in range(3):
-                for j in range(3): R_lpt[i,j] = float(R_np[i,j])
-            pp.r_mtx = R_lpt
-            
-            t_pt = lpt.Pt3D(float(tvec[0]), float(tvec[1]), float(tvec[2]))
-            pp.t_vec = t_pt
-            
-            # Inverse Extrinsics
-            R_inv = R_np.T
-            t_inv = -R_inv @ tvec
-            R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            for i in range(3):
-                for j in range(3): R_inv_lpt[i,j] = float(R_inv[i,j])
-            pp.r_mtx_inv = R_inv_lpt
-            pp.t_vec_inv = lpt.Pt3D(float(t_inv[0]), float(t_inv[1]), float(t_inv[2]))
-            
-            # 2. Intrinsics (f only, preserve cx,cy)
-            # Use fresh MatrixDouble to be safe (match _apply_params_to_cpp pattern)
-            K = lpt.MatrixDouble(3, 3, 0.0)
-            K[0, 0] = float(f)
-            K[1, 1] = float(f)
-            K[0, 2] = float(pp.cam_mtx[0, 2]) # Preserve cx
-            K[1, 2] = float(pp.cam_mtx[1, 2]) # Preserve cy
-            K[2, 2] = 1.0
-            pp.cam_mtx = K
-            
-            # 3. Distortion
-            if len(dist) > 0:
-                pp.dist_coeff = [float(x) for x in dist]
-                pp.n_dist_coeff = len(dist)
-            
-            cam._pinplate_param = pp
-            cam.updatePt3dClosest()
-            
-        except Exception as e:
-             print(f"[Warning] Camera update failed for cid {cid}: {e}")
 
-    def _apply_all_to_cpp(self):
-        """Apply current Python state (self.cam_params, self.window_planes, self.window_media) to C++."""
-        # 1. Update Camera Intrinsics/Extrinsics
-        for cid in self.active_cam_ids:
-            self._update_cpp_camera(cid)
-            
-        # 2. Update Window Planes (Geometry)
-        for wid, pl in self.window_planes.items():
-            if wid not in self.window_media: continue
-            media = self.window_media[wid]
-            thick = media.get('thickness', 10.0)
-            
-            n = np.array(pl['plane_n'])
-            pt = np.array(pl['plane_pt'])
-            
-            # Apply to all cameras sharing this window
-            cams = self.window_to_cams.get(wid, [])
-            for cid in cams:
-                if cid not in self.cams_cpp: continue
-                cam = self.cams_cpp[cid]
-                
-                try:
-                    pp = cam._pinplate_param
-                    
-                    # Refractive Props
-                    pp.n1 = media['n1']
-                    pp.n2 = media['n2']
-                    pp.n3 = media['n3']
-                    pp.w_array = [float(thick)]
-                    
-                    # Plane Geometry
-                    plane_obj = pp.plane
-                    plane_obj.pt = lpt.Pt3D(float(pt[0]), float(pt[1]), float(pt[2]))
-                    plane_obj.norm_vector = lpt.Pt3D(float(n[0]), float(n[1]), float(n[2]))
-                    pp.plane = plane_obj
-                    
-                    cam._pinplate_param = pp
-                    cam.updatePt3dClosest() 
-                    
-                except Exception as e:
-                    print(f"[Warning] Plane update failed for cid {cid} (win {wid}): {e}")
 
     def _pack_parameters(self) -> Tuple[np.ndarray, List[Tuple[float, float]], List[str]]:
         """
@@ -2954,61 +2856,23 @@ class RefractiveBAOptimizerPR5:
                 'initialized': True,
                 'thick_mm': t_val
             }
-            
+
             # Update all cameras attached to this window
             for cid in self.window_to_cams.get(wid, []):
+                if cid not in self.cams_cpp: continue
                 cam = self.cams_cpp[cid]
                 
-                # Extrinsics & F Update
+                # Prepare Args
                 rv = rvec_map[cid]
                 tv = tvec_map[cid]
                 f = f_map[cid]
                 
-                # Update Intrinsics (Keep cx, cy fixed from initial state)
-                pp = cam._pinplate_param
-                
-                # Standardize MatrixDouble population via indexing (bypass initializer_list issues)
-                K = lpt.MatrixDouble(3, 3, 0.0)
-                K[0, 0] = float(f)
-                K[1, 1] = float(f)
-                K[0, 2] = float(pp.cam_mtx[0, 2])
-                K[1, 2] = float(pp.cam_mtx[1, 2])
-                K[2, 2] = 1.0
-                pp.cam_mtx = K
-                
-                # Update Extrinsics (Forward)
-                R_np = rodrigues_to_R(rv)
-                R_lpt = lpt.MatrixDouble(3, 3, 0.0)
-                for i in range(3):
-                    for j in range(3):
-                        R_lpt[i, j] = float(R_np[i, j])
-                pp.r_mtx = R_lpt
-                pp.t_vec = lpt.Pt3D(float(tv[0]), float(tv[1]), float(tv[2]))
-                
-                # Update Extrinsics (Inverse) - Crucial for pinplateLine
-                R_inv_np = R_np.T
-                t_inv_np = -R_inv_np @ tv
-                R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
-                for i in range(3):
-                    for j in range(3):
-                        R_inv_lpt[i, j] = float(R_inv_np[i, j])
-                pp.r_mtx_inv = R_inv_lpt
-                pp.t_vec_inv = lpt.Pt3D(float(t_inv_np[0]), float(t_inv_np[1]), float(t_inv_np[2]))
-                
-                # Update Plane & Thickness
-                pp.w_array = [float(t_val)]
-                
-                # Re-apply updated Plane struct
-                pl_internal = pp.plane
-                # [CRITICAL] Coordinate Alignment: Shift to Farthest Interface for C++ engine
-                p_farthest = pt_new + n_new * t_val
-                pl_internal.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
-                pl_internal.norm_vector = lpt.Pt3D(float(n_new[0]), float(n_new[1]), float(n_new[2]))
-                pp.plane = pl_internal
-                
-                # Commit everything back to Camera object
-                cam._pinplate_param = pp
-                cam.updatePt3dClosest() # Refresh internal geometric state
+                update_cpp_camera_state(cam,
+                                        extrinsics={'rvec': rv, 'tvec': tv},
+                                        intrinsics={'f': f}, # cx, cy preserved
+                                        plane_geom={'pt': pt_new.tolist(), 'n': n_new.tolist()},
+                                        media_props={'thickness': t_val}
+                                       )
                     
         return updated_planes
 
@@ -3017,7 +2881,6 @@ class RefractiveBAOptimizerPR5:
         PR5 Cost Function:
         Ray Dist + Wand Length + Strong Priors
         """
-        # Unpack
         # Unpack
         planes_scalars, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x)
         
@@ -3329,11 +3192,7 @@ class RefractiveBAOptimizerPR5:
     def save_cache(self, out_path: str, points_3d: list = None):
         """Save PR5 results to cache (with Feasibility Audit)."""
         try:
-            # Audit constraints before saving
-            # Sync internal C++ state first
-            for cid in self.cam_params:
-                self._update_cpp_camera(cid)
-                
+
             Rs = self.dataset.get('est_radius_small_mm', 2.0)
             Rl = self.dataset.get('est_radius_large_mm', 5.0)
             

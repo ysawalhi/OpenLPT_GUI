@@ -29,7 +29,7 @@ import pyopenlpt as lpt
 from .refractive_geometry import (
     Ray, normalize, build_pinplate_ray_cpp, triangulate_point, point_to_ray_dist,
     update_normal_tangent, rodrigues_to_R, camera_center, angle_between_vectors,
-    optical_axis_world
+    optical_axis_world, update_cpp_camera_state
 )
 from .refractive_constraints import compute_soft_barrier_penalty
 
@@ -178,30 +178,7 @@ class RefractivePlaneOptimizer:
                 if uvA is not None or uvB is not None:
                     self.obs_cache[fid][cid] = (uvA, uvB)
     
-    def _update_cpp_camera(self, cam_obj, plane_pt: List[float], plane_n: List[float]):
-        """
-        Update C++ camera's plane parameters using daisy-chain assignment.
-        This handles pybind11's value-copy behavior for nested structs.
-        """
-        try:
-            pp = cam_obj._pinplate_param
-            
-            # [CRITICAL] Coordinate Alignment: PINPLATE model in C++ expects Farthest Interface
-            # Python optimization uses Closest Interface as base.
-            # Shift point along normal by thickness.
-            thick_mm = pp.w_array[0] if pp.w_array else 0.0
-            p_n = np.array(plane_n)
-            p_pt = np.array(plane_pt)
-            p_farthest = p_pt + p_n * thick_mm
-            
-            pl = pp.plane
-            pl.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
-            pl.norm_vector = lpt.Pt3D(float(p_n[0]), float(p_n[1]), float(p_n[2]))
-            pp.plane = pl
-            cam_obj._pinplate_param = pp
-            cam_obj.updatePt3dClosest() # Refresh internal geometric state
-        except Exception as e:
-            print(f"  [Warning] C++ update failed: {e}")
+
     
     def _apply_planes_to_cpp(self, planes: Dict[int, Dict]):
         """Apply plane parameters to all C++ camera objects."""
@@ -210,7 +187,7 @@ class RefractivePlaneOptimizer:
             n_list = pl['plane_n'].tolist()
             for cid in self.win_cams.get(wid, []):
                 if cid in self.cams_cpp:
-                    self._update_cpp_camera(self.cams_cpp[cid], pt_list, n_list)
+                    update_cpp_camera_state(self.cams_cpp[cid], plane_geom={'pt': pt_list, 'n': n_list})
     
     def _check_plane_sanity(self, planes: Dict[int, Dict], radii: Dict[str, float]) -> bool:
         """

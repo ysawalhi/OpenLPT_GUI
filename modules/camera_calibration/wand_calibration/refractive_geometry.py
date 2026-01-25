@@ -545,3 +545,154 @@ def align_world_y_to_plane_intersection(
     
     return new_cam_params, new_window_planes, new_points_3d, R_world, t_shift
 
+
+def update_cpp_camera_state(cam_obj, 
+                            extrinsics: Optional[dict] = None,
+                            intrinsics: Optional[dict] = None,
+                            plane_geom: Optional[dict] = None,
+                            media_props: Optional[dict] = None) -> None:
+    """
+    Unified function to update C++ Camera parameters (PinPlate model).
+    
+    Handles:
+    1. Intrinsics (K matrix, distortion)
+    2. Extrinsics (R, T, and their inverses)
+    3. Plane Geometry (Coordinate Shift: Closest -> Farthest)
+    4. Refractive Media Properties
+    5. Internal State Refresh (updatePt3dClosest)
+    
+    Args:
+        cam_obj: lpt.Camera instance
+        extrinsics: Dict with keys 'rvec' (3,) and 'tvec' (3,)
+        intrinsics: Dict with optional keys 'f', 'cx', 'cy', 'dist'
+        plane_geom: Dict with keys 'pt', 'n' (point and normal at Closest Interface)
+        media_props: Dict with keys 'thickness' (and optional 'n1','n2','n3' or 'n_air'...)
+    """
+    try:
+        import pyopenlpt as lpt
+    except ImportError:
+        return # Cannot update if lpt not available
+        
+    # Python-side binding usually exposes a copy of the struct
+    pp = cam_obj._pinplate_param
+    
+    # --- 1. Intrinsics ---
+    if intrinsics:
+        # Create fresh K matrix
+        K = lpt.MatrixDouble(3, 3, 0.0)
+        
+        # Use existing as default
+        current_K = pp.cam_mtx
+        fx = intrinsics.get('f', current_K[0, 0])
+        fy = intrinsics.get('f', current_K[1, 1]) # Assume fx=fy if 'f' passed
+        cx = intrinsics.get('cx', current_K[0, 2])
+        cy = intrinsics.get('cy', current_K[1, 2])
+        
+        K[0, 0] = float(fx)
+        K[1, 1] = float(fy)
+        K[0, 2] = float(cx)
+        K[1, 2] = float(cy)
+        K[2, 2] = 1.0
+        pp.cam_mtx = K
+        
+        # Distortion
+        if 'dist' in intrinsics and intrinsics['dist'] is not None:
+             d = intrinsics['dist']
+             pp.dist_coeff = [float(x) for x in d]
+             pp.n_dist_coeff = len(d)
+             pp.is_distorted = any(abs(x) > 1e-9 for x in d)
+
+    # --- 2. Extrinsics ---
+    if extrinsics:
+        # Support partial updates by reading current state if needed
+        # Note: We need both R and T to recompute inverses correctly.
+        
+        has_r = 'rvec' in extrinsics
+        has_t = 'tvec' in extrinsics
+        
+        if not has_r and not has_t:
+            pass # No extrinsics to update
+        else:
+            # Get current values
+            current_R_lpt = pp.r_mtx
+            current_t_lpt = pp.t_vec
+            
+            # Resolve R
+            if has_r:
+                rvec = extrinsics['rvec']
+                R_np = rodrigues_to_R(rvec)
+            else:
+                # Reconstruct numpy R from MatrixDouble
+                R_np = np.zeros((3, 3))
+                for i in range(3):
+                    for j in range(3):
+                        R_np[i, j] = current_R_lpt[i, j]
+            
+            # Resolve T
+            if has_t:
+                tvec = extrinsics['tvec']
+                t_np = np.asarray(tvec).flatten()
+            else:
+                 t_np = np.array([current_t_lpt[0], current_t_lpt[1], current_t_lpt[2]])
+            
+            # Update Forward
+            R_lpt = lpt.MatrixDouble(3, 3, 0.0)
+            for i in range(3):
+                for j in range(3):
+                     R_lpt[i, j] = float(R_np[i, j])
+            
+            pp.r_mtx = R_lpt
+            pp.t_vec = lpt.Pt3D(float(t_np[0]), float(t_np[1]), float(t_np[2]))
+            
+            # Update Inverse (Always recompute based on final R, T)
+            R_inv_np = R_np.T
+            t_inv_np = -R_inv_np @ t_np
+            
+            R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
+            for i in range(3):
+                for j in range(3):
+                     R_inv_lpt[i, j] = float(R_inv_np[i, j])
+                     
+            pp.r_mtx_inv = R_inv_lpt
+            pp.t_vec_inv = lpt.Pt3D(float(t_inv_np[0]), float(t_inv_np[1]), float(t_inv_np[2]))
+
+    # --- 3. Media & Thickness ---
+    current_thick = 0.0
+    if pp.w_array and len(pp.w_array) > 0:
+        current_thick = pp.w_array[0]
+        
+    if media_props:
+        # Update refractive indices if provided
+        n1 = media_props.get('n1', media_props.get('n_air'))
+        n2 = media_props.get('n2', media_props.get('n_window', media_props.get('n_glass')))
+        n3 = media_props.get('n3', media_props.get('n_object', media_props.get('n_medium')))
+        
+        if n1 is not None and n2 is not None and n3 is not None:
+             # Convention: [n_obj, n_win, n_air] (Farthest -> Nearest)
+             pp.refract_array = [float(n3), float(n2), float(n1)]
+        
+        if 'thickness' in media_props:
+            current_thick = float(media_props['thickness'])
+            pp.w_array = [current_thick]
+
+    # --- 4. Plane Geometry (Coordinate Shift) ---
+    if plane_geom:
+        pt = np.asarray(plane_geom['pt']).flatten()
+        plane_normal = np.asarray(plane_geom['n']).flatten()
+        
+        # [CRITICAL] Coordinate Alignment: Shift to Farthest Interface
+        # C++ model wants point on Farthest interface
+        # Python tracks Closest interface (or interface point)
+        p_farthest = pt + plane_normal * current_thick
+        
+        pl_struct = pp.plane
+        pl_struct.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
+        pl_struct.norm_vector = lpt.Pt3D(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2]))
+        
+        pp.plane = pl_struct
+        
+    # --- 5. Commit and Refresh ---
+    cam_obj._pinplate_param = pp
+    cam_obj.updatePt3dClosest()
+
+
