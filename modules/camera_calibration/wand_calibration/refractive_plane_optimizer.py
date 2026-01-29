@@ -21,6 +21,7 @@ Key Design Decisions:
 
 import numpy as np
 import time
+import cv2
 from scipy.optimize import least_squares
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -29,7 +30,8 @@ import pyopenlpt as lpt
 from .refractive_geometry import (
     Ray, normalize, build_pinplate_ray_cpp, triangulate_point, point_to_ray_dist,
     update_normal_tangent, rodrigues_to_R, camera_center, angle_between_vectors,
-    optical_axis_world, update_cpp_camera_state
+    optical_axis_world, update_cpp_camera_state,
+    enable_ray_tracking, reset_ray_stats, print_ray_stats_report
 )
 from .refractive_constraints import compute_soft_barrier_penalty
 
@@ -37,27 +39,19 @@ from .refractive_constraints import compute_soft_barrier_penalty
 @dataclass
 class OptimizationConfig:
     """Configuration for P1 optimization."""
-    # Lambda adaptation parameters
-    lambda0_init: float = 200.0  # Initial base lambda
-    lambda_min: float = 10.0
-    lambda_max: float = 5000.0
-    target_ratio: float = 1.0  # Target S_len / S_ray ratio
-    adaptation_eta: float = 0.30  # Damping factor
-    deadband_low: float = 0.7
-    deadband_high: float = 1.5
-    change_limit_low: float = 0.8
-    change_limit_high: float = 1.25
-    outer_rounds: int = 3
-    
     # Regularization
     lambda_reg: float = 10.0  # Normal drift penalty weight
     
+    # Unit Normalization
+    px_target: float = 0.5            # 投影误差目标 (px)
+    wand_tol_pct: float = 0.02        # 棒长容忍度 (2% 即 0.2mm)
+
     # Bounds
-    alpha_beta_bound: float = 0.5
+    alpha_beta_bound: float = 0.5  # ~28.6 degrees in radians
     margin_side_mm: float = 0.5  # Soft barrier margin
     
     # Subset
-    max_frames: int = 300
+    max_frames: int = 50000  # Default to use all frames (high limit)
     
     # Logging
     verbosity: int = 1  # 0=clean, 1=summary, 2=full audit
@@ -105,9 +99,11 @@ class RefractivePlaneOptimizer:
             'plane_n': pl['plane_n'].copy()
         } for wid, pl in window_planes.items()}
         self.wand_length = wand_length
-        self.config = config or OptimizationConfig()
+        self.config = config if config else OptimizationConfig()
         self.progress_callback = progress_callback
-
+        
+        self.sigma_ray_global = 0.04  # Default, will be recalculated
+        self.sigma_wand = 0.1        # Default, will be recalculated
         
         # Derived data
         self.active_cam_ids = list(cam_params.keys())
@@ -156,29 +152,86 @@ class RefractivePlaneOptimizer:
     def _build_obs_cache(self):
         """Build observation cache from dataset."""
         self.obs_cache = {}
-        obsA = self.dataset.get('obsA', {})
-        obsB = self.dataset.get('obsB', {})
+        obsA_raw = self.dataset.get('obsA', {})
+        obsB_raw = self.dataset.get('obsB', {})
         
         # obsA and obsB are dicts: {fid: {cid: (u, v, ...)}}
-        all_fids = set(obsA.keys()) | set(obsB.keys())
+        all_fids = sorted(list(set(obsA_raw.keys()) | set(obsB_raw.keys())))
         
         for fid in all_fids:
             self.obs_cache[fid] = {}
             for cid in self.active_cam_ids:
                 uvA = None
                 uvB = None
-                if fid in obsA and cid in obsA[fid]:
-                    pt = obsA[fid][cid]
+                if fid in obsA_raw and cid in obsA_raw[fid]:
+                    pt = obsA_raw[fid][cid]
                     if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
                         uvA = pt[:2]
-                if fid in obsB and cid in obsB[fid]:
-                    pt = obsB[fid][cid]
+                if fid in obsB_raw and cid in obsB_raw[fid]:
+                    pt = obsB_raw[fid][cid]
                     if pt is not None and len(pt) >= 2 and np.all(np.isfinite(pt[:2])):
                         uvB = pt[:2]
                 if uvA is not None or uvB is not None:
                     self.obs_cache[fid][cid] = (uvA, uvB)
-    
+        
+        self.fids_all = sorted(list(self.obs_cache.keys()))
+        # self.fids_optim will be set later based on config.max_frames
+        
+    def _compute_physical_sigmas(self):
+        """
+        Estimate global sigma_ray and sigma_wand based on camera parameters and targets.
+        Calculated once before each optimization stage.
+        """
+        cfg = self.config
+        
+        # 1. Calculate Average Focal Length (fx)
+        all_f = []
+        for cid in self.cam_params:
+            all_f.append(self.cam_params[cid][6]) # Assuming index 6 is fx
+        avg_f = np.mean(all_f) if all_f else 1000.0
+        
+        # 2. Calculate Average Object Distance Z
+        sample_dists = []
+        # Use first few frames of obs_cache to find 3D points
+        fids_to_sample = self.fids_optim[::max(1, len(self.fids_optim) // 100)] if len(self.fids_optim) > 0 else []
+        for fid in fids_to_sample:
+            rays_A, rays_B = self._build_rays_frame(fid)
+            for rays in [rays_A, rays_B]:
+                valid_rays = [r for r in rays if r.valid]
+                if len(valid_rays) >= 2:
+                    X, _, ok, _ = triangulate_point(valid_rays)
+                    if ok:
+                        for r in valid_rays:
+                            cid = r.cam_id
+                            rv = self.cam_params[cid][0:3]
+                            tv = self.cam_params[cid][3:6]
+                            R = cv2.Rodrigues(rv)[0]
+                            C = -R.T @ tv
+                            sample_dists.append(np.linalg.norm(X - C))
+                            
+        avg_dist_z = np.mean(sample_dists) if sample_dists else 600.0
+        
+        # 3. Final Sigmas
+        self.sigma_ray_global = cfg.px_target * (avg_dist_z / avg_f)
+        self.sigma_wand = self.wand_length * cfg.wand_tol_pct
+        
+        if cfg.verbosity >= 1:
+            print(f"  [P1] Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm ({cfg.px_target}px at Z={avg_dist_z:.1f}mm), sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)")
 
+    def _print_plane_diagnostics(self, stage_name: str):
+        """Print current plane normals and angles between them."""
+        print(f"\n  [{stage_name}] Plane Diagnostics:")
+        wids = sorted(self.window_planes.keys())
+        normals = []
+        for wid in wids:
+            n = self.window_planes[wid]['plane_n']
+            pt = self.window_planes[wid]['plane_pt']
+            normals.append(n)
+            print(f"    Win {wid}: n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}], pt=[{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]")
+        
+        if len(normals) == 2:
+            ang = angle_between_vectors(normals[0], normals[1])
+            print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
     
     def _apply_planes_to_cpp(self, planes: Dict[int, Dict]):
         """Apply plane parameters to all C++ camera objects."""
@@ -189,80 +242,7 @@ class RefractivePlaneOptimizer:
                 if cid in self.cams_cpp:
                     update_cpp_camera_state(self.cams_cpp[cid], plane_geom={'pt': pt_list, 'n': n_list})
     
-    def _check_plane_sanity(self, planes: Dict[int, Dict], radii: Dict[str, float]) -> bool:
-        """
-        Check if any bootstrap point violates the plane-side constraint s(X) > -epsilon - R.
-        
-        Args:
-            planes: Dictionary of plane parameters to validate/fix in-place.
-            radii: Dictionary with 'A' and 'B' keys for wand radii.
-            
-        Returns:
-            True if valid (after potential flips), False if rejected.
-        """
-        # 1. Camera Side Sanity (Flip normal if needed)
-        for wid, pl in planes.items():
-            n = pl['plane_n']
-            pt = pl['plane_pt']
-            
-            # Get camera centers for this window
-            centers = []
-            for cid in self.win_cams.get(wid, []):
-                if cid in self.cam_params:
-                    p = self.cam_params[cid]
-                    R = rodrigues_to_R(p[0:3])
-                    C = camera_center(R, p[3:6])
-                    centers.append(C)
-            
-            if centers:
-                # s(C) should be negative
-                s_vals = [np.dot(n, C - pt) for C in centers]
-                mean_s = np.mean(s_vals)
-                
-                if mean_s > 0:
-                    # Flip normal
-                    if self.config.verbosity >= 1:
-                        print(f"    [SANITY] Window {wid}: Cameras on positive side (s={mean_s:.1f}mm). FLIPPING normal.")
-                    pl['plane_n'] = -n
-                    # Re-normalize just in case
-                    pl['plane_n'] /= np.linalg.norm(pl['plane_n'])
-        
-        # 2. Point-side Sanity (using triangulated points and wand radii)
-        # Apply planes to C++ objects for ray building
-        self._apply_planes_to_cpp(planes)
-        
-        eps = 0.05 # 50 microns margin
-        
-        # Check all optimization frames (User request for robustness)
-        frames_to_check = self.fids_optim
-        
-        for fid in frames_to_check:
-            rays_A, rays_B = self._build_rays_frame(fid)
-            
-            # Helper to check for a given set of rays and radius
-            def check_endpoint_rays(rays: List[Ray], radius: float) -> bool:
-                if len(rays) >= 2:
-                    X, _, valid, _ = triangulate_point(rays)
-                    if valid:
-                        # [USER REQUEST] Global Sanity Check: X must be on the liquid side of ALL planes
-                        for wid_plane in planes:
-                            n = planes[wid_plane]['plane_n']
-                            pt = planes[wid_plane]['plane_pt']
-                            
-                            s = np.dot(X - pt, n)
-                            limit = radius + eps
-                            if s < limit:
-                                if self.config.verbosity >= 0:
-                                    print(f"    [SANITY] Window {wid_plane}: Point-side violation (s={s:.2f}mm < {limit:.2f}mm). REJECT update.")
-                                return False
-                return True
 
-            if not check_endpoint_rays(rays_A, radii.get('A', 0.0)):
-                return False
-            if not check_endpoint_rays(rays_B, radii.get('B', 0.0)):
-                return False
-            
-        return True
 
     def _build_rays_frame(self, fid: int) -> Tuple[List[Ray], List[Ray]]:
         """
@@ -352,14 +332,15 @@ class RefractivePlaneOptimizer:
             if validA:
                 for r in rays_A_all:
                     if r.valid:
-                        res_ray.append(point_to_ray_dist(XA, r.o, r.d))
+                        d = point_to_ray_dist(XA, r.o, r.d)
+                        res_ray.append(d / self.sigma_ray_global)
                     else:
-                        res_ray.append(PENALTY_RAY)
+                        res_ray.append(PENALTY_RAY / self.sigma_ray_global)
                 wids = set(r.window_id for r in rays_A_all if r.window_id != -1)
                 valid_points.append({'fid': fid, 'X': XA, 'wids': wids, 'ep': 'A'})
             else:
                 for _ in rays_A_all:
-                    res_ray.append(PENALTY_RAY)
+                    res_ray.append(PENALTY_RAY / self.sigma_ray_global)
 
             # Triangulate B
             validB = False
@@ -371,21 +352,23 @@ class RefractivePlaneOptimizer:
             if validB:
                 for r in rays_B_all:
                     if r.valid:
-                        res_ray.append(point_to_ray_dist(XB, r.o, r.d))
+                        d = point_to_ray_dist(XB, r.o, r.d)
+                        res_ray.append(d / self.sigma_ray_global)
                     else:
-                        res_ray.append(PENALTY_RAY)
+                        res_ray.append(PENALTY_RAY / self.sigma_ray_global)
                 wids = set(r.window_id for r in rays_B_all if r.window_id != -1)
                 valid_points.append({'fid': fid, 'X': XB, 'wids': wids, 'ep': 'B'})
             else:
                 for _ in rays_B_all:
-                    res_ray.append(PENALTY_RAY)
+                    res_ray.append(PENALTY_RAY / self.sigma_ray_global)
             
             # Wand Length
             if validA and validB:
                 dist = np.linalg.norm(XA - XB)
-                res_len.append(dist - self.wand_length)
+                err = dist - self.wand_length
+                res_len.append(err / self.sigma_wand)
             else:
-                res_len.append(PENALTY_LEN)
+                res_len.append(PENALTY_LEN / self.sigma_wand)
         
         # Compute statistics (Only on VALID entries for logging)
         # However, for Scipy, we return everything.
@@ -395,8 +378,8 @@ class RefractivePlaneOptimizer:
         # For stats reporting, we filter out penalty values? 
         # Actually, evaluate_residuals is also used for printing RMSE.
         # We should compute "Real" RMSE separate from "Solver" residual.
-        real_res_ray = arr_ray[arr_ray < PENALTY_RAY * 0.9]
-        real_res_len = arr_len[arr_len < PENALTY_LEN * 0.9]
+        real_res_ray = arr_ray[arr_ray < PENALTY_RAY * 0.9 / self.sigma_ray_global]
+        real_res_len = arr_len[arr_len < PENALTY_LEN * 0.9 / self.sigma_wand]
         
         S_ray = np.sum(real_res_ray**2) if len(real_res_ray) > 0 else (PENALTY_RAY**2) * len(arr_ray)
         S_len = np.sum(real_res_len**2) if len(real_res_len) > 0 else (PENALTY_LEN**2) * len(arr_len)
@@ -453,17 +436,6 @@ class RefractivePlaneOptimizer:
             arr_barrier = np.array(res_barrier)
             residuals = np.concatenate([residuals, arr_barrier])
         
-        # Add regularization if in 3D mode
-        if include_reg and mode in ['3D_full', 'joint']:
-            reg_residuals = []
-            for wid in self.window_ids:
-                n_curr = planes[wid]['plane_n']
-                n_init = self.initial_normals[wid]
-                diff = n_curr - n_init
-                reg_residuals.extend(np.sqrt(self.config.lambda_reg) * diff)
-            if reg_residuals:
-                residuals = np.concatenate([residuals, np.array(reg_residuals)])
-        
         return residuals, S_ray, S_len, N_ray, N_len, valid_points
     
     def _joint_residual_func(self, x: np.ndarray, lambda_eff: float) -> np.ndarray:
@@ -497,8 +469,8 @@ class RefractivePlaneOptimizer:
                 self._last_update_time = now
                 try:
                     # Compute metrics
-                    rmse_ray = np.sqrt(S_ray / max(1, N_ray))
-                    rmse_len = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
+                    rmse_ray = np.sqrt(S_ray / max(1, N_ray)) * self.sigma_ray_global
+                    rmse_len = np.sqrt(S_len / max(1, N_len)) * self.sigma_wand if N_len > 0 else 0.0
                     cost = 0.5 * (S_ray + lambda_eff * S_len)
                     
                     self.progress_callback(f"P1.3: Optimizing All Window parameters...", rmse_ray, rmse_len, cost)
@@ -507,39 +479,6 @@ class RefractivePlaneOptimizer:
                 
         return residuals
 
-    
-    def _adapt_lambda(self, lambda_old: float, S_ray: float, S_len: float, N_ray: int = 1, N_len: int = 1) -> float:
-        """Adapt lambda based on RMSE comparison.
-        
-        Strategy:
-        - If rmse_len <= rmse_ray: physics is good, keep lambda
-        - If rmse_len > rmse_ray: 
-            - First time: jump to 100
-            - Subsequent: double lambda
-        """
-        cfg = self.config
-        eps = 1e-12
-        
-        if S_len < eps or N_len == 0:
-            return lambda_old
-            
-        rmse_ray = np.sqrt(S_ray / max(1, N_ray))
-        rmse_len = np.sqrt(S_len / max(1, N_len))
-        
-        if rmse_len <= rmse_ray:
-            # Physics constraint is satisfied, no need to increase lambda
-            return lambda_old
-        
-        # rmse_len > rmse_ray: need more emphasis on wand length
-        if lambda_old < 100.0:
-            lambda_new = 100.0  # First time: jump to 100
-        else:
-            lambda_new = lambda_old * 2.0  # Subsequently: double
-        
-        # Global clamp
-        lambda_new = min(lambda_new, cfg.lambda_max)
-        
-        return lambda_new
     
     def _single_window_residual_func(self, x: np.ndarray, target_wid: int, 
                                       mode: str, lambda_eff: float) -> np.ndarray:
@@ -585,8 +524,8 @@ class RefractivePlaneOptimizer:
                 self._last_update_time = now
                 try:
                     # Compute metrics
-                    rmse_ray = np.sqrt(S_ray / max(1, N_ray))
-                    rmse_len = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
+                    rmse_ray = np.sqrt(S_ray / max(1, N_ray)) * self.sigma_ray_global
+                    rmse_len = np.sqrt(S_len / max(1, N_len)) * self.sigma_wand if N_len > 0 else 0.0
                     cost = 0.5 * (S_ray + lambda_eff * S_len)
                     
                     if mode == '1D_d':
@@ -601,30 +540,29 @@ class RefractivePlaneOptimizer:
     
     def optimize_per_window(self) -> Dict[int, Dict]:
         """
-        P1.1 and P1.2: Per-window optimization with outer-loop lambda adaptation.
+        P1.1 and P1.2: Per-window optimization with FIXED weighting.
         
         For each window:
         - P1.1: 1D optimization of d only
         - P1.2: 3D optimization of (d, alpha, beta)
         
-        Both stages use outer-loop lambda adaptation.
+        Uses fixed lambda = 2.0 * N_cams.
         """
-        print(f"\n  [P1.1/P1.2] Per-Window Optimization")
+        self._compute_physical_sigmas()
+        enable_ray_tracking(True, reset=True)
+        print("\n" + "="*50)
+        print("[Refractive][P1] Starting Per-Window Plane Optimization")
         
         cfg = self.config
         
-        # Initial lambda estimation using current planes
-        # [UNIFIED] Use S_ray/S_len ratio (same as P1.3) instead of N_ray/N_len
-        _, S_ray_init, S_len_init, N_ray, N_len, valid_points_init = self.evaluate_residuals(
-            self.window_planes, 1.0, include_reg=False, status_desc="Initializing...")
+        # [USER REQUEST] Fixed Weighting Strategy
+        # Lambda = 2.0 * N_active_cams
+        # This balances ~2N ray residuals vs 1 length residual
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
         
-        if S_len_init > 1e-12:
-            lambda_eff = S_ray_init / S_len_init
-        else:
-            lambda_eff = cfg.lambda0_init
-        lambda_eff = np.clip(lambda_eff, cfg.lambda_min, cfg.lambda_max)
-        
-        print(f"    Global Init: S_ray={S_ray_init:.4f}, S_len={S_len_init:.4f}, lambda_eff={lambda_eff:.2f}")
+        print(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
+        print(f"    Normal Constraint: alpha_beta_bound={cfg.alpha_beta_bound:.6f} rad ({np.degrees(cfg.alpha_beta_bound):.2f}°)")
 
         # Get wand radii for sanity checks
         radii = {
@@ -641,7 +579,7 @@ class RefractivePlaneOptimizer:
             
             # [USER REQUEST] Get contemporary 3D points for d_max
             _, _, _, _, _, valid_points_curr = self.evaluate_residuals(
-                self.window_planes, lambda_eff, include_reg=False, status_desc=f"Updating points for Window {wid}...")
+                self.window_planes, lambda_fixed, include_reg=False, status_desc=f"Updating points for Window {wid}...")
             
             # Get initial parameters
             pl = self.window_planes[wid]
@@ -687,70 +625,35 @@ class RefractivePlaneOptimizer:
             print(f"    Bounds: [d_min={d_min:.1f}, d_max={d_max:.1f}] (d_init={d_init:.1f})")
             
             # ===== P1.1: 1D Optimization (d only) =====
-            print(f"    [P1.1] 1D Optimize d (init={d_init:.1f}, bounds=[{d_min:.1f}, {d_max:.1f}])")
+            print(f"    [P1.1] 1D Optimize d (init={d_init:.1f})")
             
             x_1d = np.array([d_init])
-            # Ensure start is within bounds (float tolerance)
             x_1d = np.clip(x_1d, d_min, d_max)
-            lambda_local = lambda_eff  # Start with global estimate
-            
-            for outer_round in range(cfg.outer_rounds):
-                # Pump events
-                if self.progress_callback:
-                    try:
-                        self.progress_callback(f"Adjusting Window {wid} Distance...", 0, 0, 0)
-                    except:
-                        pass
 
-                result = least_squares(
-                    lambda x: self._single_window_residual_func(x, wid, '1D_d', lambda_local),
-                    x_1d,
-                    bounds=(np.array([d_min]), np.array([d_max])),
-                    loss='huber', f_scale=1.0,
-                    verbose=0,
-                    max_nfev=50,
-                    ftol=1e-8, xtol=1e-8, gtol=1e-8
-                )
-                x_1d = result.x.copy()
-                
-                # Evaluate at solution
-                d_opt = x_1d[0]
-                temp_planes = {w: {'plane_pt': self.window_planes[w]['plane_pt'].copy(),
-                                   'plane_n': self.window_planes[w]['plane_n'].copy()}
-                               for w in self.window_ids}
-                temp_planes[wid]['plane_pt'] = anchor + n_init * d_opt
-                
-                _, S_ray, S_len, _, _, _ = self.evaluate_residuals(temp_planes, lambda_local, include_reg=False,
-                                                               status_desc=f"Adjusting Window {wid} Distance...")
-                ratio = (lambda_local * S_len) / max(S_ray, 1e-12)
-                
-                if outer_round == 0:
-                    print(f"      [AUDIT] lambda={lambda_local:.2f}, S_ray={S_ray:.2f}, S_len={S_len:.4f}, ratio={ratio:.3f}")
-                
-                # Report progress
-                if self.progress_callback:
-                    rmse_ray_audit = np.sqrt(S_ray / max(1, N_ray))
-                    rmse_len_audit = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
-                    self.progress_callback(f"Adjusting Window {wid} Distance...", rmse_ray_audit, rmse_len_audit, result.cost)
-                
-                # Adapt lambda
-                lambda_old = lambda_local
-                lambda_local = self._adapt_lambda(lambda_old, S_ray, S_len)
-            
-            d_opt_1d = x_1d[0]
+            # Single Pass Optimization
+            if self.progress_callback:
+                try:
+                    self.progress_callback(f"Adjusting Window {wid} Distance...", 0, 0, 0)
+                except:
+                    pass
+
+            result = least_squares(
+                lambda x: self._single_window_residual_func(x, wid, '1D_d', lambda_fixed),
+                x_1d,
+                bounds=(np.array([d_min]), np.array([d_max])),
+                loss='huber', f_scale=1.0,
+                verbose=0,
+                max_nfev=50,
+                ftol=1e-6, xtol=1e-6, gtol=1e-6
+            )
+            d_opt_1d = result.x[0]
             print(f"      -> d_opt: {d_opt_1d:.2f} mm (cost: {result.cost:.4f})")
             
             # Update planes with 1D result
             old_pt = self.window_planes[wid]['plane_pt'].copy()
             old_n = self.window_planes[wid]['plane_n'].copy()
-            
             self.window_planes[wid]['plane_pt'] = anchor + n_init * d_opt_1d
             
-            # Sanity Check
-            if not self._check_plane_sanity(self.window_planes, radii):
-                 print(f"      [P1.1] Reverting Window {wid} (Bad Geometry)")
-                 self.window_planes[wid]['plane_pt'] = old_pt
-                 self.window_planes[wid]['plane_n'] = old_n
             
             # ===== P1.2: 3D Optimization [d, alpha, beta] =====
             print(f"    [P1.2] 3D Optimize [d, alpha, beta]")
@@ -760,86 +663,55 @@ class RefractivePlaneOptimizer:
             x_3d = np.array([d_opt_1d, 0.0, 0.0])
             x_3d = np.clip(x_3d, lb, ub)
             
-            for outer_round in range(cfg.outer_rounds):
-                # Pump events
-                if self.progress_callback:
-                    try:
-                        self.progress_callback(f"Adjusting Window {wid} Angle...", 0, 0, 0)
-                    except:
-                        pass
-                result = least_squares(
-                    lambda x: self._single_window_residual_func(x, wid, '3D_full', lambda_local),
-                    x_3d,
-                    bounds=(lb, ub),
-                    loss='huber', f_scale=1.0,
-                    verbose=0,
-                    max_nfev=50,
-                    ftol=1e-8, xtol=1e-8, gtol=1e-8
-                )
-                x_3d = result.x.copy()
-                
-                # Evaluate at solution
-                d_opt, alpha, beta = x_3d
-                n_new = update_normal_tangent(n_init, alpha, beta)
-                temp_planes = {w: {'plane_pt': self.window_planes[w]['plane_pt'].copy(),
-                                   'plane_n': self.window_planes[w]['plane_n'].copy()}
-                               for w in self.window_ids}
-                temp_planes[wid] = {'plane_pt': anchor + n_new * d_opt, 'plane_n': n_new}
-                
-                _, S_ray, S_len, _, _, _ = self.evaluate_residuals(temp_planes, lambda_local, include_reg=False,
-                                                               status_desc=f"Adjusting Window {wid} Angle...")
-                ratio = (lambda_local * S_len) / max(S_ray, 1e-12)
-                
-                if outer_round == 0:
-                    print(f"      [AUDIT] lambda={lambda_local:.2f}, S_ray={S_ray:.2f}, S_len={S_len:.4f}, ratio={ratio:.3f}")
-
-                # Report progress
-                if self.progress_callback:
-                    rmse_ray_audit = np.sqrt(S_ray / max(1, N_ray))
-                    rmse_len_audit = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
-                    self.progress_callback(f"Adjusting Window {wid} Angle...", rmse_ray_audit, rmse_len_audit, result.cost)
-                
-                # Adapt lambda
-                lambda_old = lambda_local
-                lambda_local = self._adapt_lambda(lambda_old, S_ray, S_len, N_ray, N_len)
+            # Single Pass Optimization
+            if self.progress_callback:
+                try:
+                    self.progress_callback(f"Adjusting Window {wid} Angle...", 0, 0, 0)
+                except:
+                    pass
             
-            d_final, a_final, b_final = x_3d
+            result = least_squares(
+                lambda x: self._single_window_residual_func(x, wid, '3D_full', lambda_fixed),
+                x_3d,
+                bounds=(lb, ub),
+                loss='huber', f_scale=1.0,
+                verbose=0,
+                max_nfev=50,
+                ftol=1e-6, xtol=1e-6, gtol=1e-6
+            )
+
+            d_final, a_final, b_final = result.x
             n_final = update_normal_tangent(n_init, a_final, b_final)
             pt_final = anchor + n_final * d_final
             
             # Report
             angle = angle_between_vectors(n_final, n_init)
-            print(f"      -> d={d_final:.2f}, alpha={a_final:.4f}, beta={b_final:.4f}")
+            print(f"      -> d={d_final:.2f}, alpha={a_final:.4f}, beta={b_final:.4f} (cost: {result.cost:.4f})")
             print(f"      -> n_new: {n_final.round(4)}, angle_change: {angle:.2f}°")
             
             # Commit
             old_pt = self.window_planes[wid]['plane_pt'].copy()
             old_n = self.window_planes[wid]['plane_n'].copy()
-            
             self.window_planes[wid] = {'plane_pt': pt_final, 'plane_n': n_final}
             
-            # Sanity Check
-            radii = {
-                'A': self.dataset.get('est_radius_small_mm', 0.0),
-                'B': self.dataset.get('est_radius_large_mm', 0.0)
-            }
-            if not self._check_plane_sanity(self.window_planes, radii):
-                 print(f"      [P1.2] Reverting Window {wid} (Bad Geometry)")
-                 self.window_planes[wid]['plane_pt'] = old_pt
-                 self.window_planes[wid]['plane_n'] = old_n
             
             # Update initial_normals for P1.3 regularization baseline
             self.initial_normals[wid] = n_final.copy()
             
-            # Carry forward lambda for next window
-            lambda_eff = lambda_local
-        
+        print("[Refractive][P1] Per-window optimization complete.")
+        self._print_plane_diagnostics("P1.2 Per-Window End")
+        print_ray_stats_report("P1.1/P1.2 Per-Window")
+        enable_ray_tracking(False)
         return self.window_planes
     
     def optimize_joint(self) -> Dict[int, Dict]:
         """
-        P1.3: Joint optimization of all windows with outer-loop lambda adaptation.
+        P1.3: Joint optimization of all windows with FIXED weighting.
         """
+        self._compute_physical_sigmas()
+        enable_ray_tracking(True, reset=True)
+        print("\n" + "="*50)
+        print("[Refractive][P1] Starting Joint Window Optimization (P1.3)")
         print(f"\n  [P1.3] Joint Optimization (All {self.n_windows} Windows)")
         
         cfg = self.config
@@ -850,30 +722,25 @@ class RefractivePlaneOptimizer:
             'B': self.dataset.get('est_radius_large_mm', 0.0)
         }
         
-        
         if self.progress_callback:
              try:
                  self.progress_callback("P1.3: Optimizing All Window parameters...", 0, 0, 0)
              except:
                  pass
 
-        # Initial lambda estimation
-        # [USER REQUEST] Use S_ray/S_len (error magnitude ratio) instead of N_ray/N_len (count ratio)
+        # [USER REQUEST] Fixed Weighting Strategy
+        # Lambda = 2.0 * N_active_cams
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
+        
+        # Initial evaluation just for logging / valid points
         _, S_ray_init, S_len_init, N_ray, N_len, valid_points_init = self.evaluate_residuals(
-            self.window_planes, 1.0, include_reg=False, status_desc="Optimizing All Window parameters...")
+            self.window_planes, lambda_fixed, include_reg=False, status_desc="Initializing Joint Opt...")
         
-        if S_len_init > 1e-12:
-            lambda_eff = S_ray_init / S_len_init
-        else:
-            lambda_eff = cfg.lambda0_init
-        
-        lambda_eff = np.clip(lambda_eff, cfg.lambda_min, cfg.lambda_max)
-        
-        print(f"    Initial: S_ray={S_ray_init:.4f}, S_len={S_len_init:.4f}, lambda_eff={lambda_eff:.2f}")
+        print(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
+        print(f"    Initial: S_ray={S_ray_init:.4f}, S_len={S_len_init:.4f}")
         
         # [USER REQUEST] Contemporary 3D points for Joint d_max bounds
-        # (Though d_max in P1.3 is mostly for safety, we should still use refracted points)
-        # We iteration over windows to rebuild bounds with CURRENT points
         x0 = []
         lb = []
         ub = []
@@ -904,67 +771,47 @@ class RefractivePlaneOptimizer:
         x0 = np.array(x0)
         bounds = (np.array(lb), np.array(ub))
         
-        # Outer-loop lambda adaptation
+        # Single Pass Optimization
         x_current = x0.copy()
         
-        for outer_round in range(cfg.outer_rounds):
-            # Pump events
-            if self.progress_callback:
-                try:
-                    self.progress_callback(f"Optimizing All Window parameters...", 0, 0, 0)
-                except:
-                    pass
+        if self.progress_callback:
+            try:
+                self.progress_callback(f"Optimizing All Window parameters...", 0, 0, 0)
+            except:
+                pass
 
-            print(f"\n    --- Outer Round {outer_round + 1}/{cfg.outer_rounds} ---")
-
+        result = least_squares(
+            lambda x: self._joint_residual_func(x, lambda_fixed),
+            x_current,
+            bounds=bounds,
+            loss='huber', f_scale=1.0,
+            verbose=0,
+            max_nfev=50,
+            ftol=1e-6, xtol=1e-6, gtol=1e-6
+        )
+        x_current = result.x.copy()
+        
+        # Reconstruct planes from solution
+        planes = {}
+        for i, wid in enumerate(self.window_ids):
+            d_val = x_current[3*i]
+            alpha = x_current[3*i + 1]
+            beta = x_current[3*i + 2]
             
-            result = least_squares(
-                lambda x: self._joint_residual_func(x, lambda_eff),
-                x_current,
-                bounds=bounds,
-                loss='huber', f_scale=1.0,
-                verbose=0,
-                max_nfev=50,
-                ftol=1e-8, xtol=1e-8, gtol=1e-8
-            )
+            n_base = self.initial_normals[wid]
+            n_new = update_normal_tangent(n_base, alpha, beta)
+            anchor = self.win_anchors[wid]
+            plane_pt = anchor + n_new * d_val
             
-            x_current = result.x.copy()
-            
-            # Reconstruct planes from solution
-            planes = {}
-            for i, wid in enumerate(self.window_ids):
-                d_val = x_current[3*i]
-                alpha = x_current[3*i + 1]
-                beta = x_current[3*i + 2]
-                
-                n_base = self.initial_normals[wid]
-                n_new = update_normal_tangent(n_base, alpha, beta)
-                anchor = self.win_anchors[wid]
-                plane_pt = anchor + n_new * d_val
-                
-                planes[wid] = {'plane_pt': plane_pt, 'plane_n': n_new}
-            
-            # Evaluate S_ray and S_len at solution
-            _, S_ray, S_len, _, _, _ = self.evaluate_residuals(planes, lambda_eff, include_reg=False,
-                                                          status_desc="Optimizing All Window parameters...")
-            
-            current_ratio = (lambda_eff * S_len) / max(S_ray, 1e-12)
-            
-            # AUDIT log
-            print(f"    [AUDIT] N_ray={N_ray}, N_len={N_len}, lambda_eff={lambda_eff:.2f}")
-            print(f"            S_ray={S_ray:.4f}, S_len={S_len:.4f}, ratio={current_ratio:.4f}")
-            print(f"            cost={result.cost:.4f}")
-            
-            # Push AUDIT results to UI
-            if self.progress_callback:
-                rmse_ray_audit = np.sqrt(S_ray / max(1, N_ray))
-                rmse_len_audit = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
-                self.progress_callback(f"Optimizing All Window parameters...", rmse_ray_audit, rmse_len_audit, result.cost)
-            
-            # Adapt lambda
-            lambda_old = lambda_eff
-            lambda_eff = self._adapt_lambda(lambda_old, S_ray, S_len, N_ray, N_len)
-            print(f"    Lambda update: {lambda_old:.2f} -> {lambda_eff:.2f}")
+            planes[wid] = {'plane_pt': plane_pt, 'plane_n': n_new}
+        
+        # Final Report
+        _, S_ray, S_len, _, _, _ = self.evaluate_residuals(planes, lambda_fixed, include_reg=False,
+                                                      status_desc="Optimizing All Window parameters...")
+        if self.progress_callback:
+            rmse_ray_audit = np.sqrt(S_ray / max(1, N_ray))
+            rmse_len_audit = np.sqrt(S_len / max(1, N_len)) if N_len > 0 else 0.0
+            self.progress_callback(f"Optimizing All Window parameters...", rmse_ray_audit, rmse_len_audit, result.cost)
         
         # Final result
         final_planes = {}
@@ -993,15 +840,17 @@ class RefractivePlaneOptimizer:
                       
         self.window_planes = final_planes
         
+        print("[Refractive][P1] P1.3 Joint optimization complete.")
+        self._print_plane_diagnostics("P1.3 Joint End")
+        print_ray_stats_report("P1.3 Joint")
+        enable_ray_tracking(False)
+        
         # Sanity Check
         radii = {
             'A': self.dataset.get('est_radius_small_mm', 0.0),
             'B': self.dataset.get('est_radius_large_mm', 0.0)
         }
-        if not self._check_plane_sanity(self.window_planes, radii):
-             print(f"    [P1.3] Joint Optimization rejected (Bad Geometry). Reverting.")
-             self.window_planes = old_planes
-             return old_planes
+
         
         return final_planes
     

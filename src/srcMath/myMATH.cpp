@@ -418,6 +418,17 @@ void triangulation(Pt3D& pt_world, double& error,
     error = std::sqrt(error / n);
 }
 
+// Cross product of two 3d vectors
+Pt3D cross (Pt3D const& vec1, Pt3D const& vec2)
+{
+    Pt3D res;
+    res[0] = vec1[1]*vec2[2] - vec1[2]*vec2[1];
+    res[1] = vec1[2]*vec2[0] - vec1[0]*vec2[2];
+    res[2] = vec1[0]*vec2[1] - vec1[1]*vec2[0];
+    return res;
+}
+
+
 // Find the cross points of two 2d lines
 bool crossPoint (Pt2D& pt2d, Line2D const& line1, Line2D const& line2)
 {

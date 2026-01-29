@@ -272,8 +272,7 @@ void Camera::loadParameters(std::istream &is) {
     }
     _pinplate_param.n_plate = _pinplate_param.w_array.size();
 
-    // update closest point to the camera
-    updatePt3dClosest();
+    updatePinPlateParam();
 
     // read projection tolerance
     is >> _pinplate_param.proj_tol;
@@ -385,56 +384,6 @@ void Camera::updatePolyDuDv() {
     }
   }
 }
-
-void Camera::updatePt3dClosest() {
-  if (_type != PINPLATE) return;
-
-  // Task B2: User requires using unit normal explicitly
-  // Task C: Add Contract Comment
-  // ============================================================
-  //  PINPLATE GEOMETRY CONTRACT
-  //    - _pinplate_param.plane.pt      : farthest interface reference point (Control Point on Glass Surface)
-  //    - _pinplate_param.plane.norm_vector : geometric normal, points away from camera (Camera -> Object)
-  //    - w_array                       : stored farthest -> nearest ([thick])
-  //    - pt3d_closest                  : Derived. closest interface point.
-  //                                      pt3d_closest = plane.pt - n_hat * sum(w_array)
-  // ============================================================
-
-  // Ensure normalized
-  double nn = _pinplate_param.plane.norm_vector.norm();
-  if (nn < 1e-12) {
-    std::cerr << "updatePt3dClosest: plane normal near zero\n";
-    throw error_type;
-  }
-  _pinplate_param.plane.norm_vector /= nn;
-  Pt3D n_hat = _pinplate_param.plane.norm_vector; // Use this n_hat
-
-  _pinplate_param.pt3d_closest = _pinplate_param.plane.pt; // start at farthest
-
-  double total_w = 0.0;
-  // Subtract width to go from Farthest -> Nearest (Closest)
-  for (int i = 0; i < _pinplate_param.n_plate; i++) {
-    double w = _pinplate_param.w_array[i];
-    _pinplate_param.pt3d_closest = _pinplate_param.pt3d_closest - n_hat * w;
-    total_w += w;
-  }
-
-  // Task C: One-time Debug Print
-  static bool printed_once = false;
-  if (!printed_once) {
-      double dist = (_pinplate_param.plane.pt - _pinplate_param.pt3d_closest).norm();
-      std::cout << "[PINPLATE][GEOMETRY] updatePt3dClosest Report:" << std::endl;
-      std::cout << "  norm(n_hat) = " << n_hat.norm() << std::endl;
-      std::cout << "  sum_w       = " << total_w << " mm" << std::endl;
-      std::cout << "  ||plane.pt - pt3d_closest|| = " << dist << " mm" << std::endl;
-      if (std::abs(total_w - dist) > 1e-4) {
-          std::cout << "  [CRITICAL] Distance Mismatch! Geometry definition error." << std::endl;
-      }
-      printed_once = true;
-  }
-}
-
-
 
 Pt3D Camera::rmtxTorvec(Matrix<double> const &r_mtx) {
   Pt3D r_vec;
@@ -647,7 +596,7 @@ Pt2D Camera::project(Pt3D const &pt_world, bool is_print_detail) const {
   } else if (_type == POLYNOMIAL) {
     return polyProject(pt_world);
   } else if (_type == PINPLATE) {
-    std::tuple<bool, Pt3D, double> result = refractPlate(pt_world);
+    std::tuple<bool, Pt3D, double, int> result = refractPlate(pt_world);
     if (is_print_detail) {
       std::cout << "Camera::Project line " << __LINE__
                 << " : result (is_parallel,error^2): " << std::get<0>(result)
@@ -678,220 +627,6 @@ Pt2D Camera::worldToUndistImg(Pt3D const &pt_world,
   return pt_img_mm;
 }
 
-// Plate refraction model
-std::tuple<bool, Pt3D, double>
-Camera::refractPlate(Pt3D const &pt_world) const {
-  Plane3D plane;
-  Line3D line;
-  Pt3D pt_cross;
-  Pt3D pt_init;
-  Pt3D pt_last;
-  std::tuple<bool, Pt3D, double> result = {false, {0, 0, 0}, -1};
-  bool is_parallel = false;
-
-  bool is_check_radius = false;
-  double radius_max2 =
-      0; // max r^2 from projected point on the first plane to pt_world
-  // double radius_plane = 0; // r projected point on the plane
-  if (_pinplate_param.refract_ratio_max > 1.0) {
-    is_check_radius = true;
-    double sin = 1 / _pinplate_param.refract_ratio_max;
-    radius_max2 =
-        myMATH::dist2(pt_world, _pinplate_param.plane) / (1 - sin * sin);
-    // radius_plane = std::sqrt(radius_max2) * sin;
-  }
-
-  double cos_1;
-  double cos_2;
-  double factor;
-  double refract_ratio;
-  double diff_vec[3] = {0, 0, 0};
-  double delta = -1;
-  double lr = _pinplate_param.lr;
-  double radius2 = 0;
-  for (int iter = 1; iter < _pinplate_param.proj_nmax; iter++) {
-    is_parallel = false;
-    plane = _pinplate_param.plane;
-
-    if (iter == 1) {
-      line.pt = pt_world;
-      line.unit_vector =
-          myMATH::createUnitVector(pt_world, _pinplate_param.t_vec_inv);
-      is_parallel = myMATH::crossPoint(pt_cross, line, plane);
-      if (is_parallel) {
-        std::get<0>(result) = is_parallel;
-        return result;
-      }
-      pt_init = pt_cross;
-
-      // check radius
-      if (is_check_radius) {
-        radius2 = myMATH::dist2(pt_init, pt_world);
-        int iter_innner = 0;
-        while (radius2 >= radius_max2) {
-          // update pt_init
-          cos_1 = myMATH::dot(line.unit_vector, plane.norm_vector);
-          for (int i = 0; i < 3; i++) {
-            diff_vec[i] = pt_init[i] - pt_world[i];
-            diff_vec[i] -= cos_1 * plane.norm_vector[i];
-          }
-          for (int i = 0; i < 3; i++) {
-            pt_init[i] -= 0.5 * diff_vec[i];
-          }
-
-          // update line
-          line.pt = pt_world;
-          pt_cross = pt_init;
-          line.unit_vector = myMATH::createUnitVector(line.pt, pt_cross);
-
-          // update radius
-          radius2 = myMATH::dist2(pt_init, pt_world);
-          iter_innner++;
-
-          if (iter_innner > _pinplate_param.proj_nmax) {
-            std::cout << "Camera::RefractPlate line " << __LINE__
-                      << " : Error: maximum number of iterations reached"
-                      << std::endl;
-            std::get<0>(result) = true;
-            return result;
-          }
-        }
-      }
-    } else {
-      line.pt = pt_world;
-      pt_cross = pt_init;
-
-      line.unit_vector = myMATH::createUnitVector(line.pt, pt_cross);
-    }
-
-    // forward projection: find intersection with each plane
-    int plane_id = 0;
-    for (plane_id = 1; plane_id < _pinplate_param.n_plate + 1; plane_id++) {
-      refract_ratio = _pinplate_param.refract_array[plane_id - 1] /
-                      _pinplate_param.refract_array[plane_id];
-      cos_1 = myMATH::dot(line.unit_vector, plane.norm_vector);
-      cos_1 = cos_1 > 1 ? 1 : cos_1 < -1 ? -1 : cos_1;
-      cos_2 = 1 - refract_ratio * refract_ratio * (1 - cos_1 * cos_1);
-      if (cos_2 <= 0) {
-        std::cout << "Camera::RefractPlate line " << __LINE__
-                  << " : Error: total internal reflection" << std::endl;
-        std::cout << "(iter,plane_id,lr,cos_1,cos_2): " << iter << ","
-                  << plane_id << "," << lr << "," << cos_1 << "," << cos_2
-                  << std::endl;
-
-        is_parallel = true;
-        std::get<0>(result) = is_parallel;
-        return result;
-      }
-      factor = -refract_ratio * cos_1 - std::sqrt(cos_2);
-
-      // get new line
-      line.pt = pt_cross;
-      line.unit_vector =
-          line.unit_vector * refract_ratio + plane.norm_vector * factor;
-
-      // get new plane
-      plane.pt -= plane.norm_vector * _pinplate_param.w_array[plane_id - 1];
-
-      // calculate new intersection
-      is_parallel = myMATH::crossPoint(pt_cross, line, plane);
-      if (is_parallel) {
-        std::get<0>(result) = is_parallel;
-        return result;
-      }
-    }
-    pt_last = pt_cross;
-
-    // backward projection: find intersection with the last plane
-    plane_id = _pinplate_param.n_plate;
-
-    // get line vector
-    refract_ratio = _pinplate_param.refract_array[plane_id] /
-                    _pinplate_param.refract_array[plane_id + 1];
-    cos_1 = myMATH::dot(line.unit_vector, plane.norm_vector);
-    cos_1 = cos_1 > 1 ? 1 : cos_1 < -1 ? -1 : cos_1;
-    cos_2 = 1 - refract_ratio * refract_ratio * (1 - cos_1 * cos_1);
-    if (cos_2 <= 0) {
-      std::cout << "Camera::RefractPlate line " << __LINE__
-                << " : Error: total internal reflection" << std::endl;
-      std::cout << "(iter,plane_id,cos_1,cos_2,delta): " << iter << ","
-                << plane_id << "," << cos_1 << "," << cos_2 << "," << delta
-                << std::endl;
-
-      is_parallel = true;
-      std::get<0>(result) = is_parallel;
-      return result;
-    }
-
-    factor = -refract_ratio * cos_1 - std::sqrt(cos_2);
-
-    line.unit_vector =
-        line.unit_vector * refract_ratio + plane.norm_vector * factor;
-    line.pt = _pinplate_param.t_vec_inv;
-
-    // calculate intersection
-    is_parallel = myMATH::crossPoint(pt_cross, line, plane);
-    if (is_parallel) {
-      std::get<0>(result) = is_parallel;
-      return result;
-    }
-
-    // calculate diff vector
-    delta = 0;
-    for (int i = 0; i < 3; i++) {
-      diff_vec[i] = pt_cross[i] - pt_last[i];
-      delta += diff_vec[i] * diff_vec[i];
-    }
-    delta = std::sqrt(delta);
-
-    // check convergence
-    if (delta < _pinplate_param.proj_tol) {
-      std::get<1>(result) = pt_cross;
-      std::get<2>(result) = delta;
-      return result;
-    }
-
-    // update pt_init
-    for (int i = 0; i < 3; i++) {
-      pt_cross[i] = pt_init[i] + lr * diff_vec[i];
-    }
-
-    // check radius
-    if (is_check_radius) {
-      radius2 = myMATH::dist2(pt_cross, pt_world);
-      int iter_innner = 0;
-      while (radius2 >= radius_max2) {
-        // update learning rate
-        lr *= 0.5;
-
-        // update pt
-        for (int i = 0; i < 3; i++) {
-          pt_cross[i] = pt_init[i] + lr * diff_vec[i];
-        }
-
-        // update radius
-        radius2 = myMATH::dist2(pt_cross, pt_world);
-
-        iter_innner++;
-        if (iter_innner > _pinplate_param.proj_nmax) {
-          std::cout << "Camera::RefractPlate line " << __LINE__
-                    << " : Error: maximum number of iterations reached"
-                    << std::endl;
-          std::get<0>(result) = true;
-          return result;
-        }
-      }
-    }
-
-    // update pt_init
-    pt_init = pt_cross;
-  }
-
-  std::get<0>(result) = is_parallel;
-  std::get<1>(result) = pt_cross;
-  std::get<2>(result) = delta;
-  return result;
-}
 
 Pt2D Camera::distort(Pt2D const &pt_img_undist,
                      PinholeParam const &param) const {
@@ -1076,164 +811,400 @@ Line3D Camera::pinholeLine(Pt2D const &pt_img_undist) const {
   return line;
 }
 
-Line3D Camera::pinplateLine(Pt2D const &pt_img_undist) const {
+void Camera::updatePinPlateParam ()
+{
+    if (_type == PINPLATE)
+    {
+        // from farthest to nearest to camera
+        _pinplate_param.plane_array = std::vector<Plane3D>(_pinplate_param.n_plate + 1);
+        _pinplate_param.plane_array[0] = _pinplate_param.plane;
 
-  // ============================================================
-  //  PINPLATE (Route B) FULL IMPLEMENTATION
-  //  Contract (matches struct comment):
-  //    - _pinplate_param.plane.pt      : farthest interface reference point
-  //    - _pinplate_param.plane.norm_vector : geometric normal, points away from camera (camera->object)
-  //    - refract_array, w_array        : stored farthest -> nearest
-  //      Example n_plate=1: refract_array = [n_obj, n_win, n_air]
-  //                         w_array      = [thickness] (farthest->nearest, only one)
-  //  Ray tracing physical order:
-  //    - start from closest interface, march toward farthest interface
-  //    - use index mapping to consume farthest->nearest arrays correctly
-  // ============================================================
+        for (int i = 1; i <= _pinplate_param.n_plate; i ++)
+        {
+            Plane3D& prev_plane = _pinplate_param.plane_array[i-1];
+            Plane3D& curr_plane = _pinplate_param.plane_array[i];
 
-  // ----------------------------
-  // Build initial LOS in camera/world coordinates (same as your original)
-  // ----------------------------
-  Pt3D pt_world(pt_img_undist[0], pt_img_undist[1], 1.0);
+            // point on the current plane
+            curr_plane.pt = prev_plane.pt - prev_plane.norm_vector * _pinplate_param.w_array[i-1];
 
-  // calculate line of sight: pt_world = R_inv * [u,v,1] + t_inv
-  pt_world = _pinplate_param.r_mtx_inv * pt_world + _pinplate_param.t_vec_inv;
+            // normal vector of the current plane
+            curr_plane.norm_vector = prev_plane.norm_vector;
+        }
 
-  Line3D line;
-  line.pt = _pinplate_param.t_vec_inv; // Camera center (world)
-
-  // v_air = normalize(pt_world - cam_center) = normalize(R_inv * [u,v,1])
-  line.unit_vector = myMATH::createUnitVector(_pinplate_param.t_vec_inv, pt_world);
-  // ----------------------------
-  // Construct first interface plane (closest to camera)
-  // IMPORTANT:
-  //   - plane.norm_vector is the GEOMETRIC normal and MUST be fixed
-  //   - it points away from camera (camera -> object)
-  //   - plane.pt is the CLOSEST interface point (prepared by updatePt3dClosest())
-  // ----------------------------
-  Plane3D plane;
-  plane.pt = _pinplate_param.pt3d_closest;          // closest interface
-  plane.norm_vector = _pinplate_param.plane.norm_vector; // geom normal (fixed)
-
-  // Normalize geometric normal (critical)
-  double nrm = plane.norm_vector.norm();
-  if (nrm < 1e-12) {
-    std::cerr << "Camera::pinplateLine: Error: plane normal is near zero" << std::endl;
-    throw error_type;
-  }
-  plane.norm_vector /= nrm;
-
-  // ----------------------------
-  // Helpers for Route B indexing (farthest->nearest storage)
-  // Physical propagation: closest -> farthest, interfaces k=0..P
-  // For each interface k:
-  //   n1 = medium on camera-side (near side) of that interface
-  //   n2 = medium on object-side (far side) of that interface
-  //
-  // Storage: refract_array[0] = farthest medium (object-side),
-  //          refract_array[P+1] = nearest medium (camera-side)
-  //
-  // Mapping:
-  //   n1(k) = refract_array[P+1 - k]
-  //   n2(k) = refract_array[P   - k]
-  //
-  // Thickness advance after interface k (k < P):
-  //   plane.pt += n_geom * w_array[P-1 - k]
-  // ----------------------------
-  const int P = _pinplate_param.n_plate;
-
-  auto get_n1 = [&](int k) -> double {
-    return _pinplate_param.refract_array[P + 1 - k];
-  };
-  auto get_n2 = [&](int k) -> double {
-    return _pinplate_param.refract_array[P - k];
-  };
-  auto get_w_forward = [&](int k) -> double {
-    return _pinplate_param.w_array[P - 1 - k];
-  };
-
-  Pt3D pt_cross;
-  bool is_parallel = false;
-
-  // ----------------------------
-  // Loop interfaces from closest (k=0) to farthest (k=P)
-  // ----------------------------
-  for (int k = 0; k <= P; ++k) {
-
-    // Intersect current line with current interface plane
-    is_parallel = myMATH::crossPoint(pt_cross, line, plane);
-    if (is_parallel) {
-      std::cerr << "Camera::pinplateLine line " << __LINE__
-                << " : Error: line is parallel to the plane" << std::endl;
-      throw error_type;
+        // 2D coordinate system on refractive planes
+        getPlaneCoordinateSystem(_pinplate_param.u_axis, _pinplate_param.v_axis, _pinplate_param.plane);
     }
-
-
-    // Medium indices (Route B mapping)
-    const double n1 = get_n1(k); // near side (camera-side of this interface)
-    const double n2 = get_n2(k); // far side (object-side of this interface)
-
-
-    // Incident dir and fixed geometric normal
-    Pt3D v = line.unit_vector;
-    Pt3D n_geom = plane.norm_vector; // DO NOT MODIFY (geom normal fixed)
-
-    // ------------------------------------------------------------
-    // Stable refraction (Ordered Forward Tracing)
-    // Ray always travels from n1 -> n2 in this loop (k=0..P).
-    // We just need to orient n_use to point INTO n1 (against v).
-    // ------------------------------------------------------------
-    Pt3D n_use;
-    double cosi; // cos(theta_1) must be positive
-
-    double dot_v_n = myMATH::dot(v, n_geom);
-    if (dot_v_n > 0.0) {
-        // v aligns with n_geom (typical for camera->object)
-        // Normal pointing into n1 is -n_geom
-        n_use = n_geom * -1.0;
-        cosi = dot_v_n;
-    } else {
-        // v opposes n_geom
-        // Normal pointing into n1 is n_geom
-        n_use = n_geom;
-        cosi = -dot_v_n;
-    }
-    
-    // Clamp
-    cosi = std::max(0.0, std::min(1.0, cosi));
-
-    const double etai = n1;
-    const double etat = n2;
-    const double eta = etai / etat;
-    const double k_val = 1.0 - eta * eta * (1.0 - cosi * cosi);
-
-
-    if (k_val <= 0.0) {
-      // std::cerr << "Camera::pinplateLine line " << __LINE__
-      //           << " : Error: total internal reflection" << std::endl;
-      throw error_type;
-    }
-
-    Pt3D v_before = v;
-
-    Pt3D v_out = v * eta + n_use * (eta * cosi - std::sqrt(k_val));
-    v_out /= v_out.norm();
-
-    // Update line at this interface
-    line.unit_vector = v_out;
-    line.pt = pt_cross;
-
-
-    // Advance plane to next interface by thickness along FIXED GEOMETRIC normal
-    // plane.norm points away from camera, so +n_geom moves from closer -> farther planes.
-    if (k < P) {
-      const double w = get_w_forward(k);
-      plane.pt += n_geom * w;
-    }
-  }
-  return line;
 }
 
+Line3D Camera::pinplateLine (Pt2D const& pt_img_undist) const
+{
+    Pt3D pt_world(pt_img_undist[0], pt_img_undist[1], 1.0);
+
+    // calculate line of sight
+    pt_world = _pinplate_param.r_mtx_inv * pt_world + _pinplate_param.t_vec_inv;
+    
+    Line3D line;
+    line.pt = _pinplate_param.t_vec_inv;
+    line.unit_vector = myMATH::createUnitVector(_pinplate_param.t_vec_inv, pt_world);
+
+    // backward projection
+    Pt3D pt_cross;
+    bool is_parallel = false;
+    double refract_ratio;
+    double cos_1;
+    double cos_2;
+    double factor;
+
+    for (int plane_id = _pinplate_param.n_plate; plane_id >= 0; plane_id --)
+    {
+        const Plane3D& plane = _pinplate_param.plane_array[plane_id];
+        is_parallel = myMATH::crossPoint(pt_cross, line, plane);
+        if (is_parallel)
+        {
+            std::cerr << "Camera::PinplateLine line " << __LINE__ << " : Error: line is parallel to the plane" << std::endl;
+            throw error_type;
+        }
+
+        double refract_ratio = _pinplate_param.refract_array[plane_id+1] / _pinplate_param.refract_array[plane_id];
+        bool success = refractDir(line.unit_vector, plane.norm_vector, refract_ratio, false);
+        if (!success)
+        {
+            std::cerr << "Camera::PinplateLine line " << __LINE__ << " : Error: total internal reflection" << std::endl;
+            throw error_type;
+        }
+        line.pt = pt_cross;
+    }
+
+    return line;
+}
+
+// Plate refraction model
+std::tuple<bool, Pt3D, double, int> Camera::refractPlate(Pt3D const& pt_world) const {
+    return refractPlateNewton(pt_world);
+}
+
+std::tuple<bool, Pt3D, double, int> Camera::refractPlateNewton(Pt3D const& pt_world) const
+{
+    std::tuple<bool, Pt3D, double, int> result = {false, {0,0,0}, -1, 0};
+    
+    const int proj_nmax = _pinplate_param.proj_nmax;
+    const double proj_tol = _pinplate_param.proj_tol;
+    const double eps = _pinplate_param.lr;
+    
+    // Check if we need to enforce radius constraint (total internal reflection zone)
+    bool is_check_radius = false;
+    double radius_max2 = 0;
+    if (_pinplate_param.refract_ratio_max > 1.0) {
+        is_check_radius = true;
+        double sin_angle = 1.0 / _pinplate_param.refract_ratio_max;
+        radius_max2 = myMATH::dist2(pt_world, _pinplate_param.plane) / (1.0 - sin_angle*sin_angle);
+    }
+    
+    // Initialize: find initial point on first plane
+    Line3D line;
+    line.pt = pt_world;
+    line.unit_vector = myMATH::createUnitVector(pt_world, _pinplate_param.t_vec_inv);
+    
+    Pt3D pt_init;
+    if (myMATH::crossPoint(pt_init, line, _pinplate_param.plane)) {
+        std::get<0>(result) = true;
+        return result;
+    }
+    
+    // Check and adjust initial point if it's in forbidden region
+    if (is_check_radius) {
+        double radius2 = myMATH::dist2(pt_init, pt_world);
+        if (radius2 >= radius_max2) {
+            // Project onto boundary of valid region (95% of max radius for safety)
+            double scale = std::sqrt(radius_max2 * 0.95 / radius2);
+            for (int i = 0; i < 3; i++) {
+                pt_init[i] = pt_world[i] + (pt_init[i] - pt_world[i]) * scale;
+            }
+            
+            // Verify the adjusted point can trace without total internal reflection
+            Pt3D pt_exit_test, dir_test;
+            if (!forwardTrace(pt_exit_test, dir_test, pt_world, pt_init)) {
+                std::get<0>(result) = true;
+                return result;
+            }
+        }
+    }
+    
+    // 2D parametrization on first plane
+    std::vector<double> x(2);
+    projectPointToPlane2D(x, pt_init, _pinplate_param.plane, 
+                         _pinplate_param.u_axis, _pinplate_param.v_axis);
+    
+    // Reusable variables
+    Pt3D pt_current, pt_exit, exit_direction;
+    Pt3D vec_to_pinhole, residual_vec;
+    std::vector<double> x_perturb(2);
+    double J[2][2];
+    double F[2];
+    double JTJ[2][2];
+    
+    // Levenberg-Marquardt damping parameter
+    double lambda = 0.01;
+    const double lambda_min = 1e-10;
+    const double lambda_max = 1e10;
+
+    for (int iter = 0; iter < proj_nmax; iter++) {
+        // Reconstruct 3D point from 2D parameters
+        reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
+                         _pinplate_param.u_axis, _pinplate_param.v_axis, x);
+        
+        // Forward trace to get exit ray
+        if (!forwardTrace(pt_exit, exit_direction, pt_world, pt_current)) {
+            std::get<0>(result) = true;
+            std::get<3>(result) = iter + 1;
+            return result;
+        }
+        
+        // RESIDUAL: Distance from exit ray to pinhole
+        vec_to_pinhole = _pinplate_param.t_vec_inv - pt_exit;
+        double proj_along_ray = myMATH::dot(vec_to_pinhole, exit_direction);
+        residual_vec = vec_to_pinhole - exit_direction * proj_along_ray;
+        
+        double residual = residual_vec.norm();
+        
+        if (residual < proj_tol) {
+            std::get<1>(result) = pt_exit;
+            std::get<2>(result) = residual;
+            std::get<3>(result) = iter + 1;
+            return result;
+        }
+        
+        // Project residual onto plane basis to get 2D residual
+        F[0] = myMATH::dot(residual_vec, _pinplate_param.u_axis);
+        F[1] = myMATH::dot(residual_vec, _pinplate_param.v_axis);
+        
+        // Compute Jacobian using finite differences with radius constraint
+        for (int j = 0; j < 2; j++) {
+            x_perturb = x;
+            x_perturb[j] += eps;
+
+            // Reconstruct perturbed 3D point
+            reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
+                              _pinplate_param.u_axis, _pinplate_param.v_axis, x_perturb);
+            
+            // Enforce radius constraint by clamping to valid region
+            if (is_check_radius) {
+                double radius2 = myMATH::dist2(pt_current, pt_world);
+                if (radius2 >= radius_max2) {
+                    // Project point onto sphere boundary (97% for safety)
+                    double scale = std::sqrt(radius_max2 * 0.97 / radius2);
+                    for (int i = 0; i < 3; i++) {
+                        pt_current[i] = pt_world[i] + (pt_current[i] - pt_world[i]) * scale;
+                    }
+                    
+                    // Update x_perturb to reflect the clamped position
+                    projectPointToPlane2D(x_perturb, pt_current, _pinplate_param.plane,
+                                         _pinplate_param.u_axis, _pinplate_param.v_axis);
+                }
+            }
+            
+            if (!forwardTrace(pt_exit, exit_direction, pt_world, pt_current)) {
+                // Should not happen after clamping, but handle it
+                std::get<0>(result) = true;
+                std::get<3>(result) = iter + 1;
+                return result;
+            }
+            
+            // Compute perturbed residual
+            vec_to_pinhole = _pinplate_param.t_vec_inv - pt_exit;
+            proj_along_ray = myMATH::dot(vec_to_pinhole, exit_direction);
+            residual_vec = vec_to_pinhole - exit_direction * proj_along_ray;
+            
+            double F_perturb[2];
+            F_perturb[0] = myMATH::dot(residual_vec, _pinplate_param.u_axis);
+            F_perturb[1] = myMATH::dot(residual_vec, _pinplate_param.v_axis);
+            
+            // Compute finite difference with actual (possibly clamped) perturbation
+            J[0][j] = (F_perturb[0] - F[0]) / (x_perturb[j] - x[j]);
+            J[1][j] = (F_perturb[1] - F[1]) / (x_perturb[j] - x[j]);
+        }
+        
+        // Levenberg-Marquardt: Solve (J^T*J + lambda*I) * dx = -J^T*F
+        JTJ[0][0] = J[0][0]*J[0][0] + J[1][0]*J[1][0] + lambda;
+        JTJ[0][1] = J[0][0]*J[0][1] + J[1][0]*J[1][1];
+        JTJ[1][0] = JTJ[0][1];
+        JTJ[1][1] = J[0][1]*J[0][1] + J[1][1]*J[1][1] + lambda;
+        
+        double JTF[2];
+        JTF[0] = -(J[0][0]*F[0] + J[1][0]*F[1]);
+        JTF[1] = -(J[0][1]*F[0] + J[1][1]*F[1]);
+        
+        // Solve 2x2 system
+        double det = JTJ[0][0]*JTJ[1][1] - JTJ[0][1]*JTJ[1][0];
+        
+        // Check condition number
+        double trace = JTJ[0][0] + JTJ[1][1];
+        double condition_estimate = trace / std::abs(det);
+        
+        if (std::abs(det) < 1e-20 || condition_estimate > 1e12) {
+            lambda = std::min(lambda * 10.0, lambda_max);
+            if (lambda >= lambda_max) {
+                std::get<0>(result) = true;
+                std::get<3>(result) = iter + 1;
+                return result;
+            }
+            continue;
+        }
+        
+        double dx[2];
+        dx[0] = (JTF[0]*JTJ[1][1] - JTF[1]*JTJ[0][1]) / det;
+        dx[1] = (JTF[1]*JTJ[0][0] - JTF[0]*JTJ[1][0]) / det;
+        
+        // Line search with radius constraint
+        double alpha = 1.0;
+        bool step_accepted = false;
+        const int max_line_search = 10;
+        
+        for (int ls = 0; ls < max_line_search; ls++) {
+            x_perturb[0] = x[0] + alpha*dx[0];
+            x_perturb[1] = x[1] + alpha*dx[1];
+            
+            reconstructFrom2D(pt_current, _pinplate_param.plane.pt, 
+                            _pinplate_param.u_axis, _pinplate_param.v_axis, x_perturb);
+            
+            // Enforce radius constraint during line search too
+            if (is_check_radius) {
+                double radius2 = myMATH::dist2(pt_current, pt_world);
+                if (radius2 >= radius_max2) {
+                    // Project onto boundary
+                    double scale = std::sqrt(radius_max2 * 0.97 / radius2);
+                    for (int i = 0; i < 3; i++) {
+                        pt_current[i] = pt_world[i] + (pt_current[i] - pt_world[i]) * scale;
+                    }
+                }
+            }
+            
+            if (forwardTrace(pt_exit, exit_direction, pt_world, pt_current)) {
+                vec_to_pinhole = _pinplate_param.t_vec_inv - pt_exit;
+                proj_along_ray = myMATH::dot(vec_to_pinhole, exit_direction);
+                residual_vec = vec_to_pinhole - exit_direction * proj_along_ray;
+                double residual_new = residual_vec.norm();
+                
+                if (residual_new < residual) {
+                    // Update x to reflect actual (possibly clamped) position
+                    projectPointToPlane2D(x, pt_current, _pinplate_param.plane,
+                                         _pinplate_param.u_axis, _pinplate_param.v_axis);
+                    step_accepted = true;
+                    lambda = std::max(lambda * 0.1, lambda_min);
+                    break;
+                }
+            }
+            alpha *= 0.5;
+        }
+        
+        if (!step_accepted) {
+            lambda = std::min(lambda * 10.0, lambda_max);
+            if (lambda >= lambda_max) {
+                std::get<0>(result) = true;
+                std::get<3>(result) = iter + 1;
+                return result;
+            }
+        }
+    }
+    
+    // If reached here, maximum iterations exceeded
+    std::get<1>(result) = pt_exit;
+    std::get<2>(result) = residual_vec.norm();
+    std::get<3>(result) = proj_nmax;
+    return result;
+}
+
+void Camera::getPlaneCoordinateSystem(Pt3D& u_axis, Pt3D& v_axis, const Plane3D& plane) const {
+    // Create orthonormal basis on the plane
+    if (std::abs(plane.norm_vector[2]) < 0.9) {
+        u_axis = myMATH::cross(plane.norm_vector, {0, 0, 1});
+    } else {
+        u_axis = myMATH::cross(plane.norm_vector, {1, 0, 0});
+    }
+    u_axis /= u_axis.norm();
+    v_axis = myMATH::cross(plane.norm_vector, u_axis);
+    v_axis /= v_axis.norm();
+}
+
+void Camera::projectPointToPlane2D(std::vector<double>& coords, 
+                                   const Pt3D& pt, const Plane3D& plane,
+                                   const Pt3D& u_axis, const Pt3D& v_axis) const
+{
+    Pt3D diff = {pt[0] - plane.pt[0], pt[1] - plane.pt[1], pt[2] - plane.pt[2]};
+    coords[0] = myMATH::dot(diff, u_axis);
+    coords[1] = myMATH::dot(diff, v_axis);
+}
+
+void Camera::reconstructFrom2D(Pt3D& result, const Pt3D& origin, const Pt3D& u_axis,
+                               const Pt3D& v_axis, const std::vector<double>& coords) const
+{
+    for (int i = 0; i < 3; i++) {
+        result[i] = origin[i] + coords[0]*u_axis[i] + coords[1]*v_axis[i];
+    }
+}
+
+bool Camera::forwardTrace(Pt3D& pt_exit, Pt3D& exit_direction,
+                          const Pt3D& pt_world, const Pt3D& pt_entry) const
+{
+    Line3D line;
+    line.pt = pt_world;
+    line.unit_vector = myMATH::createUnitVector(pt_world, pt_entry);
+    
+    Pt3D pt_cross = pt_entry;
+    
+    for (int plane_id = 1; plane_id <= _pinplate_param.n_plate; plane_id++) {
+        const Plane3D& plane_curr = _pinplate_param.plane_array[plane_id-1];
+        const Plane3D& plane_next = _pinplate_param.plane_array[plane_id];
+
+        double refract_ratio = _pinplate_param.refract_array[plane_id-1] / 
+                               _pinplate_param.refract_array[plane_id];
+        
+        if (!refractDir(line.unit_vector, plane_curr.norm_vector, refract_ratio, true)) {
+            return false;
+        }
+        line.pt = pt_cross;
+        
+        if (myMATH::crossPoint(pt_cross, line, plane_next)) {
+            return false;
+        }
+    }
+    
+    pt_exit = pt_cross;
+    exit_direction = line.unit_vector;
+    double refract_ratio = _pinplate_param.refract_array[_pinplate_param.n_plate] / 
+                           _pinplate_param.refract_array[_pinplate_param.n_plate + 1];
+    bool success = refractDir(exit_direction, _pinplate_param.plane_array[_pinplate_param.n_plate].norm_vector, refract_ratio, true);
+    if (!success) {
+        return false;
+    }
+    
+    return true;
+}
+
+bool Camera::refractDir(Pt3D& dir_refract, const Pt3D& normal, double refract_ratio, bool is_forward) const {
+    double cos_1 = std::clamp(myMATH::dot(dir_refract, normal), -1.0, 1.0);
+    double cos_2 = 1.0 - refract_ratio*refract_ratio*(1.0 - cos_1*cos_1);
+    if (cos_2 <= 0) {
+        return false;
+    }
+
+    if (std::abs(cos_1) < SMALLNUMBER) {
+        cos_1 = 0.0;
+        double tan_2 = std::sqrt((1.0 - cos_2) / cos_2);
+        double factor = - dir_refract.norm() / tan_2 * (is_forward ? 1.0 : -1.0); 
+        for (int i = 0; i < 3; i++) {
+            dir_refract[i] = dir_refract[i] + normal[i] * factor;
+        }
+    } else {
+        double factor = - refract_ratio * cos_1 - std::sqrt(cos_2) * (is_forward ? 1.0 : -1.0);
+        for (int i = 0; i < 3; i++) {
+            dir_refract[i] = dir_refract[i] * refract_ratio + normal[i] * factor;
+        }
+    }
+
+    dir_refract /= dir_refract.norm();
+    return true;
+}
 
 
 // Polynomial model

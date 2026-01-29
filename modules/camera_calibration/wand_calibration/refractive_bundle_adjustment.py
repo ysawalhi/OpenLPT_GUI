@@ -52,8 +52,8 @@ from .refractive_geometry import (
     Ray, normalize, build_pinplate_ray_cpp, triangulate_point, point_to_ray_dist,
     point_to_ray_dist_vec,  # Vectorized version for performance
     update_normal_tangent, rodrigues_to_R, camera_center, angle_between_vectors,
-
-    optical_axis_world, update_cpp_camera_state
+    optical_axis_world, update_cpp_camera_state,
+    enable_ray_tracking, reset_ray_stats, print_ray_stats_report
 )
 from datetime import datetime
 from pathlib import Path
@@ -224,16 +224,6 @@ class ObservabilityInfo:
 @dataclass
 class PR4Config:
     """Configuration for PR4 Bundle Adjustment."""
-    # Lambda adaptation (same as P1)
-    lambda0_init: float = 200.0
-    lambda_min: float = 10.0
-    lambda_max: float = 5000.0
-    target_ratio: float = 1.0
-    adaptation_eta: float = 0.30
-    deadband_low: float = 0.7
-    deadband_high: float = 1.5
-    outer_rounds: int = 3
-    
     # Regularization
     lambda_reg_plane: float = 10.0  # Normal drift penalty
     lambda_reg_tvec: float = 1.0    # Translation drift penalty
@@ -264,14 +254,26 @@ class PR4Config:
     rvec_bound: float = 0.1        # radians (~5.7 degrees)
     
     # Sampling
-    max_frames: int = 300
+    max_frames: int = 50000  # Default to all (high limit)
     random_seed: int = 42
     
+    # Unit Normalization
+    px_target: float = 0.5            # 投影误差目标 (px)
+    px_target: float = 0.5            # 投影误差目标 (px)
+    wand_tol_pct: float = 0.02        # 棒长容忍度 (2% 即 0.2mm)
+    
+    # Sphere Radii (Estimated or Config)
+    R_small_mm: float = 1.5
+    R_large_mm: float = 2.0
+
     # Stage control
     skip_pr4: bool = False
     pr4_stage: int = 3
     verbosity: int = 1
-    margin_side_mm: float = 0.05    # Margin for soft barrier (mm)
+    margin_side_mm: float = 0.05    # Margin for side constraint (mm)
+    alpha_side_gate: float = 10.0   # Gate magnitude: C_gate = alpha * J_ref
+    beta_side_dir: float = 1e4      # Directional weight when gate is active
+    beta_side_soft: float = 100.0   # Soft floor weight when gate is NOT active (though PR4 defaults to ON)
     
     
 @dataclass
@@ -303,48 +305,26 @@ class PR5Config:
     beta_side_soft: float = 100.0    # Soft floor weight when gate OFF
     scale_len_gate_active: float = 0.1 # Multiply lambda_len by this when gate is ON (reduce dominance)
     
-    # Bounds (Percentage)
-    bounds_thick_pct: float = 0.05  # +/- 5%
-    bounds_f_pct: float = 0.02      # +/- 2%
-    bounds_alpha_beta_deg: float = 5.0
-    bounds_d_delta_mm: float = 20.0
-    
     # Sampling
     max_frames: int = 50000  # Default to all (high limit)
     random_seed: int = 42
     
-    # Prior Weights (Lambda)
-    # Note: Lambda usually means weight in least squares sum(w * r^2).
-    # Here sigma is provided. weight = (1/sigma)^2.
-    # Residual = (val - init) / sigma.
-    # We will compute sigmas dynamically based on Observability.
+    # Unit Normalization
+    # Unit Normalization
+    px_target: float = 0.5            # 投影误差目标 (px)
+    wand_tol_pct: float = 0.05        # 棒长容忍度 (5%)
+
+    bounds_thick_pct: float = 0.05
+    bounds_f_pct: float = 0.05        # 5%
+    bounds_alpha_beta_deg: float = 5.0
+    bounds_d_delta_mm: float = 10.0   # 10mm
     
-    # Configuration for Priors (Sigmas) 
-    sigma_plane_ang_single: float = 0.0035  # ~1 deg original: 0.0035
-    sigma_plane_ang_weak: float = 0.006     # ~1 deg (<15 deg) original: 0.006
-    sigma_plane_ang_mid: float = 0.010      # ~2 deg (<25 deg) original: 0.010
-    sigma_plane_ang_strong: float = 0.026   # ~3 deg (>=25 deg) original: 0.026
-    
-    sigma_d_single: float = 1.0
-    sigma_d_weak: float = 2.0  # <25 deg
-    sigma_d_strong: float = 5.0 # >= 25 deg
-    
-    sigma_rvec_very_weak: float = 0.0087 # ~0.5 deg (<15)
-    sigma_rvec_weak: float = 0.0175      # ~1.0 deg (<25)
-    sigma_rvec_normal: float = 0.035     # ~2.0 deg (>=25)
-    
-    sigma_tvec_weak: float = 2.0    # N=2 & <25
-    sigma_tvec_normal: float = 5.0
-    
-    # Step Caps
-    step_cap_rvec_very_weak_deg: float = 0.3
-    step_cap_rvec_weak_deg: float = 0.3
-    step_cap_rvec_normal_deg: float = 0.6
-    
-    step_cap_tvec_weak_mm: float = 0.5
-    step_cap_tvec_normal_mm: float = 1.0
-    
-    allow_weak_rvec: bool = True
+    # Uniform Sigma Priors (User Specified)
+    # 10 deg, 10 mm, 20 mm, 10 deg
+    sigma_rvec: float = 0.1745      # 10.0 degrees
+    sigma_tvec: float = 10.0        # 10.0 mm
+    sigma_d: float = 10.0           # 10.0 mm
+    sigma_plane_ang: float = 0.0873 # 5.0 degrees
     pr4_stage: int = 3
     
     # Logging
@@ -406,6 +386,7 @@ class RefractiveBAOptimizerPR4:
         } for wid, pl in self.window_planes.items()}
         
         self.initial_cam_params = {cid: p.copy() for cid, p in self.cam_params.items()}
+        self._j_ref = 1.0 # Reference cost for barrier scaling
         
         # Derived data
         self.window_ids = sorted(self.window_planes.keys())
@@ -422,11 +403,14 @@ class RefractiveBAOptimizerPR4:
         
         # Frame sampling
         all_frames = sorted(self.dataset.get('frames', []))
-        import random
-        rng = random.Random(self.config.random_seed)
-        subset_size = min(len(all_frames), self.config.max_frames)
-        self.fids_optim = sorted(rng.sample(all_frames, subset_size))
-        
+        if self.config.max_frames > 0 and len(all_frames) > self.config.max_frames:
+             # Random sample
+             import random
+             rnd = random.Random(self.config.random_seed)
+             self.fids_optim = sorted(rnd.sample(all_frames, self.config.max_frames))
+        else:
+             self.fids_optim = all_frames
+             
         # Observability analysis
         self.observability: Dict[int, ObservabilityInfo] = {}
         self._compute_observability()
@@ -435,11 +419,22 @@ class RefractiveBAOptimizerPR4:
         self.freeze_table: Dict = {}
         self._build_freeze_table()
         
+    def _sync_initial_state(self):
+        """Update initial_planes/cams from current state (Relinearization)."""
+        self.initial_planes = {wid: {
+            k: (v.copy() if hasattr(v, 'copy') else v) for k, v in pl.items()
+        } for wid, pl in self.window_planes.items()}
+        
+        self.initial_cam_params = {cid: p.copy() for cid, p in self.cam_params.items()}
+        
         # Active freeze table pointer (for staged optimization context switching)
         self._freeze_table_active = self.freeze_table
         
         self._last_ray_rmse = -1.0
         self._last_len_rmse = -1.0
+        
+        self.sigma_ray_global = 0.04  # Default, will be recalculated
+        self.sigma_wand = 0.1        # Default, will be recalculated
     
     def _rvec_step_cap_deg(self, status) -> float:
         """Get step-cap in degrees for a given rvec freeze status.
@@ -716,6 +711,57 @@ class RefractiveBAOptimizerPR4:
                     'tvec': info.tvec_status,
                     'rvec': info.rvec_status
                 }
+
+    def _compute_physical_sigmas(self):
+        """Estimate global sigma values across all optimize stages."""
+        cfg = self.config
+        
+        all_f = [p[6] for p in self.cam_params.values() if len(p) > 6]
+        avg_f = np.mean(all_f) if all_f else 1000.0
+        
+        sample_dists = []
+        fids_to_sample = self.fids_optim[::max(1, len(self.fids_optim) // 100)]
+        for fid in fids_to_sample:
+            # Reconstruct centers
+            obs = self.dataset['obsA'].get(fid, {})
+            cids = sorted(obs.keys())
+            rays = []
+            for cid in cids:
+                if cid in self.cams_cpp:
+                    r = build_pinplate_ray_cpp(self.cams_cpp[cid], obs[cid])
+                    if r.valid: rays.append(r)
+            if len(rays) >= 2:
+                X, _, ok, _ = triangulate_point(rays)
+                if ok:
+                    for cid in cids:
+                        rv = self.cam_params[cid][0:3]
+                        tv = self.cam_params[cid][3:6]
+                        R = cv2.Rodrigues(rv)[0]
+                        C = -R.T @ tv
+                        sample_dists.append(np.linalg.norm(X - C))
+        
+        avg_dist_z = np.mean(sample_dists) if sample_dists else 600.0
+        
+        self.sigma_ray_global = cfg.px_target * (avg_dist_z / avg_f)
+        self.sigma_wand = self.wand_length * cfg.wand_tol_pct
+        
+        if cfg.verbosity >= 1:
+            print(f"  [PR4] Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm ({cfg.px_target}px at Z={avg_dist_z:.1f}mm), sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)")
+
+    def _print_plane_diagnostics(self, stage_name: str):
+        """Print current plane normals and angles between them."""
+        print(f"\n  [{stage_name}] Plane Diagnostics:")
+        wids = sorted(self.window_planes.keys())
+        normals = []
+        for wid in wids:
+            n = self.window_planes[wid]['plane_n']
+            pt = self.window_planes[wid]['plane_pt']
+            normals.append(n)
+            print(f"    Win {wid}: n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}], pt=[{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]")
+        
+        if len(normals) == 2:
+            ang = angle_between_vectors(normals[0], normals[1])
+            print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
     
     def print_freeze_table(self):
         """Print summary of freeze/optimize decisions."""
@@ -833,34 +879,36 @@ class RefractiveBAOptimizerPR4:
                 update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
         
         # 1. Pre-calculate total possible counts for FIXED size
-        # Ray slots: sum of cameras per frame * 2
-        # Length slots: 1 per frame
-        # Barrier slots: number of valid points * windows per point (worst-case all points)
-        
-        # To keep it simple and truly fixed, use the observations present in fids_optim
         total_ray_slots = 0
         for fid in self.fids_optim:
-            # We know exactly how many cameras see each endpoint from setup
             for key in ['obsA', 'obsB']:
-                if fid in self.dataset[key]:
-                    total_ray_slots += len(self.dataset[key][fid])
+                obs = self.dataset[key].get(fid, {})
+                total_ray_slots += len(obs)
         
         total_len_slots = len(self.fids_optim)
         
         # Barrier slots: each point (max 2 per frame) can collide with its window's planes
-        # Since windows are fixed, we can count slots
         total_barrier_slots = 0
         for fid in self.fids_optim:
             for key in ['obsA', 'obsB']:
-                if fid in self.dataset[key]:
-                    # Point sees these windows
-                    wids = set(self.cam_to_window.get(cid) for cid in self.dataset[key][fid])
-                    total_barrier_slots += len(wids)
+                obs = self.dataset[key].get(fid, {})
+                if obs:
+                    # Point sees these windows. Use cam_to_window mapping to define slots.
+                    wids = set()
+                    for cid in obs.keys():
+                        wid = self.cam_to_window.get(cid)
+                        if wid is not None and wid != -1:
+                            wids.add(wid)
+                    # 2 residuals per window (Step + Gradient)
+                    total_barrier_slots += 2 * len(wids)
                     
         # Pre-allocate
         res_ray_fixed = np.zeros(total_ray_slots)
         res_len_fixed = np.zeros(total_len_slots)
         res_barrier_fixed = np.zeros(total_barrier_slots)
+        
+        PENALTY_RAY = 100.0   # mm
+        PENALTY_LEN = self.wand_length
         
         idx_ray = 0
         idx_len = 0
@@ -878,100 +926,150 @@ class RefractiveBAOptimizerPR4:
         
         # --- Computation Loop ---
         for fid in self.fids_optim:
-            rays_A, rays_B = self._build_rays_frame(fid)
-            
-            # Get FIXED slot counts from dataset (not from rays which can vary)
+            # Get observations for this frame
             obs_A = self.dataset['obsA'].get(fid, {})
             obs_B = self.dataset['obsB'].get(fid, {})
-            n_slots_A = len(obs_A)
-            n_slots_B = len(obs_B)
-            wids_A = set(self.cam_to_window.get(cid) for cid in obs_A)
-            wids_B = set(self.cam_to_window.get(cid) for cid in obs_B)
-            n_barrier_A = len(wids_A)
-            n_barrier_B = len(wids_B)
             
-            # Endpoint A
+            # --- Endpoint A ---
+            n_slots_A = len(obs_A)
+            # Build rays in STABLE order (sorted cam_id)
+            cids_A = sorted(obs_A.keys())
+            rays_A_all = []
+            for cid in cids_A:
+                cam_obj = self.cams_cpp.get(cid)
+                if cam_obj:
+                    r = build_pinplate_ray_cpp(cam_obj, obs_A[cid], cam_id=cid, 
+                                               window_id=self.cam_to_window.get(cid, -1), 
+                                               frame_id=fid, endpoint="A")
+                    rays_A_all.append(r)
+                else:
+                    # Fallback for missing camera object
+                    rays_A_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
+            
             validA = False
             XA = None
-            if len(rays_A) >= 2:
-                XA, _, validA, _ = triangulate_point(rays_A)
-                if validA:
-                    num_triangulated_points += 1
-                    wids = set(r.window_id for r in rays_A if r.window_id is not None)
-                    valid_points_data.append((XA, wids, 'A', idx_barrier))
-                    # Fill Ray residuals for valid rays only
-                    for r in rays_A:
+            rays_A_valid = [r for r in rays_A_all if r.valid]
+            if len(rays_A_valid) >= 2:
+                XA, _, validA, _ = triangulate_point(rays_A_valid)
+            
+            # Use fixed iteration to fill slots
+            start_idx_barrier_A = idx_barrier
+            # Determine expected windows for this point
+            wids_A_expected = sorted([w for w in set(self.cam_to_window.get(cid) for cid in cids_A) if w is not None and w != -1])
+            n_barrier_A = len(wids_A_expected)
+            
+            if validA:
+                num_triangulated_points += 1
+                valid_points_data.append((XA, wids_A_expected, 'A', start_idx_barrier_A))
+                for r in rays_A_all:
+                    if r.valid:
                         d = point_to_ray_dist(XA, r.o, r.d)
-                        res_ray_fixed[idx_ray] = d
+                        res_ray_fixed[idx_ray] = d / self.sigma_ray_global
                         S_ray += d**2
-                        idx_ray += 1
                         N_ray_actual += 1
-                    # Skip remaining slots if rays_A < n_slots_A
-                    idx_ray += (n_slots_A - len(rays_A))
-                else:
-                    # Point invalid, skip all ray slots (keep at 0.0)
-                    idx_ray += n_slots_A
+                    else:
+                        res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
             else:
-                # Insufficient rays, skip all ray slots
-                idx_ray += n_slots_A
-            # Always advance barrier index by fixed count
-            idx_barrier += n_barrier_A
+                # Triangulation failed, fill all rays with penalty
+                for _ in range(n_slots_A):
+                    res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+            
+            # Advance barrier index by fixed amount
+            idx_barrier += 2 * n_barrier_A
 
-            # Endpoint B
+            # --- Endpoint B ---
+            n_slots_B = len(obs_B)
+            cids_B = sorted(obs_B.keys())
+            rays_B_all = []
+            for cid in cids_B:
+                cam_obj = self.cams_cpp.get(cid)
+                if cam_obj:
+                    r = build_pinplate_ray_cpp(cam_obj, obs_B[cid], cam_id=cid, 
+                                               window_id=self.cam_to_window.get(cid, -1), 
+                                               frame_id=fid, endpoint="B")
+                    rays_B_all.append(r)
+                else:
+                    rays_B_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
+            
             validB = False
             XB = None
-            if len(rays_B) >= 2:
-                XB, _, validB, _ = triangulate_point(rays_B)
-                if validB:
-                    num_triangulated_points += 1
-                    wids = set(r.window_id for r in rays_B if r.window_id is not None)
-                    valid_points_data.append((XB, wids, 'B', idx_barrier))
-                    for r in rays_B:
+            rays_B_valid = [r for r in rays_B_all if r.valid]
+            if len(rays_B_valid) >= 2:
+                XB, _, validB, _ = triangulate_point(rays_B_valid)
+            
+            start_idx_barrier_B = idx_barrier
+            wids_B_expected = sorted([w for w in set(self.cam_to_window.get(cid) for cid in cids_B) if w is not None and w != -1])
+            n_barrier_B = len(wids_B_expected)
+            
+            if validB:
+                num_triangulated_points += 1
+                valid_points_data.append((XB, wids_B_expected, 'B', start_idx_barrier_B))
+                for r in rays_B_all:
+                    if r.valid:
                         d = point_to_ray_dist(XB, r.o, r.d)
-                        res_ray_fixed[idx_ray] = d
+                        res_ray_fixed[idx_ray] = d / self.sigma_ray_global
                         S_ray += d**2
-                        idx_ray += 1
                         N_ray_actual += 1
-                    idx_ray += (n_slots_B - len(rays_B))
-                else:
-                    idx_ray += n_slots_B
+                    else:
+                        res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
             else:
-                idx_ray += n_slots_B
-            idx_barrier += n_barrier_B
+                for _ in range(n_slots_B):
+                    res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+            
+            idx_barrier += 2 * n_barrier_B
 
-            # Length
+            # --- Wand Length ---
             if validA and validB:
                 wand_len = np.linalg.norm(XA - XB)
                 err = wand_len - self.wand_length
-                res_len_fixed[idx_len] = err
+                res_len_fixed[idx_len] = err / self.sigma_wand
                 S_len += err**2
                 N_len_actual += 1
+            else:
+                res_len_fixed[idx_len] = PENALTY_LEN / self.sigma_wand
             idx_len += 1
 
         # 2. Side Barrier (Adaptive)
-        # J_data = S_ray + lambda * S_len
         J_data = S_ray + lambda_eff * S_len
-        N_samples = max(1, num_triangulated_points)
-        w_side = 0.02 * J_data / N_samples
-        
         margin_mm = self.config.margin_side_mm
         sX_vals = []
         
+        # Hard Barrier Constants (PR5-style)
+        C_gate = self.config.alpha_side_gate * self._j_ref
+        r_fix_const = np.sqrt(2.0 * C_gate)
+        r_grad_const = np.sqrt(2.0 * self.config.beta_side_dir)
+        tau = 0.01
+
         for (X, wids, endpoint, b_start_idx) in valid_points_data:
             r_val = radius_A if endpoint == 'A' else radius_B
             curr_b_idx = b_start_idx
-            for wid in sorted(list(wids)): # Sorted for deterministic indexing
+            for wid in wids: # Already sorted at creation
                 if wid not in planes: 
-                    curr_b_idx += 1
+                    curr_b_idx += 2
                     continue
                 pl = planes[wid]
-                p_side, sX = compute_soft_barrier_penalty(
-                    X, pl['plane_pt'], pl['plane_n'], 
-                    w_side=w_side, sigma=0.01, R_mm=r_val, margin_mm=margin_mm
-                )
-                res_barrier_fixed[curr_b_idx] = p_side
+                n = pl['plane_n']
+                P_plane = pl['plane_pt']
+                # Signed distance sX (Positive = correct side)
+                sX = np.dot(n, X - P_plane)
                 sX_vals.append(sX)
-                curr_b_idx += 1
+
+                # PR5-style Strong Constraint (Gate ON by default)
+                gap = (margin_mm + r_val) - sX
+                if gap > 0:
+                    # Violation: Smooth Step + Gradient
+                    res_barrier_fixed[curr_b_idx] = r_fix_const * (1.0 - np.exp(-gap / tau))
+                    res_barrier_fixed[curr_b_idx + 1] = r_grad_const * gap
+                else:
+                    # Feasible
+                    res_barrier_fixed[curr_b_idx] = 0.0
+                    res_barrier_fixed[curr_b_idx + 1] = 0.0
+                
+                curr_b_idx += 2
 
         # Diagnostics
         if sX_vals:
@@ -979,11 +1077,14 @@ class RefractiveBAOptimizerPR4:
             self._last_barrier_stats = {
                 'min_sX': np.min(sX_arr),
                 'pct_near': np.mean(sX_arr < margin_mm) * 100,
-                'ratio': np.sum(res_barrier_fixed**2) / max(1e-9, J_data),
-                'w_side': w_side
+                'ratio': np.sum(res_barrier_fixed**2) / max(1e-9, J_data)
             }
         else:
             self._last_barrier_stats = {}
+
+        # Update RMSE for diagnostics based on physical units
+        self._last_ray_rmse = np.sqrt(S_ray / max(1, N_ray_actual))
+        self._last_len_rmse = np.sqrt(S_len / max(1, N_len_actual)) if N_len_actual > 0 else 0.0
 
         # 3. Combine
         weighted_len = np.sqrt(lambda_eff) * res_len_fixed
@@ -991,83 +1092,32 @@ class RefractiveBAOptimizerPR4:
             
         return residuals, S_ray, S_len, N_ray_actual, N_len_actual
 
-
-    def _adapt_lambda(self, lambda_old: float, S_ray: float, S_len: float, N_ray: int, N_len: int) -> float:
-        """Adapt lambda based on RMSE comparison.
-        
-        Strategy:
-        - If rmse_len <= rmse_ray: physics is good, keep lambda
-        - If rmse_len > rmse_ray: 
-            - First time: jump to 100
-            - Subsequent: double lambda
+    def _get_param_layout(self, enable_planes: bool, enable_cam_t: bool, enable_cam_r: bool) -> List[Tuple]:
         """
-        cfg = self.config
-        eps = 1e-12
-        
-        if S_len < eps or N_len == 0:
-            return lambda_old
-            
-        rmse_ray = np.sqrt(S_ray / max(1, N_ray))
-        rmse_len = np.sqrt(S_len / max(1, N_len))
-        
-        if rmse_len <= rmse_ray:
-            # Physics constraint is satisfied, no need to increase lambda
-            return lambda_old
-        
-        # rmse_len > rmse_ray: need more emphasis on wand length
-        if lambda_old < 100.0:
-            lambda_new = 100.0  # First time: jump to 100
-        else:
-            lambda_new = lambda_old * 2.0  # Subsequently: double
-        
-        # Global clamp
-        lambda_new = min(lambda_new, cfg.lambda_max)
-        
-        return lambda_new
-
-
-
-    def _get_param_layout(self, mode: str) -> List[Tuple]:
-        """
-        Get layout of parameter vector x.
+        Get layout of parameter vector x based on enabled flags.
         Returns list of (type, id, subparam_idx).
         """
         layout = []
         
-        # 1. Planes (always optimized unless frozen?)
-        # Actually P1.1 was d only, P1.2 was d,a,b.
-        # PR4 implies full d,a,b optimization for planes
-        for wid in self.window_ids:
-            ft = self._freeze_table_active.get(wid, {})
-            if ft.get('plane') != FreezeStatus.FREEZE:
+        # 1. Planes
+        if enable_planes:
+            for wid in self.window_ids:
                 layout.append(('plane_d', wid, 0))
                 layout.append(('plane_a', wid, 0))
                 layout.append(('plane_b', wid, 0))
         
         # 2. Cameras
-        if mode != 'planes_only':
-            for wid in self.window_ids:
-                ft = self._freeze_table_active.get(wid, {})
-                for cid in self.window_to_cams.get(wid, []):
-                    cft = ft.get('cameras', {}).get(cid, {})
-                    
-                    if cft.get('tvec') != FreezeStatus.FREEZE:
-                        layout.append(('cam_t', cid, 0)) # tx
-                        layout.append(('cam_t', cid, 1)) # ty
-                        layout.append(('cam_t', cid, 2)) # tz
-                    
-                    # rvec (only if allowed by active freeze table)
-                    r_status = cft.get('rvec')
-                    if r_status is not None and r_status != FreezeStatus.FREEZE:
-                        layout.append(('cam_r', cid, 0)) # rx
-                        layout.append(('cam_r', cid, 1)) # ry
-                        layout.append(('cam_r', cid, 2)) # rz
-        
-        # Debug: Log rvec layout for verification (verbosity >= 2)
-        if self.config.verbosity >= 2:
-            rvec_cids = sorted(set(pid for (ptype, pid, _) in layout if ptype == 'cam_r'))
-            if rvec_cids:
-                print(f"    [DEBUG] _get_param_layout({mode}): rvec enabled for cids={rvec_cids}")
+        if enable_cam_t or enable_cam_r:
+            for cid in self.active_cam_ids:
+                if enable_cam_t:
+                    layout.append(('cam_t', cid, 0)) # tx
+                    layout.append(('cam_t', cid, 1)) # ty
+                    layout.append(('cam_t', cid, 2)) # tz
+                
+                if enable_cam_r:
+                    layout.append(('cam_r', cid, 0)) # rx
+                    layout.append(('cam_r', cid, 1)) # ry
+                    layout.append(('cam_r', cid, 2)) # rz
         
         return layout
     
@@ -1246,86 +1296,86 @@ class RefractiveBAOptimizerPR4:
                 reg_residuals.append(val * np.sqrt(weight))
         
         if len(reg_residuals) > 0:
-            return np.concatenate([residuals, np.array(reg_residuals)])
+            residuals = np.concatenate([residuals, np.array(reg_residuals)])
+                     
+        if len(reg_residuals) > 0:
+            residuals = np.concatenate([residuals, np.array(reg_residuals)])
+
         return np.array(residuals)
 
-    def _optimize_generic(self, mode: str, description: str):
-        """Generic optimization loop with step cap and rollback."""
-        layout = self._get_param_layout(mode)
+    def _optimize_generic(self, mode: str, description: str, 
+                          enable_planes: bool, enable_cam_t: bool, enable_cam_r: bool,
+                          limit_rot_rad: float, limit_trans_mm: float, 
+                          limit_plane_d_mm: float, limit_plane_angle_rad: float,
+                          plane_d_bounds: Dict[int, float] = None,
+                          ftol: float = 1e-6):
+        """
+        Generic optimization loop with explicit bounds and parameter selection.
+        """
+        layout = self._get_param_layout(enable_planes, enable_cam_t, enable_cam_r)
+        
         if not layout:
             print(f"  [{description}] No parameters to optimize.")
             return
 
         x0 = np.zeros(len(layout), dtype=np.float64)
-        # lambda_eff initialized later
         cfg = self.config
         
         print(f"  [{description}] optimizing {len(x0)} parameters ({len(layout)//3} blocks)...")
         # Calc initial RMSE for rollback reference
         planes0, cams0 = self._unpack_params_delta(x0, layout)
-        # Use initial dummy lambda to get S components
-        _, S_ray0, S_len0, N_ray, N_len = self.evaluate_residuals(planes0, cams0, cfg.lambda0_init)
+        
+        # [USER REQUEST] Fixed Weighting Strategy
+        # Lambda = 2.0 * N_active_cams
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
+        
+        # Initial evaluation
+        _, S_ray0, S_len0, N_ray, N_len = self.evaluate_residuals(planes0, cams0, lambda_fixed)
+        
+        # [Constraint] Force lambda=1 if S_ray / S_len < 10 (User Request)
+        if S_len0 > 1e-9:
+             ratio_s = S_ray0 / S_len0
+             if ratio_s < 10.0:
+                 print(f"    [Constraint] S_ray/S_len ({ratio_s:.2f}) < 10. Forcing lambda=1.0 (was {lambda_fixed:.1f})")
+                 lambda_fixed = 1.0
         
         rmse_ray0 = np.sqrt(S_ray0 / max(N_ray, 1))
         rmse_len0 = np.sqrt(S_len0 / max(N_len, 1)) if N_len > 0 else 0.0
-
-        # [USER REQUEST] Dynamic Initial Lambda
-        # Set lambda such that lambda * S_len ~ S_ray (Ratio ~ 1.0)
-        if S_len0 > 1e-12:
-            lambda_eff = S_ray0 / S_len0
-            # Clamp to reasonable range
-            # [USER REQUEST] Cap initial lambda to prevent explosion (e.g. 500.0)
-            initial_cap = 500.0
-            lambda_eff = float(np.clip(lambda_eff, cfg.lambda_min, initial_cap))
-        else:
-            lambda_eff = cfg.lambda0_init
-            
-        # [USER REQUEST] Initial Physics Check
-        # If physics is already good (Len < Ray), prevent initial explosion
-        if rmse_len0 < rmse_ray0:
-            lambda_cap = 10.0  # Conservative starting point
-            if lambda_eff > lambda_cap:
-                print(f"  [Init] Physics Good (Len={rmse_len0:.4f} < Ray={rmse_ray0:.4f}). Capping Lambda {lambda_eff:.1f}->{lambda_cap:.1f}")
-                lambda_eff = lambda_cap
-            
-        print(f"  [Init] Dynamic Lambda: {lambda_eff:.2f} (S_ray={S_ray0:.2f}, S_len={S_len0:.2f})")
         
-        # Build bounds for each parameter based on layout
-        # We align these with the intended Step Caps to ensure symmetric constraints during optimization.
+        # Initial normalized cost J0
+        J0 = (rmse_ray0**2) + lambda_fixed * (rmse_len0**2)
+        self._j_ref = J0 if J0 > 1e-6 else 1.0
+        
+        print(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
+        print(f"    Initial: S_ray={S_ray0:.2f}, S_len={S_len0:.2f} (J0={J0:.4f})")
+        
+        # Build Bounds
         lb = []
         ub = []
         for (ptype, pid, subidx) in layout:
             if ptype == 'plane_d':
-                # Plane distance: +/- 20mm (Matching PR5 bounds)
-                lb.append(-20.0)
-                ub.append(20.0)
+                limit = limit_plane_d_mm
+                if plane_d_bounds and pid in plane_d_bounds:
+                    limit = plane_d_bounds[pid]
+                lb.append(-limit)
+                ub.append(limit)
             elif ptype == 'plane_a' or ptype == 'plane_b':
-                # Plane angles: +/- 10 degrees (allowing more flexibility in PR4)
-                limit_rad = np.radians(10.0)
-                lb.append(-limit_rad)
-                ub.append(limit_rad)
+                lb.append(-limit_plane_angle_rad)
+                ub.append(limit_plane_angle_rad)
             elif ptype == 'cam_r':
-                # Camera rotation: Match Step-Cap based on status
-                wid = self.cam_to_window.get(pid)
-                status = self.freeze_table.get(wid, {}).get('cameras', {}).get(pid, {}).get('rvec')
-                limit_deg = self._rvec_step_cap_deg(status)
-                limit_rad = np.radians(limit_deg)
-                lb.append(-limit_rad)
-                ub.append(limit_rad)
+                lb.append(-limit_rot_rad)
+                ub.append(limit_rot_rad)
             elif ptype == 'cam_t':
-                # Camera translation: Match Step-Cap based on status
-                wid = self.cam_to_window.get(pid)
-                status = self.freeze_table.get(wid, {}).get('cameras', {}).get(pid, {}).get('tvec')
-                limit_mm = self._tvec_step_cap_mm(status)
-                lb.append(-limit_mm)
-                ub.append(limit_mm)
+                lb.append(-limit_trans_mm)
+                ub.append(limit_trans_mm)
             else:
-                lb.append(-10.0)
-                ub.append(10.0)
+                lb.append(-1.0)
+                ub.append(1.0)
         
         bounds = (np.array(lb), np.array(ub))
         
-        # Residual wrapper for event pumping
+         # Residual wrapper for event pumping
         self._res_call_count = 0
         def residuals_wrapper(x, *args, **kwargs):
             res = self._residuals_pr4(x, *args, **kwargs)
@@ -1333,288 +1383,485 @@ class RefractiveBAOptimizerPR4:
             if self.progress_callback and self._res_call_count % 30 == 0:
                 try:
                     c_approx = 0.5 * np.sum(res**2)
-                    # Log to console (disabled - too verbose)
-                    # if self.config.verbosity >= 2:
-                    #     print(f"    [Iter {self._res_call_count}] Cost={c_approx:.2f}, RayRMSE={self._last_ray_rmse:.4f}, LenRMSE={self._last_len_rmse:.4f}")
-                        
-                    # Pass -1.0 for RMSEs to show N.A.
+                    
+                    # [DEBUG] Print to terminal instead of UI
+                    if hasattr(self, '_last_ratio_info'):
+                         # Calculate percentage
+                         j_ratio = getattr(self, '_last_ratio_cost', 0.0)
+                         pct = (j_ratio / c_approx * 100) if c_approx > 0 else 0
+                         print(f"  [PR4 DEBUG] J_tot={c_approx:.1e}, J_ratio={j_ratio:.1e} ({pct:.1f}%) | {self._last_ratio_info}")
+                         
                     if self.progress_callback:
-                        self.progress_callback(f"Refining Camera & Window Parameters (Round {round_idx+1})...", self._last_ray_rmse, self._last_len_rmse, c_approx)
+                        self.progress_callback(f"{description}", self._last_ray_rmse, self._last_len_rmse, c_approx)
                 except Exception as e:
                     print(f"[Warning] Progress callback failed: {e}")
             return res
 
 
-        for round_idx in range(self.config.outer_rounds):
-            # [DEBUG] Log Lambda for User Analysis
-            print(f"    [PR4][ROUND {round_idx+1}] Lambda = {lambda_eff:.2f}")
+        # Single Pass Optimization
+        res = least_squares(
+            residuals_wrapper, 
+            x0, 
+            args=(layout, mode, lambda_fixed),
+            method='trf', 
+            bounds=bounds,
+            verbose=0,
+            x_scale='jac',
+            ftol=ftol,
+            xtol=1e-6,
+            gtol=1e-6,
+            max_nfev=50
+        )
 
-            # Solve with bounds
-            res = least_squares(
-                residuals_wrapper, 
-                x0, 
-                args=(layout, mode, lambda_eff),
-                method='trf', 
-                bounds=bounds,
-                verbose=0,
-                x_scale='jac',
-                ftol=1e-6,
-                xtol=1e-6,
-                gtol=1e-6,
-                max_nfev=50
-            )
+        # Print Barrier Stats
+        if cfg.verbosity >= 1 and hasattr(self, '_last_barrier_stats') and self._last_barrier_stats:
+            s = self._last_barrier_stats
+            print(f"    [PR4][SIDE-BARRIER] min(sX)={s['min_sX']:.4f}mm, near(<20um)={s['pct_near']:.1f}%, cost/J={s['ratio']:.1e}")
 
-            # Print Barrier Stats (PR4 Part 5)
-            if cfg.verbosity >= 1 and hasattr(self, '_last_barrier_stats') and self._last_barrier_stats:
-                s = self._last_barrier_stats
-                print(f"    [PR4][SIDE-BARRIER][ROUND {round_idx+1}] min(sX)={s['min_sX']:.4f}mm, near(<20um)={s['pct_near']:.1f}%, cost/J={s['ratio']:.1e}")
-
-            
-            x_candidate = res.x
-            
-            # Step-capping now handled natively via least_squares bounds
-            x_step_capped = res.x
-            clamped_rvec_count = 0 
-            clamped_tvec_count = 0
-            num_rvec_blocks = 1
-            
-            # --- 2. Rollback Check ---
-            # Evaluate new cost
-            curr_planes, curr_cams = self._unpack_params_delta(x_step_capped, layout)
-            _, S_ray, S_len, N_ray, N_len = self.evaluate_residuals(curr_planes, curr_cams, lambda_eff)
-            
-            rmse_ray = np.sqrt(S_ray / max(N_ray, 1))
-            rmse_len = np.sqrt(S_len / max(N_len, 1)) if N_len > 0 else 0.0
-            
-            # [FIX] MSE-based normalized cost
-            # Normalized Cost = S_ray/N_ray + lambda * S_len/N_len
-            cost_new = (rmse_ray**2) + lambda_eff * (rmse_len**2)
-            
-            # Baseline J0 is established from the accepted state
-            if round_idx == 0:
-                # If round 0 (first attempt), J0 is from initial residuals (normalized)
-                self._current_J0 = (rmse_ray0**2) + lambda_eff * (rmse_len0**2)
-            
-            J0 = self._current_J0
-            
-            # Use tracked J0 for rollback comparison
-            # Ensure we have a valid baseline J0
-            if not hasattr(self, '_current_J0'):
-                 self._current_J0 = (rmse_ray0**2 * max(N_ray,1)) + lambda_eff * (rmse_len0**2 * max(N_len,1))
-
-            # === NEW Tiered Rollback Logic (PR4.2/4.3) ===
-            # Thresholds: 1% and 5%
-            J0 = self._current_J0
-            threshold_accept = 1.01  # ≤1% increase: direct accept
-            threshold_soft = 1.05   # 1-5% increase: conditional accept
-            
-            # Calculate clamped ratio for conditional logic
-            # layout is a list of (ptype, pid, subidx) tuples
-            # Count unique camera IDs with 'cam_r' parameter type
-            num_rvec_blocks = len(set(pid for ptype, pid, _ in layout if ptype == 'cam_r'))
-            num_rvec_blocks = max(num_rvec_blocks, 1)  # Avoid division by zero
-            clamped_ratio = clamped_rvec_count / num_rvec_blocks
-
-            # Determine action
-            if cost_new <= J0 * threshold_accept:
-                # DIRECT ACCEPT: Cost improved or increased ≤1%
-                accept = True
-                accept_action = "ACCEPT"
-            elif cost_new < J0 * threshold_soft:
-                # CONDITIONAL ACCEPT (1-5% increase)
-                accept = True
-                if clamped_ratio >= 0.3:
-                    # Many rvecs clamped -> reduce step size
-                    self._step_cap_multiplier = getattr(self, '_step_cap_multiplier', 1.0) * 0.5
-                    accept_action = "ACCEPT (clamped>30%, step_cap*=0.5)"
-                else:
-                    # Few rvecs clamped -> increase lambda
-                    lambda_eff *= 2.0
-                    accept_action = "ACCEPT (clamped<30%, lambda*=2)"
-            else:
-                # REJECT: Cost increased >5%
-                accept = False
-                accept_action = "REJECT"
-
-            # Convergence Check: If improvement is negligible (< 1e-6), stop optimization rounds early.
-            # Compare J_new vs J0
-            diff_rel = (J0 - cost_new) / max(J0, 1e-12)
-            if accept and (abs(diff_rel) < 1e-6) and round_idx > 0:
-                if cfg.verbosity >= 1:
-                    print(f"    Round {round_idx+1}: CONVERGED (Cost stable).")
-                x0 = x_step_capped
-                rmse_ray0, rmse_len0 = rmse_ray, rmse_len
-                break
-            
-            if accept:
-                x_opt = x_step_capped
-                # Update references
-                rmse_ray0 = rmse_ray
-                rmse_len0 = rmse_len
-
-                lambda_new = self._adapt_lambda(lambda_eff, S_ray, S_len, N_ray, N_len)
-                
-                if cfg.verbosity >= 2:
-                    print(f"    Round {round_idx+1}: {accept_action} (J={cost_new:.4f}, J0={J0:.4f}, caps r={clamped_rvec_count}/{num_rvec_blocks}). lam={lambda_eff:.1f}->{lambda_new:.1f}")
- 
-                lambda_eff = lambda_new
-                x0 = x_opt
-                
-                # Update J0 Baseline with NEW lambda for next comparison
-                # Normalized Cost J0 = MSE_ray + lambda_new * MSE_len
-                self._current_J0 = (rmse_ray0**2) + lambda_eff * (rmse_len0**2)
-                
-            else:
-                # REJECT: Cost increased >5%
-                if cfg.verbosity >= 1:
-                     print(f"    Round {round_idx+1}: REJECT (J={cost_new:.4f} > J0*1.05={J0*1.05:.4f}). Rollback.")
-                     print(f"       Caps: r={clamped_rvec_count}, t={clamped_tvec_count}")
-                     print(f"       RMSE Ray: {rmse_ray0:.4f}->{rmse_ray:.4f}, Len: {rmse_len0:.4f}->{rmse_len:.4f}")
-                
-                # Increase lambda to constrain next attempt
-                lambda_eff *= 2.0
-                
-                # Update J0 Baseline with NEW lambda for next comparison
-                self._current_J0 = (rmse_ray0**2) + lambda_eff * (rmse_len0**2)
-                
-                # x0 remains same
-
-            
-            # Progress callback for UI updates (called every round, regardless of accept/reject)
-            if self.progress_callback is not None:
-                try:
-                    # Report current best RMSE values
-                    self.progress_callback(description, rmse_ray0, rmse_len0, cost_new)
-                    self._last_ray_rmse = rmse_ray0
-                    self._last_len_rmse = rmse_len0
-                except Exception:
-                    pass  # Silently ignore callback errors to not disrupt optimization
-
+        # Final evaluation
+        planes_final, cams_final = self._unpack_params_delta(res.x, layout)
+        _, S_rayF, S_lenF, _, _ = self.evaluate_residuals(planes_final, cams_final, lambda_fixed)
         
-        # Commit Final Results
-        self.window_planes, self.cam_params = self._unpack_params_delta(x0, layout)
+        rmse_rayF = np.sqrt(S_rayF / max(N_ray, 1))
+        rmse_lenF = np.sqrt(S_lenF / max(N_len, 1)) if N_len > 0 else 0.0
+        JF = (rmse_rayF**2) + lambda_fixed * (rmse_lenF**2)
+        
+        print(f"    Final:   S_ray={S_rayF:.2f}, S_len={S_lenF:.2f} (JF={JF:.4f})")
+        print(f"      RMSE Ray: {rmse_ray0:.4f} -> {rmse_rayF:.4f}")
+        print(f"      RMSE Len: {rmse_len0:.4f} -> {rmse_lenF:.4f}")
+        
+        # Rollback check if degraded (Safety)
+        # However, pure geometric optimization shouldn't degrade unless local minima.
+        # We accept result.
         
         # Update Initial State for next stage
-        self.initial_planes = {wid: {k: (v.copy() if hasattr(v, 'copy') else v) for k,v in pl.items()} for wid, pl in self.window_planes.items()}
-        self.initial_cam_params = {cid: p.copy() for cid, p in self.cam_params.items()}
+        self.initial_planes = planes_final
+        self.initial_cam_params = cams_final
+        
+        # Update Public State
+        self.window_planes = planes_final
+        self.cam_params = cams_final
+        
+        return res, layout
 
+    def _print_plane_diagnostics(self, stage_name: str):
+        """Print current plane normals and angles between them."""
+        print(f"\n  [{stage_name}] Plane Diagnostics:")
+        wids = sorted(self.window_planes.keys())
+        normals = []
+        for wid in wids:
+            n = self.window_planes[wid]['plane_n']
+            pt = self.window_planes[wid]['plane_pt']
+            normals.append(n)
+            print(f"    Win {wid}: n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}], pt=[{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]")
+            
+            # [LOGGING] Print distances from associated cameras
+            cams = self.window_to_cams.get(wid, [])
+            for cid in cams:
+                if cid in self.cam_params:
+                     p = self.cam_params[cid]
+                     R, _ = cv2.Rodrigues(p[0:3])
+                     C = camera_center(R, p[3:6])
+                     dist = abs(np.dot(n, pt - C))
+                     print(f"      -> Cam {cid}: Dist {dist:.2f} mm")
+        
+        if len(normals) == 2:
+            from .refractive_geometry import angle_between_vectors
+            ang = angle_between_vectors(normals[0], normals[1])
+            print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
+
+    def _perform_geometric_initialization(self, wid: int, cid: int):
+        """
+        Hard geometric reset for weak window.
+        Move plane so closest 3D point is at exactly 'gap' distance.
+        gap = R_ball + 0.2 * d_cam_point + 0.05
+        """
+        print(f"  [GeoInit] Performing geometric initialization for Win {wid} (Cam {cid})...")
+        
+        # 1. Get Camera Center
+        p = self.cam_params[cid]
+        R, _ = cv2.Rodrigues(p[0:3])
+        C_A = -R.T @ p[3:6]
+        
+        # 2. Find closest 3D point optimized by *other* views
+        # We need points that are triangulatable.
+        min_dist = 1e9
+        X_min = None
+        R_min = 0.0 # Radius of ball at that point
+        
+        # Helper to triangulate single frame without `cid` (to avoid circular dependency on this plane)
+        count_3d = 0
+        
+        # Iterate cache (subset for speed?)
+        fids = sorted(list(self.obs_cache.keys()))
+        step = max(1, len(fids) // 2000) # Check up to 2000 frames
+        
+        for fid in fids[::step]:
+            obs = self.obs_cache[fid]
+            if cid not in obs: continue
+            
+            # Check for other cams
+            uvA_self, uvB_self = obs[cid]
+            
+            for endpoint, uv_self, radius_val in [('A', uvA_self, self.config.R_small_mm), ('B', uvB_self, self.config.R_large_mm)]:
+                if uv_self is None: continue
+                
+                # Build rays from OTHER cameras
+                rays_other = []
+                for other_cid, (o_uvA, o_uvB) in obs.items():
+                    if other_cid == cid: continue
+                    val = o_uvA if endpoint == 'A' else o_uvB
+                    if val is not None:
+                        # Build ray
+                        r = build_pinplate_ray_cpp(
+                            self.cams_cpp[other_cid], val, 
+                            cam_id=other_cid, 
+                            window_id=self.cam_to_window.get(other_cid, -1),
+                            frame_id=fid, endpoint=endpoint
+                        )
+                        if r.valid:
+                            rays_other.append(r)
+                
+                if len(rays_other) >= 2:
+                    X, _, ok, _ = triangulate_point(rays_other)
+                    if ok:
+                        d = np.linalg.norm(X - C_A)
+                        if d < min_dist:
+                            min_dist = d
+                            X_min = X
+                            R_min = radius_val
+                            count_3d += 1
+        
+        if X_min is None:
+            print(f"  [GeoInit] Failed: No triangulatable 3D points found for Win {wid} (Need overlap with other cams).")
+            return
+
+        # 3. Calculate target gap
+        margin = 0.05
+        # User formula: gap = R_min + 0.1 * d_min + margin
+        gap = R_min + 0.1 * min_dist + margin
+        
+        # 4. Move Plane
+        pl = self.window_planes[wid]
+        n = pl['plane_n']
+        pt = pl['plane_pt']
+        
+        # Current s0 = dot(n, X_min - pt)
+        # We need s_new = gap
+        # s_new = dot(n, X_min - (pt + t*n)) = s0 - t
+        # => t = s0 - gap
+        
+        s0 = np.dot(n, X_min - pt)
+        t = s0 - gap
+        
+        pt_new = pt + t * n
+        
+        # 5. Safety Check
+        # Check 1: Point on object side?
+        # s(X_min)_new = dot(n, X_min - pt_new)
+        s_X_new = np.dot(n, X_min - pt_new)
+        # Check 2: Camera on camera side?
+        # s(C_A)_new = dot(n, C_A - pt_new)
+        s_C_new = np.dot(n, C_A - pt_new)
+        
+        print(f"  [GeoInit] Found X_min at d={min_dist:.2f}mm. s0={s0:.2f}mm -> Target gap={gap:.2f}mm.")
+        print(f"            Shift t={t:.2f}mm. Check: s(X)={s_X_new:.4f} (>0), s(C)={s_C_new:.4f} (<0)")
+        
+        if s_X_new > -1e-3 and s_C_new < 1e-3:
+            # Apply
+            pl['plane_pt'] = pt_new
+            print(f"  [GeoInit] APPLIED. New pt=[{pt_new[0]:.2f}, {pt_new[1]:.2f}, {pt_new[2]:.2f}]")
+            
+            return min_dist
+        else:
+            print(f"  [GeoInit] REJECTED. Geometric violation. (C on wrong side or X on wrong side)")
+            return None
+
+    def _detect_weak_windows(self):
+        """
+        Identify weak windows (Single Camera + Angle < 5 deg) vs Strong windows.
+        Computes reference d1_avg from strong windows.
+        
+        Stores:
+          self._weak_windows = {wid: {'cam_id': cid, 'd0_init': float, 'n_init': vec}}
+          self._d1_avg_ref = float (mean distance of strong windows)
+        """
+        self._weak_windows = {}
+        self._strong_windows_list = []
+        strong_dists = []
+        
+        print("\n[PR4] Detecting Weak Windows (Dist-Ratio Constraint)...")
+        
+        for wid in self.window_planes:
+            cams = self.window_to_cams.get(wid, [])
+            cams_active = [c for c in cams if c in self.active_cam_ids]
+            
+            pl = self.window_planes[wid]
+            n = pl['plane_n']
+            pt = pl['plane_pt']
+            
+            # Compute distance for this window (mean of cameras)
+            d_win_vals = []
+            for cid in cams_active:
+                p = self.cam_params[cid]
+                R, _ = cv2.Rodrigues(p[0:3])
+                C = camera_center(R, p[3:6])
+                # Dist = dot(n, pt - C_cam) ? No, C++ convention: s < 0
+                # Distance = |dot(n, pt - C)|
+                dist = abs(np.dot(n, pt - C))
+                d_win_vals.append(dist)
+            
+            d_win_mean = np.mean(d_win_vals) if d_win_vals else 0.0
+            
+            # Classification
+            # Weak if: 1 active camera AND angle(n, optical_axis) < 5 deg
+            is_weak = False
+            angle_deg = 90.0
+            
+            if len(cams_active) == 1:
+                cid = cams_active[0]
+                # Optical axis: R.T @ [0,0,1] = [r_31, r_32, r_33] (3rd row of R?)
+                # Actually Z-axis of camera frame in world coords.
+                # R maps World->Cam. Z_cam = [0,0,1].
+                # in World: R.T @ [0,0,1] = 3rd row of R (since R is orthogonal)? No, 3rd column of R.T = 3rd row of R.
+                # Yes, R = [r1; r2; r3]. Z_cam_in_world = r3 (3rd row of R).
+                p = self.cam_params[cid]
+                R, _ = cv2.Rodrigues(p[0:3])
+                opt_axis = R[2, :] # 3rd row
+                
+                # Angle between n and opt_axis
+                # dot
+                costh = abs(np.dot(n, opt_axis))
+                angle_deg = np.degrees(np.arccos(min(1.0, costh)))
+                
+                if angle_deg < 5.0:
+                    is_weak = True
+            
+            if is_weak:
+                # Count observations (frames) for this camera
+                # obs_count calculation... (keep existing logic)
+                obs_count = 0
+                cid = cams_active[0]
+                for fid in self.obs_cache:
+                    if cid in self.obs_cache[fid]:
+                        uvA, uvB = self.obs_cache[fid][cid]
+                        if uvA is not None or uvB is not None:
+                             obs_count += 1
+                
+                # Check geometric init status
+                if not hasattr(self, '_weak_window_refs'):
+                    self._weak_window_refs = {}
+                
+                d_min_ref = 0.0
+                if wid not in self._weak_window_refs:
+                    # Execute ONCE
+                    d_min = self._perform_geometric_initialization(wid, cid)
+                    if d_min is not None:
+                        self._weak_window_refs[wid] = d_min
+                        d_min_ref = d_min
+                        
+                        # [Fix] Refresh d0 for log since plane moved
+                        p = self.cam_params[cid]
+                        R, _ = cv2.Rodrigues(p[0:3])
+                        C = -R.T @ p[3:6]
+                        pl_new = self.window_planes[wid]
+                        d_win_mean = abs(np.dot(pl_new['plane_n'], pl_new['plane_pt'] - C))
+                else:
+                    d_min_ref = self._weak_window_refs[wid]
+                
+                self._weak_windows[wid] = {
+                    'cam_id': cams_active[0], 
+                    'd0_init': d_win_mean, 
+                    'angle_deg': angle_deg,
+                    'obs_count': obs_count,
+                    'd_min_ref': d_min_ref
+                }
+                print(f"  [WEAK] Win {wid}: 1 Cam ({cid}), Ang={angle_deg:.2f}° (<5°). d0={d_win_mean:.2f}mm, d_min={d_min_ref:.2f}")
+            elif len(cams_active) > 0:
+                self._strong_windows_list.append(wid)
+                strong_dists.append(d_win_mean)
+                print(f"  [STRONG] Win {wid}: {len(cams_active)} Cams, Ang={angle_deg:.2f}°. d={d_win_mean:.2f}mm")
+        
+        # Initial Reference (for logging/fallback)
+        if strong_dists:
+            self._d1_avg_ref = np.mean(strong_dists)
+        else:
+            self._d1_avg_ref = 600.0 # Fallback
+            
+        print(f"  Ref Distance d1 (Initial Strong Avg): {self._d1_avg_ref:.2f} mm")
 
     def optimize(self, skip_pr4: bool = False, pr4_stage: int = 3) -> Tuple[Dict[int, Dict], Dict[int, np.ndarray]]:
         """
-        Main PR4 optimization entry point.
+        Execute PR4 Optimization (Alternating Refinement).
+        
+        Strategy:
+        1. Alternating Loop (Max 6 iterations):
+           - A: Optimize Planes (Fixed Cams). Bounds: Angle +/- 2.5 deg.
+           - B: Optimize Cams (Fixed Planes). Bounds: Free.
+           - Check: If Plane optimization (A) did NOT hit angle boundary, terminate loop early.
+        2. Final Joint Optimization (PR4.3 / Round 3).
         """
+        self._compute_physical_sigmas()
+        
+        # [MOVED per user request] Weak window detection now inside loop.
+        # self._detect_weak_windows()
+        
+        # [NEW] Persistent store for geometric init state (d_min)
+        self._weak_window_refs = {}
+        
+        enable_ray_tracking(True, reset=True)
+        print(f"\n[PR4] Optimization Start ({len(self.active_cam_ids)} cameras, {len(self.window_ids)} windows)")
+        for wid, pl in sorted(self.window_planes.items()):
+            pt = pl['plane_pt']
+            n = pl['plane_n']
+            print(f"  [PR4][INIT] Win {wid}: pt=[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}], n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
+
         if skip_pr4 or self.config.skip_pr4:
-            print("\n[PR4] Skipped (skip_pr4=True)")
+            print("[PR4] Skipped (config.skip_pr4=True).")
             return self.window_planes, self.cam_params
-        
-        print("\n" + "=" * 50)
-        print("[Refractive] Phase PR4: Bundle Adjustment (Selective BA)")
-        print("=" * 50)
-        
-        # Calculate initial RMSE for UI continuity
-        try:
-             _, S_ray, S_len, N_ray, N_len = self.evaluate_residuals(self.window_planes, self.cam_params, self.config.lambda0_init)
-             self._last_ray_rmse = np.sqrt(S_ray / max(N_ray, 1))
-             self._last_len_rmse = np.sqrt(S_len / max(N_len, 1)) if N_len > 0 else 0.0
-        except:
-             pass
-        
-        # Print freeze table
-        self.print_freeze_table()
-        
-        # PR4.1: Planes + selected tvec
-        if pr4_stage >= 1:
-            # Dynamically set rvec to FREEZE for this stage
-            # We can override the table temporarily?
-            # Or just filter in _get_param_layout using 'mode'.
-            # Current _get_param_layout respects freeze_table strictly.
-            # So we should modify freeze table temporarily or have mode-switch?
-            # Easier: Pass 'planes_and_tvec' mode to _optimize_generic 
-            # and generic uses it to filter on top of freeze table?
-            # Actually _get_param_layout already handles 'planes_only'.
-            # Let's verify _get_param_layout behavior.
-            # It enables cameras if mode != 'planes_only'.
-            # I need finer control.
-            
-            # Temporary override of freeze table for PR4.1
-            saved_ftp = {} # save rvec status
-            for wid in self.freeze_table:
-                for cid in self.freeze_table[wid]['cameras']:
-                    saved_ftp[(wid, cid)] = self.freeze_table[wid]['cameras'][cid]['rvec']
-                    self.freeze_table[wid]['cameras'][cid]['rvec'] = FreezeStatus.FREEZE
-            
-            print("\n[PR4.1] Optimizing planes + selected tvec...")
-            self._optimize_generic("pr4_1", "Optimizing camera extrinsic parameter and window parameters...")
-            
-            # Restore rvec status
-            for (wid, cid), status in saved_ftp.items():
-                self.freeze_table[wid]['cameras'][cid]['rvec'] = status
 
-        # PR4.2: Enable only STRONG rvec candidates
-        if pr4_stage >= 2:
-            # Build masked table: STRONG rvec enabled, others (OPTIMIZE/REG) temporarily FREEZE
-            import copy
-            masked_table_pr42 = copy.deepcopy(self.freeze_table)
+        # --- Alternating Loop ---
+        max_loop_iters = 6
+        loop_iter = 0
+        hit_boundary = True # Assume hit to start
+        
+        print(f"\n[PR4] Starting Alternating Loop (Max {max_loop_iters} passes)")
+        
+        while loop_iter < max_loop_iters:
+            loop_iter += 1
             
-            n_strong = 0
-            strong_cids = []
-            for wid in masked_table_pr42:
-                cams = masked_table_pr42[wid].get('cameras', {})
-                for cid in cams:
-                    original_status = self.freeze_table[wid]['cameras'][cid].get('rvec', FreezeStatus.FREEZE)
-                    if original_status == FreezeStatus.OPTIMIZE_STRONG:
-                        # Keep STRONG enabled
-                        n_strong += 1
-                        strong_cids.append(cid)
-                    elif original_status in [FreezeStatus.OPTIMIZE, FreezeStatus.OPTIMIZE_REGULARIZED]:
-                        # Temporarily freeze non-STRONG rvec for PR4.2
-                        masked_table_pr42[wid]['cameras'][cid]['rvec'] = FreezeStatus.FREEZE
+            # [NEW] Dynamic Detection per loop
+            self._detect_weak_windows()
             
-            if n_strong > 0:
-                print(f"\n[PR4.2] Optimization Phase 2 (Adding {n_strong} STRONG rvec candidates: {sorted(set(strong_cids))})...")
-                # Context switch to masked table with exception safety
-                old_table = self._freeze_table_active
-                try:
-                    self._freeze_table_active = masked_table_pr42
-                    self._optimize_generic("pr4_2", "Optimizing camera extrinsic parameter and window parameters...")
-                finally:
-                    self._freeze_table_active = old_table
+            # [Fix] Sync initial state because _detect_weak_windows might have moved planes (GeoInit)
+            # This ensures the optimization starts from the correct new position (delta=0 -> new_pt)
+            self._sync_initial_state()
+            
+            # [NEW] Calculate Shrinking Bounds for Weak Windows
+            # Loop 1: +/- 10% of d_min
+            # Loop 2: +/- 5%
+            # Loop 3: +/- 2.5%
+            # Formula: 0.1 * (0.5 ^ (loop_iter - 1))
+            plane_d_bounds = {}
+            if hasattr(self, '_weak_windows'):
+                print(f"  [PR4][LOOP {loop_iter}] Bounds Configuration:")
+                print(f"    Global Plane Angle: +/- 2.5 deg")
+                
+                factor = 0.1 * (0.5 ** (loop_iter - 1))
+                for wid, info in self._weak_windows.items():
+                    d_ref = info.get('d_min_ref', 0.0)
+                    if d_ref > 0:
+                        limit = d_ref * factor
+                        plane_d_bounds[wid] = limit
+                        print(f"    [WEAK BOUNDS] Win {wid}: +/- {limit:.2f} mm ({factor*100:.2f}% of {d_ref:.1f}mm)")
+            
+            print(f"\n[PR4][LOOP {loop_iter}] Step A: Optimize Planes (Bounds: +/- 2.5 deg)")
+            self._print_plane_diagnostics(f"Pre-Loop {loop_iter} Planes")
+            
+            # Step A: Optimize Planes (Fixed Cams) - Strict Angle Bound (2.5 deg)
+            # Bounds: Angle +/- 2.5 deg, Distance +/- 500mm (effectively free)
+            limit_angle_rad = np.radians(2.5)
+            b_plane_strict = (limit_angle_rad, 500.0)
+            
+            res_planes, layout_planes = self._optimize_generic(
+                mode=f'pr4_loop_{loop_iter}_planes', 
+                description=f"Adjusting plane parameters ...",
+                enable_planes=True,
+                enable_cam_t=False,
+                enable_cam_r=False,
+                limit_rot_rad=0.0,
+                limit_trans_mm=0.0,
+                limit_plane_d_mm=b_plane_strict[1],
+                limit_plane_angle_rad=b_plane_strict[0],
+                plane_d_bounds=plane_d_bounds, # [NEW] Pass bounds
+                ftol=5e-4
+            )
+            self._print_plane_diagnostics(f"PR4 Loop {loop_iter} Planes")
+            
+            # Check for Boundary Hit in Plane Angles
+            # active_mask: 0 = interior, -1/1 = hit bound
+            # Inspect layout to find plane_a/plane_b indices
+            active_mask = res_planes.active_mask
+            hit_boundary = False
+            
+            idx = 0
+            for (ptype, pid, subidx) in layout_planes:
+                if (ptype == 'plane_a' or ptype == 'plane_b') and active_mask[idx] != 0:
+                    hit_boundary = True
+                    # print(f"  [DEBUG] Hit boundary on {ptype} (Win {pid})")
+                idx += 1
+            
+            if hit_boundary:
+                print(f"  [PR4][LOOP {loop_iter}] Plane constraints ACTIVE (hit 2.5 deg bound). Continuing loop.")
             else:
-                print("\n[PR4.2] No STRONG rvec candidates, skipping.")
+                print(f"  [PR4][LOOP {loop_iter}] Plane constraints INACTIVE (all within 2.5 deg). Loop condition satisfied.")
+
+            # Step B: Optimize Cameras (Fixed Planes) - Free Bounds
+            print(f"\n[PR4][LOOP {loop_iter}] Step B: Optimize Cameras (Free Bounds)")
+            b_cam_free = (np.deg2rad(180.0), 2000.0)
             
-        # PR4.3: Enable STRONG + REGULARIZED + OPTIMIZE rvecs (full table)
+            self._optimize_generic(
+                mode=f'pr4_loop_{loop_iter}_cams', 
+                description=f"Optimizing camera extrinsic parameters ...",
+                enable_planes=False,
+                enable_cam_t=True,
+                enable_cam_r=True,
+                limit_rot_rad=b_cam_free[0],
+                limit_trans_mm=b_cam_free[1],
+                limit_plane_d_mm=0.0,
+                limit_plane_angle_rad=0.0,
+                ftol=5e-4
+            )
+            self._print_plane_diagnostics(f"PR4 Loop {loop_iter} Cams")
+
+            # Check termination
+            if not hit_boundary:
+                print(f"  [PR4] Converged early at Loop {loop_iter} (Planes inside 2.5 deg). Stopping loop.")
+                break
+        
+        if hit_boundary and loop_iter == max_loop_iters:
+             print(f"  [PR4] Loop reached max iterations ({max_loop_iters}). Proceeding to Joint.")
+
+        # --- Final Joint Optimization (Round 3) ---
         if pr4_stage >= 3:
-            # Count all eligible rvec candidates
-            n_total = 0
-            all_cids = []
-            for wid in self.freeze_table:
-                cams = self.freeze_table[wid].get('cameras', {})
-                for cid in cams:
-                    status = self.freeze_table[wid]['cameras'][cid].get('rvec', FreezeStatus.FREEZE)
-                    if status in [FreezeStatus.OPTIMIZE, FreezeStatus.OPTIMIZE_STRONG, FreezeStatus.OPTIMIZE_REGULARIZED]:
-                        n_total += 1
-                        all_cids.append(cid)
+            print("\n[PR4][FINAL] Joint Optimization (Round 3 Rules).")
             
-            if n_total > 0:
-                print(f"\n[PR4.3] Joint bundle adjustment (Adding {n_total} rvec candidates: {sorted(set(all_cids))})...")
-                # Use full original table (contains all statuses)
-                self._freeze_table_active = self.freeze_table
-                self._optimize_generic("pr4_3", "Optimizing camera extrinsic parameter and window parameters...")
-            else:
-                print("\n[PR4.3] No rvec candidates, skipping.")
-
+            # [NEW] Re-detect before final joint
+            self._detect_weak_windows()
+            # Bounds: 20 deg, 50 mm d, 10 mm tvec
+            limit_rvec = np.radians(20.0)
+            limit_plane_d = 50.0
+            limit_plane_ang = np.radians(20.0)
+            limit_tvec = 10.0
             
+            print(f"  Bounds: rvec < 20deg, plane_d < 50mm, plane_ang < 20deg, tvec < 10mm")
+            
+            self._optimize_generic(
+                mode='pr4_final_joint', 
+                description="Optimizing plane and camera extrinsic parameters ...",
+                enable_planes=True,
+                enable_cam_t=True,
+                enable_cam_r=True,
+                limit_rot_rad=limit_rvec,
+                limit_trans_mm=limit_tvec,
+                limit_plane_d_mm=limit_plane_d,
+                limit_plane_angle_rad=limit_plane_ang,
+                ftol=1e-5
+            )
+            self._print_plane_diagnostics("PR4 Final Joint End")
         
-        # [CRITICAL] Final Sync to C++ objects (Ensures next stage starts correctly)
-        self.evaluate_residuals(self.window_planes, self.cam_params, self.config.lambda0_init)
+        # Explicit sync call to be safe for returning
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
+        self.evaluate_residuals(self.window_planes, self.cam_params, lambda_fixed)
 
-        # Print diagnostics
         self.print_diagnostics()
-        
         print("\n[PR4] Optimization Complete.")
+        print_ray_stats_report("PR4 Bundle")
+        enable_ray_tracking(False)
+        
         return self.window_planes, self.cam_params
 
-    # Helper methods placeholders removed as they are integrated into optimize()
     def _optimize_pr4_1(self): pass
     def _optimize_pr4_2(self): pass
     def _optimize_pr4_3(self): pass
@@ -1625,9 +1872,10 @@ class RefractiveBAOptimizerPR4:
         print("-" * 40)
         
         # Evaluate final residuals
-        lambda_eff = self.config.lambda0_init
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
         residuals, S_ray, S_len, N_ray, N_len = self.evaluate_residuals(
-            self.window_planes, self.cam_params, lambda_eff
+            self.window_planes, self.cam_params, lambda_fixed
         )
         
         # Ray stats
@@ -1704,9 +1952,7 @@ class RefractiveBAOptimizerPR4:
                 if wid in self.window_planes:
                      self.window_planes[wid]['plane_pt'] = np.array(pl['plane_pt'])
                      self.window_planes[wid]['plane_n'] = np.array(pl['plane_n'])
-            
-            # Apply to C++ objects
-            # Apply to C++ objects
+
             # Apply to C++ objects (Consolidated Update)
             for cid in self.active_cam_ids:
                 if cid not in self.cams_cpp: continue
@@ -1714,10 +1960,20 @@ class RefractiveBAOptimizerPR4:
                 # Prepare update arguments
                 update_kwargs = {}
                 
-                # 1. Extrinsics
+                # 1. Extrinsics AND Intrinsics
                 if cid in self.cam_params:
                     p = self.cam_params[cid]
                     update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+                    
+                    # [CRITICAL] Pass full intrinsics to ensure update_cpp_camera_state 
+                    # doesn't zero them out if C++ state is not fully initialized.
+                    # This prevents PR4 cache load from corrupting state for PR5.
+                    update_kwargs['intrinsics'] = {
+                        'f': p[6],
+                        'cx': p[7],
+                        'cy': p[8],
+                        'dist': [p[9], p[10], 0, 0, 0]
+                    }
                 
                 # 2. Plane Geometry
                 wid = self.cam_to_window.get(cid)
@@ -1818,6 +2074,9 @@ class RefractiveBAOptimizerPR5:
         self._last_n_ray = 0
         self._last_s_len = 0.0
         self._last_n_len = 0
+        
+        self.sigma_ray_global = 0.04
+        self.sigma_wand = 0.1
 
         
         self.active_cam_ids = sorted(list(self.cams_cpp.keys()))
@@ -1847,11 +2106,6 @@ class RefractiveBAOptimizerPR5:
             wid = self.cam_to_window.get(cid)
             if wid not in self.window_to_cams: self.window_to_cams[wid] = []
             self.window_to_cams[wid].append(cid)
-            
-        # Observability Analysis
-        self.observability = {}
-        self.freeze_table = {} # {wid: {'plane':..., 'thick':..., 'cameras':{cid: {'tvec':..., 'rvec':..., 'f':...}}}}
-        self._compute_observability_and_freeze()
         
     def _build_obs_cache(self, frames: Optional[List[int]] = None):
         """Build observation cache from dataset (optionally subset of frames)."""
@@ -1917,7 +2171,7 @@ class RefractiveBAOptimizerPR5:
         if len(pool) <= needed:
             subset = injected + pool
         else:
-            selected_random = sorted(rng.sample(pool, needed))
+            selected_random = sorted(rng.sample(pool, max(0, needed)))
             subset = injected + selected_random
             
         # Log sampling
@@ -1926,150 +2180,84 @@ class RefractiveBAOptimizerPR5:
                 
         return sorted(subset)
 
-    def _compute_observability_and_freeze(self):
-        """Compute observability metrics and build Freeze Table according to PR5 rules."""
-        # Calculate N_cam, Baseline, Angle Diversity
-        for wid in self.window_ids:
-            info = ObservabilityInfo(wid, n_cam=0)
-            cams = self.window_to_cams.get(wid, [])
-            info.n_cam = len(cams)
-            info.camera_ids = cams
-            
-            # 1. Baseline
-            if info.n_cam >= 2:
-                # Calculate baselines... reusing code from PR4 ideally, but rewriting for independence
-                max_base = 0.0
-                centers = []
-                for cid in cams:
-                    p = self.cam_params[cid]
-                    R = rodrigues_to_R(p[0:3])
-                    C = -R.T @ p[3:6]
-                    centers.append(C)
-                
-                for i in range(len(centers)):
-                    for j in range(i+1, len(centers)):
-                        dist = np.linalg.norm(centers[i] - centers[j])
-                        max_base = max(max_base, dist)
-                info.baseline_max_mm = max_base
-            
-            # 2. Angle Diversity
-            angles = []
-            if info.n_cam >= 2:
-                 for i in range(len(cams)):
-                    for j in range(i+1, len(cams)):
-                        p1 = self.cam_params[cams[i]]
-                        p2 = self.cam_params[cams[j]]
-                        # Angle between optical axes (Z)
-                        z1 = rodrigues_to_R(p1[0:3])[:, 2]
-                        z2 = rodrigues_to_R(p2[0:3])[:, 2]
-                        ang = np.degrees(np.arccos(np.clip(np.dot(z1, z2), -1.0, 1.0)))
-                        angles.append(ang)
-            
-            if angles:
-                info.angle_diversity_p50 = np.median(angles)
-                info.angle_diversity_p90 = np.percentile(angles, 90) if len(angles) >= 2 else angles[0]
-            else:
-                info.angle_diversity_p50 = 0.0
-                info.angle_diversity_p90 = 0.0
-                
-            self.observability[wid] = info
+    def _compute_physical_sigmas(self):
+        """Estimate global sigma values across all optimize stages."""
+        cfg = self.config
+        all_f = [p[6] for p in self.cam_params.values() if len(p) > 6]
+        avg_f = np.mean(all_f) if all_f else 1000.0
+        
+        sample_dists = []
+        # Use first few frames of obs_cache
+        fids_all = sorted(list(self.obs_cache.keys()))
+        fids_to_sample = fids_all[::max(1, len(fids_all) // 100)]
+        for fid in fids_to_sample:
+            obs = self.obs_cache.get(fid, {})
+            rays = []
+            for cid in obs:
+                uvA, _ = obs[cid]
+                if uvA is not None:
+                    # cam_id=cid, window_id=self.cam_to_window.get(cid, -1), frame_id=fid, endpoint="A"
+                    r = build_pinplate_ray_cpp(self.cams_cpp[cid], uvA, cam_id=cid, window_id=self.cam_to_window.get(cid, -1), frame_id=fid, endpoint="A")
+                    if r.valid: rays.append(r)
+            if len(rays) >= 2:
+                X, _, ok, _ = triangulate_point(rays)
+                if ok:
+                    for cid in obs:
+                        rv = self.cam_params[cid][0:3]
+                        tv = self.cam_params[cid][3:6]
+                        R = cv2.Rodrigues(rv)[0]
+                        C = -R.T @ tv
+                        sample_dists.append(np.linalg.norm(X - C))
+        
+        avg_dist_z = np.mean(sample_dists) if sample_dists else 600.0
+        
+        self.sigma_ray_global = cfg.px_target * (avg_dist_z / avg_f)
+        self.sigma_wand = self.wand_length * cfg.wand_tol_pct
+        
+        if cfg.verbosity >= 1:
+            print(f"  [PR5] Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm ({cfg.px_target}px at Z={avg_dist_z:.1f}mm), sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)")
 
+    def _print_plane_diagnostics(self, stage_name: str):
+        """Print current plane normals and angles between them."""
+        print(f"\n  [{stage_name}] Plane Diagnostics:")
+        wids = sorted(self.window_planes.keys())
+        normals = []
+        for wid in wids:
+            n = self.window_planes[wid]['plane_n']
+            pt = self.window_planes[wid]['plane_pt']
+            normals.append(n)
+            print(f"    Win {wid}: n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}], pt=[{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]")
             
-            # 3. Rules Application
-            ft = {
-                'plane': FreezeStatus.OPTIMIZE,
-                'thickness': FreezeStatus.OPTIMIZE_STRONG, # Always strong
-                'cameras': {}
-            }
-            
+            # [LOGGING] Print distances from associated cameras
+            cams = self.window_to_cams.get(wid, [])
             for cid in cams:
-                cft = {'f': FreezeStatus.OPTIMIZE_STRONG} # F always strong
-                
-                # Extrinsics Logic
-                if info.n_cam == 1:
-                    # Single cam: Freeze all extrinsics to hold gauge
-                    cft['tvec'] = FreezeStatus.FREEZE
-                    cft['rvec'] = FreezeStatus.FREEZE
-                elif info.n_cam == 2:
-                    if info.angle_diversity_p50 < 15.0:
-                         cft['tvec'] = FreezeStatus.OPTIMIZE 
-                         # Weak/Strong logic per user spec
-                         cft['rvec'] = FreezeStatus.OPTIMIZE_STRONG if self.config.allow_weak_rvec else FreezeStatus.FREEZE
-                    elif info.angle_diversity_p50 < 25.0:
-                         cft['tvec'] = FreezeStatus.OPTIMIZE
-                         cft['rvec'] = FreezeStatus.OPTIMIZE_STRONG
-                    else: # >= 25
-                         cft['tvec'] = FreezeStatus.OPTIMIZE
-                         cft['rvec'] = FreezeStatus.OPTIMIZE
-                else: # N >= 3
-                    cft['tvec'] = FreezeStatus.OPTIMIZE
-                    cft['rvec'] = FreezeStatus.OPTIMIZE
-                
-                ft['cameras'][cid] = cft
-            
-            self.freeze_table[wid] = ft
-    
-    def _print_freeze_table(self):
-        """Print PR5 observability and freeze table."""
-        if self.config.verbosity >= 1:
-            print(f"\n  [PR5] Optimization Freeze & Observability Table:")
-            print(f"    {'WinID':<6} {'N_cam':<6} {'Base':<8} {'Ang(deg)':<8} {'Plane':<8} {'Thick':<8} {'Tv':<8} {'Rv':<8} {'F':<8}")
-            print("    " + "-"*80)
-            
-            for wid in self.window_ids:
-                info = self.observability[wid]
-                ft = self.freeze_table[wid]
-                
-                # Summary for cams
-                tv_stats = set()
-                rv_stats = set()
-                f_stats = set()
-                
-                for cid in info.camera_ids:
-                     cft = ft['cameras'][cid]
-                     tv_stats.add(cft['tvec'].value)
-                     rv_stats.add(cft['rvec'].value)
-                     f_stats.add(cft['f'].value)
-                
-                tv_str = "/".join(sorted(list(tv_stats))) if tv_stats else "N/A"
-                rv_str = "/".join(sorted(list(rv_stats))) if rv_stats else "N/A"
-                f_str = "/".join(sorted(list(f_stats))) if f_stats else "N/A"
-                
-                # Truncate if long
-                if len(tv_str) > 8: tv_str = tv_str[:7]+".."
-                if len(rv_str) > 8: rv_str = rv_str[:7]+".."
-                
-                print(f"    {wid:<6} {info.n_cam:<6} {info.baseline_max_mm:<8.1f} {info.angle_diversity_p90:<8.1f} "
-                      f"{ft['plane'].value:<8} {ft['thickness'].value:<8} "
-                      f"{tv_str:<8} {rv_str:<8} {f_str:<8}")
-            print("    " + "-"*80 + "\n")
+                if cid in self.cam_params:
+                     p = self.cam_params[cid]
+                     R, _ = cv2.Rodrigues(p[0:3])
+                     C = camera_center(R, p[3:6])
+                     dist = abs(np.dot(n, pt - C))
+                     print(f"      -> Cam {cid}: Dist {dist:.2f} mm")
+        
+        if len(normals) == 2:
+            from .refractive_geometry import angle_between_vectors
+            ang = angle_between_vectors(normals[0], normals[1])
+            print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
+
 
     def optimize(self) -> Tuple[Dict, Dict, Dict]:
-        """Run PR5 optimization."""
+        """Run PR5 optimization (Single Round)."""
+        enable_ray_tracking(True, reset=True)
+        verbosity = self.config.verbosity
         print("\n" + "="*60)
-        print("PR5: ROBUST BUNDLE ADJUSTMENT (Geometric Only)")
+        print("PR5: ROBUST BUNDLE ADJUSTMENT (Geometric Only - Simplified)")
         print("="*60)
         
-        self._print_freeze_table()
-        
-        # [POLISH PREP] Populate self.frozen_cams based on config
-        self.frozen_cams = []
-        if self.freeze_table:
-            # Use passed freeze table
-            for wid, ft in self.freeze_table.items():
-                if 'cameras' in ft:
-                    for cid, c_status in ft['cameras'].items():
-                        # If rvec is frozen (or any other logic), add to candidates
-                        if c_status.get('rvec') == FreezeStatus.FREEZE:
-                            self.frozen_cams.append(cid)
-        else:
-             # Fallback if no table (e.g. loaded from cache without it?)
-             # Polish might be skipped or just target all?
-             # For safety given current panic, if empty, we skip polish (warned).
-             pass
-             
-        self.frozen_cams = sorted(list(set(self.frozen_cams)))
-        
+        print(f"\n[PR5] Optimization Start ({len(self.active_cam_ids)} cameras, {len(self.window_ids)} windows)")
+        for wid, pl in sorted(self.window_planes.items()):
+            pt = pl['plane_pt']
+            n = pl['plane_n']
+            print(f"  [PR5][INIT] Win {wid}: pt=[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}], n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
+
         # Calculate initial RMSE to avoid -1.0 display at start
         try:
              x0, _, _ = self._pack_parameters()
@@ -2081,189 +2269,32 @@ class RefractiveBAOptimizerPR5:
         except:
              pass
         
-        # PR5.1 Main BA
-        if self.config.pr5_stage >= 1:
-             self._optimize_stage(stage_name="Optimizing camera intrinsic and extrinsic parameters and window parameters...", max_rounds=5, tight=False)
+        # PR5 Main BA (Single Stage)
+        self._optimize_stage(stage_name="Optimizing plane and all camera parameters ...", max_rounds=1)
         
-        # [DISABLED] PR5.2 Final Joint
-        # if self.config.pr5_stage >= 2:
-        #    self._optimize_stage(stage_name="Optimizing camera intrinsic and extrinsic parameters and window parameters...", max_rounds=3, tight=True)
+        for wid, pl in sorted(self.window_planes.items()):
+            pt = pl['plane_pt']
+            n = pl['plane_n']
+            print(f"  [PR5][FINAL] Win {wid}: pt=[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}], n=[{n[0]:.4f}, {n[1]:.4f}, {n[2]:.4f}]")
+        
+        self._print_plane_diagnostics("PR5 Final End")
+
+        print_ray_stats_report("PR5 Bundle")
+        enable_ray_tracking(False)
             
         return self.window_planes, self.cam_params, self.window_media
 
-    def _compute_side_violation(self, x):
-        """
-        Compute side violation v = max(0, margin - min(sX)) and worst point info.
-        
-        Returns:
-            v: float, violation gap (mm)
-            worst_info: tuple with worst violating point info
-            all_sX_info: list of (sX, fid, wid, endpoint) tuples
-            all_sC_info: list of (sC, cid, wid) tuples
-        """
-        cfg = self.config
-        
-        # Unpack and apply parameters
-        planes_scalars, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x)
-        planes_up = self._apply_params_to_cpp(planes_scalars, thick_map, f_map, rvec_map, tvec_map)
-        
-        all_sX_info = []
-        all_sC_info = []
-        
-        # [STEP 2] Get estimated radii for PR5
-        radius_A = self.dataset.get('est_radius_small_mm', 0.0)
-        radius_B = self.dataset.get('est_radius_large_mm', 0.0)
-        
-        # Collect signed distances from obs_cache (matching _residuals_pr5)
-        for fid in self.obs_cache:
-            rays_A = []
-            rays_B = []
-            
-            # Build rays
-            for cid, (uvA, uvB) in self.obs_cache[fid].items():
-                cam = self.cams_cpp[cid]
-                wid = self.cam_to_window.get(cid)
-                
-                if uvA is not None:
-                     rA = build_pinplate_ray_cpp(cam, uvA, cam_id=cid, window_id=wid, frame_id=fid, endpoint="A")
-                     if rA.valid: rays_A.append(rA)
-                if uvB is not None:
-                     rB = build_pinplate_ray_cpp(cam, uvB, cam_id=cid, window_id=wid, frame_id=fid, endpoint="B")
-                     if rB.valid: rays_B.append(rB)
-            
-            XA, _, vA, _ = triangulate_point(rays_A)
-            XB, _, vB, _ = triangulate_point(rays_B)
-            
-            wids_A = set(r.window_id for r in rays_A if r.window_id is not None)
-            wids_B = set(r.window_id for r in rays_B if r.window_id is not None)
-            
-            if vA:
-                for wid in wids_A:
-                    if wid not in planes_up:
-                        continue
-                    pl = planes_up[wid]
-                    P_plane = np.array(pl['plane_pt'])
-                    n = np.array(pl['plane_n'])
-                    n = n / (np.linalg.norm(n) + 1e-12)
-                    sX = float(np.dot(n, XA - P_plane))
-                    all_sX_info.append((sX, fid, wid, 'A'))
-            
-            if vB:
-                for wid in wids_B:
-                    if wid not in planes_up:
-                        continue
-                    pl = planes_up[wid]
-                    P_plane = np.array(pl['plane_pt'])
-                    n = np.array(pl['plane_n'])
-                    n = n / (np.linalg.norm(n) + 1e-12)
-                    sX = float(np.dot(n, XB - P_plane))
-                    all_sX_info.append((sX, fid, wid, 'B'))
-        
-        # Camera-side
-        for cid in self.active_cam_ids:
-            wid = self.cam_to_window.get(cid)
-            if wid is None or wid not in planes_up:
-                continue
-            
-            cp = self.cam_params[cid]
-            rvec = cp[0:3]
-            tvec = cp[3:6]
-            R_cam = cv2.Rodrigues(rvec.reshape(3, 1))[0]
-            C = -R_cam.T @ tvec
-            
-            pl = planes_up[wid]
-            P_plane = np.array(pl['plane_pt'])
-            n = np.array(pl['plane_n'])
-            n = n / (np.linalg.norm(n) + 1e-12)
-            
-            sC = float(np.dot(n, C - P_plane))
-            all_sC_info.append((sC, cid, wid))
-        
-        # Compute gaps
-        gaps_with_info = []
-        for (sX, fid, wid, endpoint) in all_sX_info:
-            # [STEP 2] Check against radius
-            # Limit is sX >= margin + R
-            # Violation if sX < margin + R
-            # Gap = (margin + R) - sX
-            
-            r_val = radius_A if endpoint == 'A' else radius_B
-            limit = cfg.margin_side_mm + r_val
-            gap = limit - sX
-            
-            gaps_with_info.append((gap, 'point', fid, wid, endpoint, sX))
-        for (sC, cid, wid) in all_sC_info:
-            gap = sC + cfg.margin_side_mm
-            gaps_with_info.append((gap, 'cam', cid, wid, None, sC))
-        
-        if gaps_with_info:
-            gaps_with_info.sort(key=lambda x: -x[0])
-            worst = gaps_with_info[0]
-            v = max(0.0, worst[0])
-        else:
-            worst = None
-            v = 0.0
-        
-        return v, worst, all_sX_info, all_sC_info
-
-    def _compute_j_data(self, x, lambda_len):
-        """Compute J_data = S_ray + lambda_len * S_len for given parameters."""
-        # Quick evaluation without full residual computation
-        planes_up, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x)
-        self._apply_params_to_cpp(planes_up, thick_map, f_map, rvec_map, tvec_map)
-        
-        s_ray = 0.0
-        s_len = 0.0
-        
-        for fid in self.obs_cache:
-            rays_A = []
-            rays_B = []
-            
-            # Build rays
-            for cid, (uvA, uvB) in self.obs_cache[fid].items():
-                cam = self.cams_cpp[cid]
-                wid = self.cam_to_window.get(cid)
-                
-                if uvA is not None:
-                     rA = build_pinplate_ray_cpp(cam, uvA, cam_id=cid, window_id=wid, frame_id=fid, endpoint="A")
-                     if rA.valid: rays_A.append(rA)
-                if uvB is not None:
-                     rB = build_pinplate_ray_cpp(cam, uvB, cam_id=cid, window_id=wid, frame_id=fid, endpoint="B")
-                     if rB.valid: rays_B.append(rB)
-            
-            XA, _, vA, _ = triangulate_point(rays_A)
-            XB, _, vB, _ = triangulate_point(rays_B)
-            
-            if vA and len(rays_A) > 0:
-                O_A = np.vstack([r.o for r in rays_A])
-                D_A = np.vstack([r.d for r in rays_A])
-                dists_A = point_to_ray_dist_vec(XA, O_A, D_A)
-                s_ray += np.sum(dists_A ** 2)
-            
-            if vB and len(rays_B) > 0:
-                O_B = np.vstack([r.o for r in rays_B])
-                D_B = np.vstack([r.d for r in rays_B])
-                dists_B = point_to_ray_dist_vec(XB, O_B, D_B)
-                s_ray += np.sum(dists_B ** 2)
-            
-            if vA and vB:
-                L = np.linalg.norm(XA - XB)
-                err = L - self.wand_length
-                s_len += err ** 2
-        
-        return s_ray + lambda_len * s_len
-
     def _optimize_stage(self, stage_name: str, max_rounds: int, tight: bool = False):
-        """Generic PR5 stage optimization."""
-        print(f"\n  [{stage_name}] Optimization ({max_rounds} rounds)...")
+        """
+        Generic PR5 stage optimization. 
+        Single round with uniform priors.
+        """
+        print(f"\n  [{stage_name}] Optimization...")
         
         cfg = self.config
-        lambda_len = cfg.lambda_len_init
-        
-        # [DEBUG] Start F
-        if len(self.active_cam_ids) > 0:
-             cid0 = self.active_cam_ids[0]
-             print(f"    [DEBUG] Stage Start: Cam {cid0} F={self.cam_params[cid0][6]:.4f}")
+        # Fixed Weighting
+        n_cams = max(1, len(self.active_cam_ids))
+        lambda_fixed = 2.0 * n_cams
         
         # Initial pack
         x0, bounds, names = self._pack_parameters()
@@ -2274,252 +2305,57 @@ class RefractiveBAOptimizerPR5:
 
         print(f"    Num Params: {len(x0)}")
         
-        # Initialize persistent gate state
-        if not hasattr(self, '_gate_enabled'):
-            self._gate_enabled = False
-            
-        # Initialize Injection State for this stage
-        injected_frames = []
+        # Force Gate Enable
+        self._round_gate_enabled = True 
         
-        # Robustly gather ALL frames from observations + definition
-        # (Fixes issue where dataset['frames'] might be incomplete subset)
-        f_def = set(self.dataset.get('frames', []))
-        f_obsA = set(self.dataset.get('obsA', {}).keys())
-        f_obsB = set(self.dataset.get('obsB', {}).keys())
-        all_frames = sorted(list(f_def | f_obsA | f_obsB))
-            
-        max_frames_cfg = getattr(cfg, 'max_frames', 300)
-
-        # Outer Loop
-        for round in range(max_rounds):
-             # -------------------------------------------------------------------------
-             # 1. SAMPLING (Worst-K Injection)
-             # -------------------------------------------------------------------------
-             subset = self.build_pr5_frame_subset(all_frames, max_frames_cfg, injected_frames_prev=injected_frames)
-             
-             # Rebuild cache for this subset (Optimization uses this)
-             self._build_obs_cache(subset)
-             
-             # -------------------------------------------------------------------------
-             # 2. ROUND SETUP (Subsampled)
-             # -------------------------------------------------------------------------
-             # Must unpack current x0 to compute initial state for this round
-             
-             # Evaluate current v using initial x0 for this round (SUBSET ONLY)
-             # This sets the gate based on what the optimizer "sees".
-             v_current, worst_info, all_sX_info, all_sC_info = self._compute_side_violation(x0)
-             
-             # Hysteresis update
-             if self._gate_enabled:
-                 if v_current < cfg.v_off_side_gate:
-                     self._gate_enabled = False
-             else:
-                 if v_current > cfg.v_on_side_gate:
-                     self._gate_enabled = True
-             
-             # Compute J_ref at round start (using initial parameters, SUBSET)
-             self._j_ref_for_round = self._compute_j_data(x0, lambda_len)
-             
-             # Store round-level gate state
-             self._round_gate_enabled = self._gate_enabled
-             
-             # [USER REQUEST] Force gate ON for the final round to ensure side constraints 
-             if round == max_rounds - 1:
-                 if not self._round_gate_enabled:
-                     print(f"    [PR5] Final Round: Forcing side gate ON.")
-                 self._round_gate_enabled = True
-             
-             self._round_v_current = v_current
-             
-             # Log Round Header (Explicitly SUBSET)
-             if cfg.verbosity >= 1:
-                 # Helper to count violations in S_info
-                 def count_viols(sX_info, sC_info):
-                     n_X = 0
-                     n_C = 0
-                     radius_A = self.dataset.get('est_radius_small_mm', 0.0)
-                     radius_B = self.dataset.get('est_radius_large_mm', 0.0)
-                     for (sX, _, _, ep) in sX_info:
-                         r_val = radius_A if ep == 'A' else radius_B
-                         if sX < cfg.margin_side_mm + r_val: n_X += 1
-                     for (sC, _, _) in sC_info:
-                         if sC > -cfg.margin_side_mm: n_C += 1
-                     return n_X, n_C
-
-                 n_viol_X, n_viol_C = count_viols(all_sX_info, all_sC_info)
-                 
-                 print(f"\n[PR5][ROUND {round+1}][SUBSET] ({len(subset)} frames)")
-                 print(f"  margin_mm      = {cfg.margin_side_mm:.4f}")
-                 print(f"  v (subset)     = {v_current:.4f} mm")
-                 print(f"  gate_enabled   = {self._round_gate_enabled}")
-                 print(f"  violations     = {n_viol_X} points + {n_viol_C} cameras (in subset)")
-
-             # Update lambda_len (Annealing?)
-             if round > 0:
-                 lambda_len = max(cfg.lambda_len_min, lambda_len * 0.8)
-             
-             # Scale lambda_len if gate is active
-             lambda_len_eff = lambda_len
-             if self._round_gate_enabled:
-                 lambda_len_eff *= cfg.scale_len_gate_active
-
-             # Residual wrapper
-             self._res_call_count_pr5 = 0
-             def residuals_wrapper_pr5(x):
-                 res = self._residuals_pr5(x, lambda_len_eff)
-                 self._res_call_count_pr5 += 1
-                 if self.progress_callback and self._res_call_count_pr5 % 30 == 0:
-                     try:
-                         # Approx cost
-                         c_approx = 0.5 * np.sum(res**2)
-                         # Report actual tracked RMSEs (Subsampled)
-                         r_rmse = np.sqrt(self._last_s_ray / max(self._last_n_ray, 1))
-                         l_rmse = np.sqrt(self._last_s_len / max(self._last_n_len, 1)) if self._last_n_len > 0 else 0.0
-                         self.progress_callback(stage_name, r_rmse, l_rmse, c_approx)
-                     except:
-                         pass
-                 return res
-
-             # -------------------------------------------------------------------------
-             # 3. OPTIMIZE (Subsampled)
-             # -------------------------------------------------------------------------
-             # [USER REQUEST] Use tighter tolerance for final round only
-             is_final_round = (round == max_rounds - 1)
-             tol = 1e-8 if is_final_round else 1e-6
-             
-             # [FINAL ROUND POLISH] Unfreeze all 'FREEZE' params to 'OPTIMIZE_STRONG'
-             if is_final_round:
-                 if cfg.verbosity >= 1:
-                     print("    [PR5] Final Round: Unfreezing 'FREEZE' parameters to 'OPTIMIZE_STRONG'.")
-                 
-                 # 1. Sync current x0 to internal objects so _pack_parameters has latest state
-                 planes_scalars, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x0)
-                 # We don't need full C++ sync here, just python dict update for packing
-                 # Update window planes
-                 planes_up = self._apply_params_to_cpp(planes_scalars, thick_map, f_map, rvec_map, tvec_map)
-                 self.window_planes = planes_up # Temporary update for packing
-                 for wid, pl in planes_up.items():
-                    self.window_media[wid]['thickness'] = thick_map[wid]
-                 
-                 # Update cameras
-                 for cid in self.active_cam_ids:
-                     if cid in f_map: self.cam_params[cid][6] = f_map[cid]
-                     if cid in rvec_map: self.cam_params[cid][0:3] = rvec_map[cid]
-                     if cid in tvec_map: self.cam_params[cid][3:6] = tvec_map[cid]
-                 
-                 # 2. Update Freeze Table
-                 # Iterate ALL windows/cameras in freeze table
-                 for wid in self.freeze_table:
-                     ft = self.freeze_table[wid]
-                     if ft.get('plane') == FreezeStatus.FREEZE: ft['plane'] = FreezeStatus.OPTIMIZE_STRONG
-                     if ft.get('thick') == FreezeStatus.FREEZE: ft['thick'] = FreezeStatus.OPTIMIZE_STRONG
-                     
-                     for cid in ft.get('cameras', {}):
-                         cft = ft['cameras'][cid]
-                         if cft.get('f') == FreezeStatus.FREEZE: cft['f'] = FreezeStatus.OPTIMIZE_STRONG
-                         if cft.get('rvec') == FreezeStatus.FREEZE: cft['rvec'] = FreezeStatus.OPTIMIZE_STRONG
-                         if cft.get('tvec') == FreezeStatus.FREEZE: cft['tvec'] = FreezeStatus.OPTIMIZE_STRONG
-                 
-                 # 3. Re-pack with expanded parameter set
-                 x0, bounds, names = self._pack_parameters()
-                 print(f"    [PR5] Expanded Param Set: {len(x0)} params")
-             
-             res = least_squares(
-                 residuals_wrapper_pr5,
-                 x0,
-                 bounds=bounds,
-                 loss='linear',
-                 ftol=tol,
-                 xtol=tol,
-                 gtol=tol,
-                 verbose=0,
-                 max_nfev=50 if not tight else 20
-             )
-             x0 = res.x
-             
-             # Log Optimize Params (SUBSET)
-             if cfg.verbosity >= 1:
-                 # J_data = S_ray + lambda_len * S_len
-                 J_data = self._last_s_ray + lambda_len_eff * self._last_s_len
-                 print(f"    [SUBSET] Res: J_data={J_data:.4f}, nfev={res.nfev}, msg={res.message}")
-
-             # -------------------------------------------------------------------------
-             # 4. FULL AUDIT (Full Dataset)
-             # -------------------------------------------------------------------------
-             # Sync params to C++ for full audit
-             planes_scalars, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x0)
-             planes_up = self._apply_params_to_cpp(planes_scalars, thick_map, f_map, rvec_map, tvec_map)
-             
-             # PERSIST optimized planes to self.window_planes so they are returned correctly
-             self.window_planes = planes_up
-             
-             # [CRITICAL FIX] PERSIST optimized camera params to self.cam_params
-             # _apply_params_to_cpp updates C++ but NOT the python dicts we return/save!
-             for cid in self.active_cam_ids:
-                 # Update f
-                 if cid in f_map:
-                     self.cam_params[cid][6] = f_map[cid]
-                 # Update rvec
-                 if cid in rvec_map:
-                     self.cam_params[cid][0:3] = rvec_map[cid]
-                 # Update tvec
-                 if cid in tvec_map:
-                     self.cam_params[cid][3:6] = tvec_map[cid]
-             
-             Rs = self.dataset.get('est_radius_small_mm', 0.0) # Correct key from code context?
-             # Wait, prev code used self.dataset.get('est_radius_small_mm', 0.0) in _compute_side_violation
-             Rl = self.dataset.get('est_radius_large_mm', 0.0)
-             
-             # Call module-level full audit
-             min_sX_full, viols_full, worst_full, frame_details, min_dist_full = evaluate_plane_side_constraints(
-                self.dataset, planes_up, self.cam_params, self.cams_cpp,
-                self.cam_to_window, Rs, Rl, cfg.margin_side_mm
-             )
-             
-             # Log Full Audit
-             if cfg.verbosity >= 1:
-                 print(f"  [PR5][FULL_AUDIT] min_sX(raw)={min_dist_full:.5f}mm, min_g={min_sX_full:.4f}mm, violations={len(viols_full)}")
-                 if worst_full:
-                     print(f"    Top: {worst_full['gap']:.4f}mm gap at F{worst_full['frame']} W{worst_full['window']} {worst_full['endpoint']}")
-                     
-             # -------------------------------------------------------------------------
-             # 5. PREPARE NEXT ROUND (Injection)
-             # -------------------------------------------------------------------------
-             # Analyze audit for injection
-             worst_sorted, near_sorted = analyze_worst_frames(frame_details)
-             
-             # Strategy: Inject violating frames first, then near-boundary
-             # K_cap is handled in build_pr5_frame_subset, but we define the candidate list here.
-             # We construct 'injected_frames' list for next round
-             
-             candidates = []
-             # 1. Violations (Worst first)
-             for item in worst_sorted:
-                 candidates.append(item['frame'])
-                 
-             # 2. Near Boundary (Worst first - closest to violation)
-             for item in near_sorted:
-                 if item['frame'] not in candidates:
-                     candidates.append(item['frame'])
-                     
-             # Pass ALL candidates to build_pr5_frame_subset?
-             # No, build_pr5_frame_subset takes 'injected_frames_prev' and truncates to K_cap.
-             # So we just pass the sorted candidate list.
-             injected_frames = candidates
-             
-             # Progress callback
-             if self.progress_callback is not None:
+        # Full Dataset Cache
+        self._build_obs_cache(None) # None = All frames
+        
+        # --- ROUND 1: Optimization ---
+        print(f"\n[PR5] Optimization (Full Dataset, lambda={lambda_fixed}, Gate=ON)")
+        
+        # Residual wrapper
+        self._res_call_count_pr5 = 0
+        def residuals_wrapper_pr5(x):
+             # Fixed weighting
+             res = self._residuals_pr5(x, lambda_fixed) # Pass fixed lambda
+             self._res_call_count_pr5 += 1
+             if self.progress_callback and self._res_call_count_pr5 % 30 == 0:
                  try:
-                     # Report actual component RMSEs
-                     ray_rmse = np.sqrt(self._last_s_ray / max(self._last_n_ray, 1))
-                     len_rmse = np.sqrt(self._last_s_len / max(self._last_n_len, 1)) if self._last_n_len > 0 else 0.0
-                     self.progress_callback(stage_name, ray_rmse, len_rmse, res.cost)
-                     self._last_ray_rmse = ray_rmse
-                     self._last_len_rmse = len_rmse
-                 except Exception:
-                     pass  # Silently ignore callback errors
+                     c_approx = 0.5 * np.sum(res**2)
+                     # Report actual tracked RMSEs (Full)
+                     r_rmse = np.sqrt(self._last_s_ray / max(self._last_n_ray, 1))
+                     l_rmse = np.sqrt(self._last_s_len / max(self._last_n_len, 1)) if self._last_n_len > 0 else 0.0
+                     
+                     
+                     # [RESTORED] Log Barrier Stats
+                     # [USER REQUEST] Print to terminal, NOT UI
+                     if hasattr(self, '_last_barrier_stats') and self._last_barrier_stats:
+                         s = self._last_barrier_stats
+                         print(f"  [PR5 BARRIER] min(sX)={s['min_sX']:.4f}mm vio={s['num_violations']}")
+                     
+                     if self.progress_callback:
+                        self.progress_callback(stage_name, r_rmse, l_rmse, c_approx)
+                 except:
+                     pass
+             return res
 
-             
+        res = least_squares(
+            residuals_wrapper_pr5,
+            x0,
+            bounds=bounds,
+            loss='linear',
+            ftol=1e-6,
+            xtol=1e-6,
+            gtol=1e-6,
+            verbose=0,
+            max_nfev=50
+        )
+        x0 = res.x
+        
+        if cfg.verbosity >= 1:
+            print(f"    Res: Cost={res.cost:.4f}, nfev={res.nfev}, msg={res.message}")
+
         # Commit Final State
         planes_up, thick_map, f_map, rvec_map, tvec_map = self._unpack_parameters(x0)
         
@@ -2630,10 +2466,20 @@ class RefractiveBAOptimizerPR5:
                 # Prepare update arguments
                 update_kwargs = {}
                 
-                # 1. Extrinsics
+                # 1. Extrinsics AND Intrinsics
                 if cid in self.cam_params:
                     p = self.cam_params[cid]
                     update_kwargs['extrinsics'] = {'rvec': p[0:3], 'tvec': p[3:6]}
+                    
+                    # [CRITICAL] Pass full intrinsics to ensure update_cpp_camera_state 
+                    # doesn't zero them out if C++ state is not fully initialized
+                    # p = [rvec(3), tvec(3), f, cx, cy, k1, k2]
+                    update_kwargs['intrinsics'] = {
+                        'f': p[6],
+                        'cx': p[7],
+                        'cy': p[8],
+                        'dist': [p[9], p[10], 0, 0, 0]
+                    }
                 
                 # 2. Plane Geometry
                 wid = self.cam_to_window.get(cid)
@@ -2643,6 +2489,8 @@ class RefractiveBAOptimizerPR5:
                         'pt': pl['plane_pt'].tolist(), 
                         'n': pl['plane_n'].tolist()
                     }
+                    if wid in self.window_media:
+                        update_kwargs['media_props'] = self.window_media[wid]
                 
                 if update_kwargs:
                     update_cpp_camera_state(self.cams_cpp[cid], **update_kwargs)
@@ -2668,9 +2516,7 @@ class RefractiveBAOptimizerPR5:
     def _pack_parameters(self) -> Tuple[np.ndarray, List[Tuple[float, float]], List[str]]:
         """
         Pack optimization parameters into vector x.
-        Order:
-        - For each window: [d, alpha, beta, thick]
-        - For each camera: [f, rvec(3), tvec(3)]
+        Always packs all parameters (Simplified PR5).
         """
         x = []
         bounds_lower = []
@@ -2681,80 +2527,59 @@ class RefractiveBAOptimizerPR5:
         
         # 1. Windows
         for wid in self.window_ids:
-            pl = self.window_planes[wid]
             media = self.window_media[wid]
-            ft = self.freeze_table.get(wid, {})
-            
-            # Plane (d, alpha, beta) - only if not frozen
-            if ft.get('plane') != FreezeStatus.FREEZE:
-                # d (delta)
-                x.append(0.0)
-                names.append(f"w{wid}_d")
-                d_bound = cfg.bounds_d_delta_mm
-                bounds_lower.append(-d_bound)
-                bounds_upper.append(d_bound)
-                
-                # alpha, beta
-                x.extend([0.0, 0.0])
-                names.append(f"w{wid}_a"); names.append(f"w{wid}_b")
-                ab_bound = np.radians(cfg.bounds_alpha_beta_deg)
-                bounds_lower.extend([-ab_bound, -ab_bound])
-                bounds_upper.extend([ab_bound, ab_bound])
-            
-            # Thickness - only if not frozen
-            if ft.get('thick') != FreezeStatus.FREEZE:
-                t_curr = media['thickness']
-                x.append(t_curr)
-                names.append(f"w{wid}_t")
-                # Bounds +/- 5%
-                t_min = t_curr * (1.0 - cfg.bounds_thick_pct)
-                t_max = t_curr * (1.0 + cfg.bounds_thick_pct)
-                bounds_lower.append(t_min)
-                bounds_upper.append(t_max)
 
+            # Plane (d, alpha, beta)
+            x.append(0.0)
+            names.append(f"w{wid}_d")
+            d_bound = cfg.bounds_d_delta_mm
+            bounds_lower.append(-d_bound)
+            bounds_upper.append(d_bound)
             
+            # alpha, beta
+            x.extend([0.0, 0.0])
+            names.append(f"w{wid}_a"); names.append(f"w{wid}_b")
+            ab_bound = np.radians(cfg.bounds_alpha_beta_deg)
+            bounds_lower.extend([-ab_bound, -ab_bound])
+            bounds_upper.extend([ab_bound, ab_bound])
+            
+            # Thickness
+            t_curr = media['thickness']
+            x.append(t_curr)
+            names.append(f"w{wid}_t")
+            # Bounds +/- 5%
+            t_min = t_curr * (1.0 - cfg.bounds_thick_pct)
+            t_max = t_curr * (1.0 + cfg.bounds_thick_pct)
+            bounds_lower.append(t_min)
+            bounds_upper.append(t_max)
+
         # 2. Cameras
         for cid in self.active_cam_ids:
-            # Find which window controls this camera to get freeze status
-            wid = self.cam_to_window.get(cid)
-            if wid not in self.freeze_table:
-                # Missing window in freeze table (consistency error or skipped window)
-                continue
-            cft = self.freeze_table[wid]['cameras'][cid]
-            
             # Focal (f)
-            if cft['f'] != FreezeStatus.FREEZE:
-                f_val = self.cam_params[cid][6] # Use current state, not absolute initial
-                x.append(f_val)
-                names.append(f"c{cid}_f")
-                # Bounds +/- 2% from absolute initial
-                f0 = self.initial_f[cid]
-                f_min = f0 * (1.0 - cfg.bounds_f_pct)
-                f_max = f0 * (1.0 + cfg.bounds_f_pct)
-                bounds_lower.append(f_min)
-                bounds_upper.append(f_max)
+            f_val = self.cam_params[cid][6]
+            x.append(f_val)
+            names.append(f"c{cid}_f")
+            # Bounds +/- 2% from absolute initial
+            f0 = self.initial_f[cid]
+            f_min = f0 * (1.0 - cfg.bounds_f_pct)
+            f_max = f0 * (1.0 + cfg.bounds_f_pct)
+            bounds_lower.append(f_min)
+            bounds_upper.append(f_max)
             
             # Rvec
             r_curr = self.cam_params[cid][0:3]
-            status_r = cft['rvec']
-            if status_r != FreezeStatus.FREEZE:
-                x.extend(r_curr)
-                names.extend([f"c{cid}_r0", f"c{cid}_r1", f"c{cid}_r2"])
-                # Bounds? Rvec usually unbound or large bounds.
-                # Prior will constrain it.
-                inf = np.inf
-                bounds_lower.extend([-inf, -inf, -inf])
-                bounds_upper.extend([inf, inf, inf])
+            x.extend(r_curr)
+            names.extend([f"c{cid}_r0", f"c{cid}_r1", f"c{cid}_r2"])
+            inf = np.inf
+            bounds_lower.extend([-inf, -inf, -inf])
+            bounds_upper.extend([inf, inf, inf])
             
             # Tvec
             t_curr = self.cam_params[cid][3:6]
-            status_t = cft['tvec']
-            if status_t != FreezeStatus.FREEZE:
-                x.extend(t_curr)
-                names.extend([f"c{cid}_tx", f"c{cid}_ty", f"c{cid}_tz"])
-                inf = np.inf
-                bounds_lower.extend([-inf, -inf, -inf])
-                bounds_upper.extend([inf, inf, inf])
+            x.extend(t_curr)
+            names.extend([f"c{cid}_tx", f"c{cid}_ty", f"c{cid}_tz"])
+            bounds_lower.extend([-inf, -inf, -inf])
+            bounds_upper.extend([inf, inf, inf])
             
         return np.array(x), (bounds_lower, bounds_upper), names
 
@@ -2774,46 +2599,23 @@ class RefractiveBAOptimizerPR5:
         
         # 1. Windows (must match pack order exactly)
         for wid in self.window_ids:
-            ft = self.freeze_table.get(wid, {})
+            d_delta = x[idx]; idx += 1
+            alpha = x[idx]; idx += 1
+            beta = x[idx]; idx += 1
+            planes_update[wid] = (d_delta, alpha, beta)
             
-            # Plane - only if not frozen
-            if ft.get('plane') != FreezeStatus.FREEZE:
-                d_delta = x[idx]; idx += 1
-                alpha = x[idx]; idx += 1
-                beta = x[idx]; idx += 1
-                planes_update[wid] = (d_delta, alpha, beta)
-            else:
-                # Use identity (no change)
-                planes_update[wid] = (0.0, 0.0, 0.0)
-            
-            # Thickness - only if not frozen
-            if ft.get('thick') != FreezeStatus.FREEZE:
-                thick_new[wid] = x[idx]; idx += 1
-            else:
-                thick_new[wid] = self.window_media[wid]['thickness']
+            thick_new[wid] = x[idx]; idx += 1
             
         # 2. Cameras
         for cid in self.active_cam_ids:
-            wid = self.cam_to_window.get(cid)
-            cft = self.freeze_table[wid]['cameras'][cid]
-            
             # F
-            if cft['f'] != FreezeStatus.FREEZE:
-                f_new[cid] = x[idx]; idx += 1
-            else:
-                f_new[cid] = self.cam_params[cid][6] # Stay at current
+            f_new[cid] = x[idx]; idx += 1
                 
             # Rvec
-            if cft['rvec'] != FreezeStatus.FREEZE:
-                rvec_new[cid] = x[idx:idx+3]; idx += 3
-            else:
-                rvec_new[cid] = self.cam_params[cid][0:3]
+            rvec_new[cid] = x[idx:idx+3]; idx += 3
                 
             # Tvec
-            if cft['tvec'] != FreezeStatus.FREEZE:
-                tvec_new[cid] = x[idx:idx+3]; idx += 3
-            else:
-                tvec_new[cid] = self.cam_params[cid][3:6]
+            tvec_new[cid] = x[idx:idx+3]; idx += 3
         
         return planes_update, thick_new, f_new, rvec_new, tvec_new
 
@@ -2862,17 +2664,41 @@ class RefractiveBAOptimizerPR5:
                 if cid not in self.cams_cpp: continue
                 cam = self.cams_cpp[cid]
                 
-                # Prepare Args
+                # Prepare Args (Explicit Intrinsics to prevent zeroing if C++ state is bad)
                 rv = rvec_map[cid]
                 tv = tvec_map[cid]
                 f = f_map[cid]
                 
+                # Fetch stable intrinsics from params
+                # Note: 'dist' might be in cam_params or initial_cam_params?
+                # cam_params: [rvec(3), tvec(3), f, cx, cy, k1, k2]
+                cp = self.cam_params[cid]
+                intrinsics_full = {
+                    'f': f,
+                    'cx': cp[7],
+                    'cy': cp[8],
+                    'dist': [cp[9], cp[10], 0, 0, 0]
+                }
+                
                 update_cpp_camera_state(cam,
                                         extrinsics={'rvec': rv, 'tvec': tv},
-                                        intrinsics={'f': f}, # cx, cy preserved
-                                        plane_geom={'pt': pt_new.tolist(), 'n': n_new.tolist()},
-                                        media_props={'thickness': t_val}
-                                       )
+                                        intrinsics=intrinsics_full,
+                                        plane_geom={
+                                            'pt': pt_new.tolist(),
+                                            'n': n_new.tolist()
+                                        },
+                                        media_props={
+                                           'thickness': t_val,
+                                           # n1/n2/n3 assumed static in window_media (not optimized)
+                                           # We can re-fetch them from self.window_media if needed,
+                                           # but update_cpp_camera_state defaults are 'None' -> preserve.
+                                           # BUT if we initialized from memory, maybe we should pass them?
+                                           # Let's trust they are preserved or handled by update logic.
+                                           # Re-passing them is safer against corruption.
+                                            'n_air': self.window_media[wid].get('n_air', 1.0),
+                                            'n_window': self.window_media[wid].get('n_window', 1.49),
+                                            'n_object': self.window_media[wid].get('n_object', 1.33)
+                                        })
                     
         return updated_planes
 
@@ -2887,307 +2713,348 @@ class RefractiveBAOptimizerPR5:
         # Apply to C++ and get updated plane geometry
         planes_up = self._apply_params_to_cpp(planes_scalars, thick_map, f_map, rvec_map, tvec_map)
         
-        res_ray = []
-        res_len = []
+        # 1. Pre-calculate total possible counts for FIXED size
+        total_ray_slots = 0
+        total_len_slots = len(self.obs_cache)
+        total_barrier_slots = 0
+        
+        for fid in self.obs_cache:
+            # Ray slots: count observations in cache
+            cids = sorted(self.obs_cache[fid].keys())
+            for cid in cids:
+                uvA, uvB = self.obs_cache[fid][cid]
+                if uvA is not None: total_ray_slots += 1
+                if uvB is not None: total_ray_slots += 1
+            
+            # Barrier slots: each point (A and B) can collide with its window's planes
+            for endpoint in ['A', 'B']:
+                wids = set()
+                for cid in cids:
+                    uvA, uvB = self.obs_cache[fid][cid]
+                    uv = uvA if endpoint == 'A' else uvB
+                    if uv is not None:
+                        wid = self.cam_to_window.get(cid)
+                        if wid is not None and wid != -1:
+                            wids.add(wid)
+                total_barrier_slots += 2 * len(wids) # Step + Gradient
+
+        # Camera-side Barrier slots: Each active camera can have one
+        total_barrier_slots += 2 * len(self.active_cam_ids)
+
+        # Pre-allocate
+        res_ray_fixed = np.zeros(total_ray_slots)
+        res_len_fixed = np.zeros(total_len_slots)
+        res_barrier_fixed = np.zeros(total_barrier_slots)
         priors = []
 
+        PENALTY_RAY = 100.0
+        PENALTY_LEN = self.wand_length
+        
+        idx_ray = 0
+        idx_len = 0
+        idx_barrier = 0
+        
+        S_ray = 0.0
+        S_len = 0.0
+        N_ray_actual = 0
+        N_len_actual = 0
+        num_triangulated_points = 0
+        
         cfg = self.config
+        radius_A = self.dataset.get('est_radius_small_mm', 0.0)
+        radius_B = self.dataset.get('est_radius_large_mm', 0.0)
         
         # Track side violations for logging
         all_sX = []
+        all_sC = []
         
         # 1. Observations (Ray + Wand)
         for fid in self.obs_cache:
-
-            rays_A = []
-            rays_B = []
+            cids = sorted(self.obs_cache[fid].keys())
             
-            # Build rays
-            for cid, (uvA, uvB) in self.obs_cache[fid].items():
-                cam = self.cams_cpp[cid]
-                wid = self.cam_to_window.get(cid)
-                
+            # --- Endpoint A ---
+            rays_A_all = []
+            cids_with_A = []
+            for cid in cids:
+                uvA, _ = self.obs_cache[fid][cid]
                 if uvA is not None:
-                     rA = build_pinplate_ray_cpp(cam, uvA, cam_id=cid, window_id=wid, frame_id=fid, endpoint="A")
-                     if rA.valid: rays_A.append(rA)
-                if uvB is not None:
-                     rB = build_pinplate_ray_cpp(cam, uvB, cam_id=cid, window_id=wid, frame_id=fid, endpoint="B")
-                     if rB.valid: rays_B.append(rB)
-            
-            # Triangulate
-            XA, _, vA, _ = triangulate_point(rays_A)
-            XB, _, vB, _ = triangulate_point(rays_B)
-            
-            # Ray Residuals (VECTORIZED for performance)
-            if vA and len(rays_A) > 0:
-                # Stack ray data into numpy arrays
-                O_A = np.vstack([r.o for r in rays_A])  # (N, 3)
-                D_A = np.vstack([r.d for r in rays_A])  # (N, 3)
-                # Vectorized half-line distance
-                dists_A = point_to_ray_dist_vec(XA, O_A, D_A)
-                res_ray.extend(dists_A.tolist())
-            
-            if vB and len(rays_B) > 0:
-                O_B = np.vstack([r.o for r in rays_B])
-                D_B = np.vstack([r.d for r in rays_B])
-                dists_B = point_to_ray_dist_vec(XB, O_B, D_B)
-                res_ray.extend(dists_B.tolist())
+                    cids_with_A.append(cid)
+                    cam = self.cams_cpp[cid]
+                    wid = self.cam_to_window.get(cid, -1)
+                    rA = build_pinplate_ray_cpp(cam, uvA, cam_id=cid, window_id=wid, frame_id=fid, endpoint="A")
+                    rays_A_all.append(rA)
 
+            validA = False
+            XA = None
+            rays_A_valid = [r for r in rays_A_all if r.valid]
+            if len(rays_A_valid) >= 2:
+                XA, _, validA, _ = triangulate_point(rays_A_valid)
             
-            # Wand Length
-            if vA and vB:
+            wids_A_expected = sorted([w for w in set(self.cam_to_window.get(cid) for cid in cids_with_A) if w is not None and w != -1])
+            
+            if validA:
+                num_triangulated_points += 1
+                for r in rays_A_all:
+                    if r.valid:
+                        d = point_to_ray_dist(XA, r.o, r.d)
+                        res_ray_fixed[idx_ray] = d / self.sigma_ray_global
+                        S_ray += d**2
+                        N_ray_actual += 1
+                    else:
+                        res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+                # Barrier residuals
+                for wid in wids_A_expected:
+                    if wid in planes_up:
+                        pl = planes_up[wid]
+                        sX = np.dot(pl['plane_n'], XA - pl['plane_pt'])
+                        all_sX.append((sX, fid, wid, 'A', idx_barrier)) # index for reference if needed
+                        # Penalty logic follows below in aggregate section
+                    idx_barrier += 2
+            else:
+                for _ in range(len(rays_A_all)):
+                    res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+                idx_barrier += 2 * len(wids_A_expected)
+            
+            # --- Endpoint B ---
+            rays_B_all = []
+            cids_with_B = []
+            for cid in cids:
+                _, uvB = self.obs_cache[fid][cid]
+                if uvB is not None:
+                    cids_with_B.append(cid)
+                    cam = self.cams_cpp[cid]
+                    wid = self.cam_to_window.get(cid, -1)
+                    rB = build_pinplate_ray_cpp(cam, uvB, cam_id=cid, window_id=wid, frame_id=fid, endpoint="B")
+                    rays_B_all.append(rB)
+
+            validB = False
+            XB = None
+            rays_B_valid = [r for r in rays_B_all if r.valid]
+            if len(rays_B_valid) >= 2:
+                XB, _, validB, _ = triangulate_point(rays_B_valid)
+            
+            wids_B_expected = sorted([w for w in set(self.cam_to_window.get(cid) for cid in cids_with_B) if w is not None and w != -1])
+
+            if validB:
+                num_triangulated_points += 1
+                for r in rays_B_all:
+                    if r.valid:
+                        d = point_to_ray_dist(XB, r.o, r.d)
+                        res_ray_fixed[idx_ray] = d / self.sigma_ray_global
+                        S_ray += d**2
+                        N_ray_actual += 1
+                    else:
+                        res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+                # Barrier
+                for wid in wids_B_expected:
+                    if wid in planes_up:
+                        pl = planes_up[wid]
+                        sX = np.dot(pl['plane_n'], XB - pl['plane_pt'])
+                        all_sX.append((sX, fid, wid, 'B', idx_barrier))
+                    idx_barrier += 2
+            else:
+                for _ in range(len(rays_B_all)):
+                    res_ray_fixed[idx_ray] = PENALTY_RAY / self.sigma_ray_global
+                    idx_ray += 1
+                idx_barrier += 2 * len(wids_B_expected)
+            
+            # --- Wand Length ---
+            if validA and validB:
                 L = np.linalg.norm(XA - XB)
                 err = L - self.wand_length
-                res_len.append(err)
-            
-            # Side Gate: Collect signed distances with source info for debug
-            # sX > margin_side_mm is OK, sX < margin_side_mm is violation
-            # Store (sX, fid, wid, endpoint) tuples for worst-point identification
-            
-            # Get unique window IDs from rays used in triangulation
-            wids_A = set(r.window_id for r in rays_A if r.window_id is not None)
-            wids_B = set(r.window_id for r in rays_B if r.window_id is not None)
-
-            
-            # XA signed distances (Differentiable)
-            if vA:
-                for wid in wids_A:
-                    if wid not in planes_up: continue
-                    pl = planes_up[wid]
-                    P_plane = pl['plane_pt']
-                    n = pl['plane_n']
-                    sX = np.dot(n, XA - P_plane)
-                    all_sX.append((sX, fid, wid, 'A'))
-            
-            # XB signed distances (Differentiable)
-            if vB:
-                for wid in wids_B:
-                    if wid not in planes_up: continue
-                    pl = planes_up[wid]
-                    P_plane = pl['plane_pt']
-                    n = pl['plane_n']
-                    sX = np.dot(n, XB - P_plane)
-                    all_sX.append((sX, fid, wid, 'B'))
+                res_len_fixed[idx_len] = err / self.sigma_wand
+                S_len += err**2
+                N_len_actual += 1
+            else:
+                res_len_fixed[idx_len] = PENALTY_LEN / self.sigma_wand
+            idx_len += 1
         
-        # Camera-side: Collect signed distances with source info
-        # Camera should be on camera-side: s < 0 (i.e. s + margin < 0 is OK)
-        all_sC = []  # (sC, cid, wid)
-        for cid in self.active_cam_ids:
+        # Camera-side: Collect signed distances
+        for cid in sorted(self.active_cam_ids):
             wid = self.cam_to_window.get(cid)
-            if wid not in planes_up: continue
+            if wid not in planes_up: 
+                idx_barrier += 2 # Maintain slot
+                continue
             
-            # Reconstruct C from C++ object (already updated by _apply_params_to_cpp)
+            # Reconstruct C from C++ object
             cam = self.cams_cpp[cid]
             pp = cam._pinplate_param
-            
-            # Extract R, t
-            R_lpt = pp.r_mtx
-            t_lpt = pp.t_vec
-            
-            # Manual conversion to numpy (fast enough for small N_cam)
             R_np = np.zeros((3, 3))
             for i in range(3):
                 for j in range(3):
-                    R_np[i, j] = R_lpt[i, j]
-            t_np = np.array([t_lpt[0], t_lpt[1], t_lpt[2]])
-            
+                    R_np[i, j] = pp.r_mtx[i, j]
+            t_np = np.array([pp.t_vec[0], pp.t_vec[1], pp.t_vec[2]])
             C = -R_np.T @ t_np
             
             pl = planes_up[wid]
-            P_plane = pl['plane_pt']
-            n = pl['plane_n']
-            
-            sC = np.dot(n, C - P_plane)
-            all_sC.append((sC, cid, wid))
-        
-        # Debug Output for Convergence Check (Sampled)
-        if self._res_call_count_pr5 % 20 == 0 and cfg.verbosity >= 1:
-            # Check min sX to ensure it is moving
-            sX_vals = [val[0] for val in all_sX]
-            min_sx = min(sX_vals) if sX_vals else 0.0
-            print(f"      [Step {self._res_call_count_pr5}] min(sX)={min_sx:.5f} mm")
-        
-        # 2. Priors
+            sC = np.dot(pl['plane_n'], C - pl['plane_pt'])
+            all_sC.append((sC, cid, wid, idx_barrier))
+            idx_barrier += 2
 
-
+        # 2. Priors (STABLE ORDER)
+        priors = []
         # Plane update priors
-        # Plane update priors
-        for wid, (d_delta, alpha, beta) in planes_scalars.items():
-            info = self.observability[wid]
+        for wid in self.window_ids:
+            d_delta, alpha, beta = planes_scalars[wid]
+            priors.append(alpha / cfg.sigma_plane_ang)
+            priors.append(beta / cfg.sigma_plane_ang)
+            priors.append(d_delta / cfg.sigma_d)
             
-            # Angle Sigma
-            if info.n_cam == 1: sigma_ang = cfg.sigma_plane_ang_single
-            elif info.angle_diversity_p50 < 15: sigma_ang = cfg.sigma_plane_ang_weak
-            elif info.angle_diversity_p50 < 25: sigma_ang = cfg.sigma_plane_ang_mid
-            else: sigma_ang = cfg.sigma_plane_ang_strong
-            
-            # D Sigma
-            if info.n_cam == 1: sigma_d = cfg.sigma_d_single
-            elif info.angle_diversity_p50 < 25: sigma_d = cfg.sigma_d_weak
-            else: sigma_d = cfg.sigma_d_strong
-            
-            priors.append(alpha / sigma_ang)
-            priors.append(beta / sigma_ang)
-            priors.append(d_delta / sigma_d)
-            
-            # Thickness Prior (Strong: bounds +/- 5%, sigma ~2%)
-            # t_init = self.initial_media[wid]['thickness'] # Base value from UI?
-            # Yes, "strong prior to UI-given thickness"
-            t_ui = self.window_media[wid]['thickness'] # Careful, this might have been updated by Packing?
-            # Actually self.window_media is state at start of PR5.
-            # Ideally use 'initial_media' which is copy at start.
+            # Thickness Prior
             t_ui = self.initial_media[wid]['thickness']
             t_curr = thick_map[wid]
-            sigma_t = (cfg.bounds_thick_pct * t_ui) / 3.0
+            sigma_t = (cfg.bounds_thick_pct * t_ui) / 3.0 if t_ui > 0 else 1.0
             priors.append((t_curr - t_ui) / sigma_t)
             
         # Camera Priors
         for cid in self.active_cam_ids:
-            wid = self.cam_to_window.get(cid)
-            info = self.observability[wid]
-            
             # F Prior
             f_curr = f_map[cid]
             f_init = self.initial_f[cid]
-            sigma_f = (cfg.bounds_f_pct * f_init) / 3.0
+            sigma_f = (cfg.bounds_f_pct * f_init) / 3.0 if f_init > 0 else 1.0
             priors.append((f_curr - f_init) / sigma_f)
             
-            # Rvec Prior
-            if cid in rvec_map:
-                r_curr = rvec_map[cid]
-                r_init = self.initial_cam_params[cid][0:3]
-                
-                # Sigma Select
-                if info.angle_diversity_p50 < 15: sigma_r = cfg.sigma_rvec_very_weak
-                elif info.angle_diversity_p50 < 25: sigma_r = cfg.sigma_rvec_weak
-                else: sigma_r = cfg.sigma_rvec_normal
-                
-                diff = r_curr - r_init
-                priors.extend(diff / sigma_r)
+            # Rvec/Tvec Priors
+            r_curr = rvec_map[cid]
+            r_init = self.initial_cam_params[cid][0:3]
+            priors.extend((r_curr - r_init) / cfg.sigma_rvec)
             
-            # Tvec Prior
-            if cid in tvec_map:
-                t_curr = tvec_map[cid]
-                t_init = self.initial_cam_params[cid][3:6]
-                
-                if info.n_cam == 2 and info.angle_diversity_p50 < 25:
-                    sigma_t = cfg.sigma_tvec_weak
-                else:
-                    sigma_t = cfg.sigma_tvec_normal
-                
-                diff = t_curr - t_init
-                priors.extend(diff / sigma_t)
-                
-        # Aggregate
-        # Manual Huber Weighting for Ray/Len residuals
-        # Priors remain pure quadratic (no robust loss)
-        # Huber: if |u| <= 1: w = 1; else w = 1/|u|
-        # Return sqrt(w) * u so that LM/TRF does weighted least squares
-        
+            t_curr = tvec_map[cid]
+            t_init = self.initial_cam_params[cid][3:6]
+            priors.extend((t_curr - t_init) / cfg.sigma_tvec)
+
+        # 3. Huber & Aggregate
         def apply_huber(r_array, delta):
-            """Apply huber weighting: u = r/delta, return sqrt(w)*u."""
-            if len(r_array) == 0:
-                return np.array([])
-            r = np.asarray(r_array)
-            u = r / delta  # Normalized residual
+            if len(r_array) == 0: return r_array
+            u = r_array / delta
             abs_u = np.abs(u)
-            w = np.where(abs_u <= 1.0, 1.0, 1.0 / abs_u)  # Huber weight
-            # Return physical units (sqrt(w) * r) to match PR4 cost magnitude
-            # Inliers: w=1 -> returns r (squared: r^2)
-            # Outliers: w=delta/|r| -> returns sqrt(delta*|r|)*sgn(r) (squared: delta*|r|)
-            return np.sqrt(w) * r
+            w = np.where(abs_u <= 1.0, 1.0, 1.0 / abs_u)
+            return np.sqrt(w) * r_array
+
+        # 4. Barrier Penalties & Stats
+        # Process Camera-side (sC)
+        all_sC_vals = []
+        for (sC, cid, wid, idx) in all_sC:
+            all_sC_vals.append(sC)
+            # Expect sC < 0. Violation if sC >= -margin
+            gap = (cfg.margin_side_mm) - (-sC) # sC should be negative. gap > 0 if sC > -margin
+            # Simplified: Violation if sC > -margin
+            # Let's say sC must be < -10mm. if sC = -5, gap = 5.
+            
+            # Use PR5 logic: sC < 0 is strict.
+            # Barrier at 0.
+            val = sC
+            if val > -cfg.margin_side_mm:
+                # Violation
+                # Linear penalty
+                res_barrier_fixed[idx] = (val + cfg.margin_side_mm) * 10.0 # Weight?
+            
+        # Process Point-side (sX)
+        all_sX_vals = []
+        violations_count = 0
         
-        arr_ray = apply_huber(res_ray, cfg.delta_ray) * np.sqrt(cfg.lambda_ray)
-        arr_len = apply_huber(res_len, cfg.delta_len) * np.sqrt(lambda_len)
-        arr_pri = np.array(priors)  # Priors: pure quadratic, no huber
+        for (sX, fid, wid, endpoint, idx) in all_sX:
+            all_sX_vals.append(sX)
+            # Expect sX > 0.
+            # Barrier at 0.
+            val = sX
+            if val < cfg.margin_side_mm:
+                violations_count += 1
+                gap = cfg.margin_side_mm - val
+                res_barrier_fixed[idx] = gap * 10.0
+                
+        # Store stats for logging
+        min_sX = np.min(all_sX_vals) if all_sX_vals else 0.0
+        min_sC = np.min(all_sC_vals) if all_sC_vals else 0.0 # sC is negative usually
+        max_sC = np.max(all_sC_vals) if all_sC_vals else 0.0 # crucial one
         
-        # Store components for display (Unweighted physical residuals)
-        self._last_s_ray = np.sum(np.array(res_ray)**2)
-        self._last_n_ray = len(res_ray)
-        self._last_s_len = np.sum(np.array(res_len)**2)
-        self._last_n_len = len(res_len)
+        self._last_barrier_stats = {
+            'min_sX': min_sX,
+            'max_sC': max_sC,
+            'num_violations': violations_count
+        }
+
+        # 5. Store Stats for wrapper
+        self._last_s_ray = S_ray
+        self._last_s_len = S_len
+        self._last_n_ray = N_ray_actual
+        self._last_n_len = N_len_actual
         
-        # === SIDE GATE: Hysteresis-Based Feasibility Constraint ===
-        # Uses round-level gate state (computed once at round start, constant here)
-        # Gate enabled: strong enforcement (r_gate = sqrt(2*C_gate), r_dir = sqrt(2*beta)*v)
-        # Gate disabled: weak floor only (r_gate = 0, r_dir = sqrt(2*beta_soft)*v)
+        # Concatenate all
+        # Huber on Ray/Len (Removed per user request -> Linear Loss)
+        # res_ray_huber = apply_huber(res_ray_fixed, 2.0)
+        # res_len_huber = apply_huber(res_len_fixed, 2.0)
         
+        return np.concatenate([
+            res_ray_fixed, 
+            res_len_fixed,
+            res_barrier_fixed, 
+            np.array(priors)
+        ])
+        arr_pri = np.array(priors)
         
-        cfg = self.config
-        
-        # Use round-level gate state (set at round start, unchanged during round)
+        # 4. Barriers Logic
         gate_enabled = getattr(self, '_round_gate_enabled', False)
         J_ref = getattr(self, '_j_ref_for_round', 1.0)
-        
-        # Per-violation residuals (Fixed Order, Fixed Length)
-        # We must generate residuals for ALL points/cameras to maintain vector size for least_squares
-        res_side = []
-        
-        # Pre-compute constants
         C_gate = cfg.alpha_side_gate * J_ref
         r_fix_const = np.sqrt(2.0 * C_gate)
         r_grad_const = np.sqrt(2.0 * cfg.beta_side_dir)
         r_soft_const = np.sqrt(2.0 * cfg.beta_side_soft)
         tau = 0.01
-        
-        radius_A = self.dataset.get('est_radius_small_mm', 0.0)
-        radius_B = self.dataset.get('est_radius_large_mm', 0.0)
 
-        # 1. Points
-        for (sX, _, _, endpoint) in all_sX:
+        # Point Side Barriers
+        for (sX, fid, wid, endpoint, b_idx) in all_sX:
             r_val = radius_A if endpoint == 'A' else radius_B
             gap = (cfg.margin_side_mm + r_val) - sX
             if gap > 0:
                 if gate_enabled:
-                    # Gate ON: Smooth Step + Gradient
-                    term_step = r_fix_const * (1.0 - np.exp(-gap / tau))
-                    res_side.append(term_step)
-                    res_side.append(r_grad_const * gap)
+                    res_barrier_fixed[b_idx] = r_fix_const * (1.0 - np.exp(-gap / tau))
+                    res_barrier_fixed[b_idx+1] = r_grad_const * gap
                 else:
-                    # Gate OFF: Weak Floor
-                    res_side.append(r_soft_const * gap)
+                    res_barrier_fixed[b_idx] = r_soft_const * gap
+                    res_barrier_fixed[b_idx+1] = 0.0
             else:
-                # Feasible
-                if gate_enabled:
-                    res_side.append(0.0)
-                    res_side.append(0.0)
-                else:
-                    res_side.append(0.0)
+                res_barrier_fixed[b_idx] = 0.0
+                res_barrier_fixed[b_idx+1] = 0.0
 
-        # 2. Cameras
-        for (sC, _, _) in all_sC:
+        # Camera Side Barriers
+        for (sC, cid, wid, b_idx) in all_sC:
             gap = sC + cfg.margin_side_mm
             if gap > 0:
                 if gate_enabled:
-                    term_step = r_fix_const * (1.0 - np.exp(-gap / tau))
-                    res_side.append(term_step)
-                    res_side.append(r_grad_const * gap)
+                    res_barrier_fixed[b_idx] = r_fix_const * (1.0 - np.exp(-gap / tau))
+                    res_barrier_fixed[b_idx+1] = r_grad_const * gap
                 else:
-                    res_side.append(r_soft_const * gap)
+                    res_barrier_fixed[b_idx] = r_soft_const * gap
+                    res_barrier_fixed[b_idx+1] = 0.0
             else:
-                if gate_enabled:
-                    res_side.append(0.0)
-                    res_side.append(0.0)
-                else:
-                    res_side.append(0.0)
-                    
-        arr_side = np.array(res_side)
+                res_barrier_fixed[b_idx] = 0.0
+                res_barrier_fixed[b_idx+1] = 0.0
+
+        # Logging
+        self._last_s_ray = S_ray
+        self._last_n_ray = N_ray_actual
+        self._last_s_len = S_len
+        self._last_n_len = N_len_actual
+        self._res_call_count_pr5 += 1
         
-        # Debug: Check parameter movement (first few calls)
-        if self._res_call_count_pr5 < 5 and cfg.verbosity >= 2:
-            planes_up, _, _, _, _ = self._unpack_parameters(x)
-            # Just print one plane centroid to see if it moves
-            if 1 in planes_up:
-                p1 = planes_up[1]['plane_pt']
-                print(f"      [Step {self._res_call_count_pr5}] Plane1 Pt: {p1[0]:.4f}, {p1[1]:.4f}, {p1[2]:.4f}")
-        
-        arr_side = np.array(res_side)
-        
+        if self._res_call_count_pr5 % 20 == 0 and cfg.verbosity >= 1:
+            sX_vals = [val[0] for val in all_sX]
+            min_sx = min(sX_vals) if sX_vals else 0.0
+            print(f"      [Step {self._res_call_count_pr5}] min(sX)={min_sx:.5f} mm")
+
         # Store current J_data
         J_data_current = self._last_s_ray + lambda_len * self._last_s_len
         self._last_j_data = J_data_current
 
-        return np.concatenate([arr_ray, arr_len, arr_pri, arr_side])
+        # Update RMSE for diagnostics
+        self._last_ray_rmse = np.sqrt(S_ray / max(1, N_ray_actual))
+        self._last_len_rmse = np.sqrt(S_len / max(1, N_len_actual)) if N_len_actual > 0 else 0.0
+
+        return np.concatenate([arr_ray, arr_len, arr_pri, res_barrier_fixed])
 
     def save_cache(self, out_path: str, points_3d: list = None):
         """Save PR5 results to cache (with Feasibility Audit)."""

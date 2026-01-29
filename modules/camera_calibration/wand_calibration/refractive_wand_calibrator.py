@@ -15,7 +15,7 @@ except ImportError:
 from .refractive_geometry import (
     build_pinplate_ray_cpp, closest_distance_rays, triangulate_point, 
     point_to_ray_dist, update_normal_tangent, camera_center,
-    align_world_y_to_plane_intersection
+    align_world_y_to_plane_intersection, update_cpp_camera_state
 )
 
 from .refractive_bootstrap import PinholeBootstrapP0, PinholeBootstrapP0Config, select_best_pair_via_precalib
@@ -1157,33 +1157,6 @@ class RefractiveWandCalibrator:
             
         return out_dir
 
-    def _update_camera_cpp_via_assign(self, cam_obj, plane_pt, plane_n, n_air, n_glass, n_medium, thickness):
-        """
-        Force update a C++ Camera object by explicitly daisy-chaining assignments.
-        This handles pybind11's value-copy behavior for nested structs.
-        """
-        # 1. Get Main Param Copy
-        pp = cam_obj._pinplate_param
-        
-        # 2. Get Plane Copy (Nested Struct)
-        pl = pp.plane
-        
-        # 3. Modify Plane Copy
-        # Use lpt.Pt3D constructors as required by pybind11
-        pl.pt = lpt.Pt3D(plane_pt[0], plane_pt[1], plane_pt[2])
-        pl.norm_vector = lpt.Pt3D(plane_n[0], plane_n[1], plane_n[2])
-        
-        # 4. Assign Plane and Media Back to Param
-        pp.plane = pl
-        pp.refract_array = [n_air, n_glass, n_medium]
-        pp.w_array = [thickness]
-        pp.n_plate = 1
-        
-        # 5. Assign Param Back to Camera
-        cam_obj._pinplate_param = pp
-        
-        # 6. Trigger internal update
-        cam_obj.updatePt3dClosest()
 
     def optimize_planes(self, dataset, cam_to_window, window_media, window_planes, cam_params, cams_cpp, active_cam_ids, verbosity: int = 0, progress_callback=None):
         """
@@ -1211,13 +1184,9 @@ class RefractiveWandCalibrator:
             window_planes=window_planes,
             wand_length=wand_len_target,
             config=OptimizationConfig(
-                lambda0_init=200.0,
-                lambda_min=10.0,
-                lambda_max=5000.0,
-                outer_rounds=3,
                 lambda_reg=10.0,
-                alpha_beta_bound=0.5,
-                max_frames=300,
+                alpha_beta_bound=0.5, # ~28.6 degrees
+                max_frames=50000,
                 verbosity=verbosity
             ),
             progress_callback=progress_callback
@@ -1294,21 +1263,16 @@ class RefractiveWandCalibrator:
             return cams_cpp
 
         print("\n[Refractive] Initializing C++ Camera objects in-memory...")
+        
         for cid in sorted(cam_params.keys()):
             # 1. Create a new default Camera instance
             cam = lpt.Camera()
-            
-            # 2. Set Model Type to PINPLATE
-            # Matches CameraType enum in Camera.h (PINHOLE=0, POLYNOMIAL=1, PINPLATE=2)
             try:
                 cam._type = lpt.PINPLATE
             except AttributeError:
-                cam._type = 2 # Fallback
+                cam._type = 2
             
-            # 3. Access the PinplateParam struct
-            pp = cam._pinplate_param
-            
-            # Unpack parameters
+            # Prepare initialization data
             p = cam_params[cid] 
             rvec, tvec = p[0:3], p[3:6]
             f, cx, cy = p[6], p[7], p[8]
@@ -1320,75 +1284,56 @@ class RefractiveWandCalibrator:
             n_air = media.get('n_air', media.get('n1', 1.0))
             n_win = media.get('n_window', media.get('n2', 1.49))
             n_obj = media.get('n_object', media.get('n3', 1.33))
-
-            # Image Size
-            image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
-            pp.n_row, pp.n_col = int(image_size[0]), int(image_size[1])
-
-            # Intrinsics (K)
-            K = lpt.MatrixDouble(3, 3, 0.0)
-            K[0, 0], K[1, 1] = float(f), float(f)
-            K[0, 2], K[1, 2] = float(cx), float(cy)
-            K[2, 2] = 1.0
-            pp.cam_mtx = K
-
-            # Distortion
-            pp.dist_coeff = [float(k1), float(k2), 0.0, 0.0, 0.0]
-            pp.is_distorted = (abs(k1) > 1e-9 or abs(k2) > 1e-9)
-            pp.n_dist_coeff = 5
-
-            # Extrinsics (Forward)
-            R, _ = cv2.Rodrigues(rvec)
-            R_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            for i in range(3):
-                for j in range(3):
-                    R_lpt[i, j] = float(R[i, j])
-            pp.r_mtx = R_lpt
-            pp.t_vec = lpt.Pt3D(float(tvec[0]), float(tvec[1]), float(tvec[2]))
-
-            # Extrinsics (Inverse)
-            R_inv = R.T
-            t_inv = -R_inv @ tvec
-            R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            for i in range(3):
-                for j in range(3):
-                    R_inv_lpt[i, j] = float(R_inv[i, j])
-            pp.r_mtx_inv = R_inv_lpt
-            pp.t_vec_inv = lpt.Pt3D(float(t_inv[0]), float(t_inv[1]), float(t_inv[2]))
-
-            # Plane Geometry
+            
             wp = window_planes[wid]
             if 'plane_pt' not in wp or 'plane_n' not in wp:
                 raise RuntimeError(f"Cam {cid} (Win {wid}): Missing initialized plane data ('plane_pt' or 'plane_n') in window_planes.")
             
-            plane_pt = np.array(wp['plane_pt'])
-            plane_norm = np.array(wp['plane_n'])
-            
-            # [CRITICAL] Coordinate Alignment: Shift to Farthest Interface for C++ engine
-            p_farthest = plane_pt + plane_norm * thick_mm
-            
-            pl = pp.plane
-            pl.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
-            pl.norm_vector = lpt.Pt3D(float(plane_norm[0]), float(plane_norm[1]), float(plane_norm[2]))
-            pp.plane = pl
-
-            # Refract Array & Thickness
-            # Convention: [n_obj, n_win, n_air] (Farthest -> Nearest)
-            pp.refract_array = [float(n_obj), float(n_win), float(n_air)]
-            pp.w_array = [float(thick_mm)]
-            pp.n_plate = 1
-            
-            # Pre-calculate Max Refract Ratio for C++ ray-tracer radius check
-            pp.refract_ratio_max = max(n_obj / n_win, n_obj / n_air, 1.0)
-
-            # Solver Config
-            pp.proj_tol = 1e-6
+            # [CRITICAL] Initialize default PinPlateParam structural fields to prevent C++ crash
+            # (update_cpp_camera_state only updates specific subsets)
+            pp = cam._pinplate_param
+            pp.proj_tol = 1e-5
             pp.proj_nmax = 100
-            pp.lr = 0.1
-
-            # Commit Struct and Refresh Internal State
+            pp.lr = 0.5
+            pp.n_row = 0  # Default, update if dataset available
+            pp.n_col = 0
+            
+            # [CRITICAL] Initialize matrices to safe sizes (prevent segfault on [0,0] access)
+            pp.cam_mtx = lpt.MatrixDouble(3, 3, 0.0)
+            pp.r_mtx = lpt.MatrixDouble(3, 3, 0.0)
+            pp.r_mtx_inv = lpt.MatrixDouble(3, 3, 0.0)
+            
             cam._pinplate_param = pp
-            cam.updatePt3dClosest()
+            
+            # Use unified update helper (Implicitly handles Closest->Farthest Shift)
+            update_cpp_camera_state(
+                cam,
+                extrinsics={'rvec': rvec, 'tvec': tvec},
+                intrinsics={'f': f, 'cx': cx, 'cy': cy, 'dist': [k1, k2, 0, 0, 0]},
+                plane_geom={'pt': wp['plane_pt'], 'n': wp['plane_n']},
+                media_props={
+                    'thickness': thick_mm,
+                    'n_air': n_air, 'n_window': n_win, 'n_object': n_obj
+                }
+            )
+            
+            # Set image size (property of PinholeParam base)
+            image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
+            pp = cam._pinplate_param
+            pp.n_row, pp.n_col = int(image_size[0]), int(image_size[1])
+            pp.proj_tol = 1e-6
+            pp.proj_nmax = 1000
+            pp.lr = 0.1
+            pp.refract_ratio_max = max(n_obj / n_win, n_obj / n_air, 1.0)
+            
+            cam._pinplate_param = pp
+            cam.updatePinPlateParam()
+            
+            # [Verify Persistence]
+            pp_check = cam._pinplate_param
+            K_check = pp_check.cam_mtx
+            if abs(K_check[0,2] - cx) > 1e-4:
+                print(f"[CRITICAL WARNING] Cam {cid} C++ Persistence Failed! CX_in={cx}, CX_out={K_check[0,2]}")
             
             cams_cpp[cid] = cam
 
@@ -1396,7 +1341,6 @@ class RefractiveWandCalibrator:
         return cams_cpp
 
     def calibrate(self, num_windows, cam_to_window, window_media, out_path, verbosity: int = 1, progress_callback=None):
-
         """
         PR1 MVP Stub: Validate, Log, Export Snapshot, and Exit (Engineering Guardrail #5).
         """
@@ -1804,11 +1748,15 @@ class RefractiveWandCalibrator:
                 except:
                     pass
             
-            optimized_planes = self.optimize_planes(
-                dataset, cam_to_window, window_media, self.window_planes, 
-                cam_params, cams_cpp, active_cam_ids, verbosity=verbosity,
-                progress_callback=progress_callback
-            )
+            # [USER REQUEST] P1 SKIPPED -> Use P0 result directly
+            print("[P1] Skipped (User Request). Using P0 initialization.")
+            optimized_planes = None 
+            
+            # optimized_planes = self.optimize_planes(
+            #     dataset, cam_to_window, window_media, self.window_planes, 
+            #     cam_params, cams_cpp, active_cam_ids, verbosity=verbosity,
+            #     progress_callback=progress_callback
+            # )
             
             # [CRITICAL] Update internal self.window_planes with optimized result
             if optimized_planes:
@@ -1824,7 +1772,12 @@ class RefractiveWandCalibrator:
                 "wand_length_bias": getattr(self, '_last_wand_bias', 0.0)
             }
             
-            # Save P1 cache
+            # Save P1 cache (Even if skipped, save current P0-state as P1 result to avoid repeated re-init attempts?)
+            # No, if skipped we might effectively not have a "P1 result". 
+            # But PR4 needs `self.window_planes` to be valid. It is from P0.
+            # Let's save it so next run loads this "skipped" state as "P1 result".
+            # CAREFUL: If we save it, next run says "Loaded plane cache successfully". 
+            # If that satisfies user, great.
             self.save_p1_cache(
                 p1_cache_path, self.window_planes, window_media, cam_to_window, 
                 dataset, cam_params, p1_diagnostics
@@ -1833,17 +1786,22 @@ class RefractiveWandCalibrator:
 
         # === Phase PR4: Bundle Adjustment (Selective BA) ===
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
+        # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
+        # rs_pr4, rl_pr4 = 1.5, 2.0 # Defaults
         if X_A_scaled and X_B_scaled:
             rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="PR4 Pre-Calc")
             dataset['est_radius_small_mm'] = rs
             dataset['est_radius_large_mm'] = rl
+            rs_pr4, rl_pr4 = rs, rl
             print(f"[PR4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
 
         # Pass verbosity to config
         pr4_config = PR4Config(
             skip_pr4=False,
             pr4_stage=3,
-            verbosity=verbosity
+            verbosity=verbosity,
+            R_small_mm=rs_pr4,
+            R_large_mm=rl_pr4
         )
         
         pr4_optimizer = RefractiveBAOptimizerPR4(
@@ -1882,9 +1840,7 @@ class RefractiveWandCalibrator:
 
         # Optimize planes, thickness, intrinsics, extrinsics with strong priors
         pr5_config = PR5Config(
-            pr5_stage=2,
-            verbosity=verbosity,
-            allow_weak_rvec=True
+            verbosity=verbosity
         )
         
         pr5_optimizer = RefractiveBAOptimizerPR5(
@@ -1896,8 +1852,7 @@ class RefractiveWandCalibrator:
             window_planes=self.window_planes,
             wand_length=wand_len_target,
             config=pr5_config,
-            progress_callback=progress_callback,
-            freeze_table=pr4_optimizer.freeze_table if pr4_optimizer else None
+            progress_callback=progress_callback
         )
 
         
@@ -2517,7 +2472,7 @@ class RefractiveWandCalibrator:
         if v_cams_cpp:
             for cam in v_cams_cpp.values():
                 pp = cam._pinplate_param
-                pp.proj_nmax = 1000
+                pp.proj_nmax = 10000
                 cam._pinplate_param = pp
 
         # === FINAL CLOSE-LOOP VERIFICATION (USER REQUEST) ===
@@ -2628,7 +2583,8 @@ class RefractiveWandCalibrator:
         self.base.per_frame_errors = {}
         
         # Statistics accumulators per camera
-        cam_error_sums = {cid: [] for cid in cams_cpp.keys()}
+        cam_error_sums = {cid: [] for cid in cams_cpp.keys()}     # For UI (Max per frame)
+        cam_all_points_errs = {cid: [] for cid in cams_cpp.keys()} # For Logging (All points) [USER REQUEST]
         total_frames = 0
         
         for fid in dataset['frames']:
@@ -2669,8 +2625,11 @@ class RefractiveWandCalibrator:
                         proj_A = (float(uv_proj_A[0]), float(uv_proj_A[1]))
                         
                         uv_obs_A = obsA[cid]
-                        err_A = np.sqrt((proj_A[0] - uv_obs_A[0])**2 + (proj_A[1] - uv_obs_A[1])**2)
-                        err_max = max(err_max, err_A)
+                        # Verify finite projection
+                        if abs(proj_A[0]) < 1e5 and abs(proj_A[1]) < 1e5:
+                            err_A = np.sqrt((proj_A[0] - uv_obs_A[0])**2 + (proj_A[1] - uv_obs_A[1])**2)
+                            err_max = max(err_max, err_A)
+                            cam_all_points_errs[cid].append(err_A) # Log A
                     
                     # [CPP_PROTOCOL] Project B point
                     if XB is not None and cid in obsB:
@@ -2679,8 +2638,11 @@ class RefractiveWandCalibrator:
                         proj_B = (float(uv_proj_B[0]), float(uv_proj_B[1]))
                         
                         uv_obs_B = obsB[cid]
-                        err_B = np.sqrt((proj_B[0] - uv_obs_B[0])**2 + (proj_B[1] - uv_obs_B[1])**2)
-                        err_max = max(err_max, err_B)
+                        # Verify finite projection
+                        if abs(proj_B[0]) < 1e5 and abs(proj_B[1]) < 1e5:
+                            err_B = np.sqrt((proj_B[0] - uv_obs_B[0])**2 + (proj_B[1] - uv_obs_B[1])**2)
+                            err_max = max(err_max, err_B)
+                            cam_all_points_errs[cid].append(err_B) # Log B
                     
                     if err_max > 0:
                         cam_errors[cid] = err_max
@@ -2701,13 +2663,14 @@ class RefractiveWandCalibrator:
                 }
                 total_frames += 1
         
-        # Log summary per camera
+        # Log summary per camera (Using All-Points stats per user request)
         print(f"[per_frame_errors] Computed errors for {total_frames} frames.")
-        for cid in sorted(cam_error_sums.keys()):
-            errs = cam_error_sums[cid]
+        for cid in sorted(cam_all_points_errs.keys()):
+            errs = cam_all_points_errs[cid]
             if errs:
                 mean_err = np.mean(errs)
+                std_err = np.std(errs)
                 max_err = np.max(errs)
-                print(f"  Cam {cid}: Mean={mean_err:.3f} px, Max={max_err:.3f} px ({len(errs)} samples)")
+                print(f"  Cam {cid}: Mean={mean_err:.3f} px, Std={std_err:.3f} px, Max={max_err:.3f} px ({len(errs)} samples)")
 
 

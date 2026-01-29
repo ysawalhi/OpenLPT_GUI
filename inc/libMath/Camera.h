@@ -58,14 +58,22 @@ struct PolyParam
 struct PinPlateParam: public PinholeParam
 { 
     Plane3D plane; // reference refractive plane (farthest plane to camera), normal vector is pointing away from the camera
-    Pt3D pt3d_closest; // closest point to the camera
-    std::vector<double> refract_array; // refractive index array (from farthest to nearest)
-    std::vector<double> w_array; // width of the refractive plate (from farthest to nearest)
+
+    // refractive index array (from farthest to nearest): (n_plate + 2) values
+    std::vector<double> refract_array;
+    // width of the refractive plate (from farthest to nearest): n_plate values
+    std::vector<double> w_array;
     int n_plate; // number of refractive plates
     double proj_tol; // projection tolerance squatre
     int proj_nmax; // maximum number of iterations for projection
     double lr; // learning rate
     double refract_ratio_max; // max(refract_array[0]/[i])
+
+    // refractive planes (from farthest to nearest): (n_plate + 1) planes
+    std::vector<Plane3D> plane_array; // update in updatePinPlateParam()
+
+    // 2D coordinate system on refractive planes
+    Pt3D u_axis, v_axis; // update in updatePinPlateParam()
 };
 
 enum CameraType
@@ -97,7 +105,8 @@ public:
     void loadParameters (std::string file_name);
 
     void updatePolyDuDv (); // for polynomial model
-    void updatePt3dClosest (); // for pinplate model
+    // void updatePt3dClosest (); // for pinplate model
+    void updatePinPlateParam(); // for pinplate model
 
     // Transfer from rotation matrix to rotation vector
     Pt3D rmtxTorvec (Matrix<double> const& r_mtx);
@@ -126,7 +135,18 @@ public:
     // output
     Pt2D worldToUndistImg (Pt3D const& pt_world, PinholeParam const& param) const;
 
-    std::tuple<bool, Pt3D, double> refractPlate (Pt3D const& pt_world) const;
+    // Refraction model
+    std::tuple<bool, Pt3D, double, int> refractPlate (Pt3D const& pt_world) const;
+    std::tuple<bool, Pt3D, double, int> refractPlateNewton(Pt3D const& pt_world) const;
+    void getPlaneCoordinateSystem(Pt3D& u_axis, Pt3D& v_axis, const Plane3D& plane) const;
+    void projectPointToPlane2D(std::vector<double>& coords, 
+                               const Pt3D& pt, const Plane3D& plane,
+                               const Pt3D& u_axis, const Pt3D& v_axis) const;
+    void reconstructFrom2D(Pt3D& result, const Pt3D& origin, const Pt3D& u_axis,
+                                   const Pt3D& v_axis, const std::vector<double>& coords) const;
+    bool forwardTrace(Pt3D& pt_exit, Pt3D& exit_direction,
+                              const Pt3D& pt_world, const Pt3D& pt_entry) const;
+    bool refractDir(Pt3D& dir_refract, const Pt3D& normal, double refract_ratio, bool is_forward) const;
 
     // Project Image in camera coordinate [mm] to pixel: 
     //  (Xu,Yu,0) -> (Xd,Yd,0) -> (Xf,Yf,0)

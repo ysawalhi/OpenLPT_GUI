@@ -58,7 +58,9 @@ void bind_Camera(py::module_& m) {
     py::class_<PinPlateParam, PinholeParam>(m, "PinPlateParam")
         .def(py::init<>())
         .def_readwrite("plane",             &PinPlateParam::plane)
-        .def_readwrite("pt3d_closest",      &PinPlateParam::pt3d_closest)
+        .def_readwrite("plane_array",       &PinPlateParam::plane_array)
+        .def_readwrite("u_axis",            &PinPlateParam::u_axis)
+        .def_readwrite("v_axis",            &PinPlateParam::v_axis)
         .def_readwrite("refract_array",     &PinPlateParam::refract_array)
         .def_readwrite("w_array",           &PinPlateParam::w_array)
         .def_readwrite("n_plate",           &PinPlateParam::n_plate)
@@ -92,7 +94,7 @@ void bind_Camera(py::module_& m) {
 
         // 方法
         .def("updatePolyDuDv",    &Camera::updatePolyDuDv)
-        .def("updatePt3dClosest", &Camera::updatePt3dClosest)
+        .def("updatePinPlateParam", &Camera::updatePinPlateParam)
         .def("rmtxTorvec",        &Camera::rmtxTorvec, py::arg("r_mtx"))
 
         .def("getNRow", &Camera::getNRow)

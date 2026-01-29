@@ -55,6 +55,52 @@ _PROBE_LOGGED = False
 _RAY_ORIGIN_AUDIT_COUNT = 0
 _RAY_ORIGIN_AUDIT_PRINTED = False
 
+# --- Ray Validity Statistics Tracking ---
+_RAY_TRACKING_ENABLED = False
+_RAY_STATS = {
+    "total": 0,
+    "valid": 0,
+    "invalid": 0,
+    "reasons": {}
+}
+
+def enable_ray_tracking(enabled: bool = True, reset: bool = True):
+    """Enable or disable global ray statistics tracking."""
+    global _RAY_TRACKING_ENABLED
+    _RAY_TRACKING_ENABLED = enabled
+    if reset:
+        reset_ray_stats()
+
+def reset_ray_stats():
+    """Reset the global ray statistics counter."""
+    global _RAY_STATS
+    _RAY_STATS = {
+        "total": 0,
+        "valid": 0,
+        "invalid": 0,
+        "reasons": {}
+    }
+
+def get_ray_stats() -> dict:
+    """Return a copy of the current ray statistics."""
+    return _RAY_STATS.copy()
+
+def print_ray_stats_report(tag: str = "Summary"):
+    """Print a concise summary of recorded ray statistics."""
+    stats = _RAY_STATS
+    if stats["total"] == 0:
+        return
+        
+    print(f"\n[{tag}] Ray Validity Report:")
+    print(f"  Total Rays : {stats['total']:,}")
+    print(f"  Valid      : {stats['valid']:,} ({stats['valid']/stats['total']*100:.2f}%)")
+    print(f"  Invalid    : {stats['invalid']:,} ({stats['invalid']/stats['total']*100:.2f}%)")
+    
+    if stats["reasons"]:
+        print("  Invalid Reasons:")
+        for r, count in sorted(stats["reasons"].items(), key=lambda x: x[1], reverse=True):
+            print(f"    - {r:<25}: {count:,}")
+
 def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, endpoint="") -> Ray:
     """
     Build object-side refracted ray using C++ lineOfSight.
@@ -67,6 +113,7 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
     
     u, v = float(uv[0]), float(uv[1])
     
+    res = None
     try:
         # Use lineOfSight which accepts pixel coordinates directly
         # It calls undistort() internally, then passes to pinplateLine()
@@ -75,24 +122,55 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
         
         if np.all(np.isfinite(o)) and np.all(np.isfinite(d)):
             if not _PROBE_LOGGED:
-                # print(f"[Refractive] lineOfSight: Input ({u:.1f},{v:.1f}) pixel coords")
                 _PROBE_LOGGED = True
             
-            # Sanity check on direction z (should be >> 0 for forward facing)
             d_norm = normalize(d)
-            if abs(d_norm[2]) < 0.1:
-                # Diagnostics for the "collapsed ray" issue
-                return Ray(o=o, d=d_norm, valid=False, reason=f"collapsed_ray_z={d_norm[2]:.4f}", 
-                           cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+            
+            try:
+                # Retrieve window normal for grazing check
+                pp = cam._pinplate_param
+                nv = pp.plane.norm_vector
+                n_win = np.array([nv[0], nv[1], nv[2]])
+                n_win = normalize(n_win)
+                cos_theta = np.dot(d_norm, n_win)
                 
-            return Ray(o=o, d=d_norm, valid=True, cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+                if cos_theta <= 0.0:
+                    res = Ray(o=o, d=d_norm, valid=False, reason=f"backward_vs_window_normal={cos_theta:.4f}", 
+                                 cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+                elif abs(cos_theta) < 0.1:
+                      res = Ray(o=o, d=d_norm, valid=False, reason=f"grazing_ray_cos={cos_theta:.4f}", 
+                                 cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+                else:
+                      res = Ray(o=o, d=d_norm, valid=True, cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+
+            except Exception as e:
+                # Fallback if normal access fails
+                res = Ray(o=o, d=d_norm, valid=True, cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+        else:
+            res = Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason="non_finite_outputs", 
+                       cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
             
     except Exception as e:
         reason = f"C++ lineOfSight failed: {str(e)}"
         if "total internal reflection" in reason.lower():
              reason = "total_internal_reflection"
-        return Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason=reason, 
+             
+        res = Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason=reason, 
                    cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+        
+    # --- Tracking Logic ---
+    if _RAY_TRACKING_ENABLED and res is not None:
+        _RAY_STATS["total"] += 1
+        if res.valid:
+            _RAY_STATS["valid"] += 1
+        else:
+            _RAY_STATS["invalid"] += 1
+            r = res.reason or "unknown"
+            # Strip numeric details from reason for cleaner categorical grouping
+            if "=" in r: r = r.split("=")[0]
+            _RAY_STATS["reasons"][r] = _RAY_STATS["reasons"].get(r, 0) + 1
+            
+    return res
     
     # Fallback
     return Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason="extraction_failed", 
@@ -674,6 +752,7 @@ def update_cpp_camera_state(cam_obj,
         if 'thickness' in media_props:
             current_thick = float(media_props['thickness'])
             pp.w_array = [current_thick]
+            pp.n_plate = len(pp.w_array)
 
     # --- 4. Plane Geometry (Coordinate Shift) ---
     if plane_geom:
@@ -693,6 +772,7 @@ def update_cpp_camera_state(cam_obj,
         
     # --- 5. Commit and Refresh ---
     cam_obj._pinplate_param = pp
-    cam_obj.updatePt3dClosest()
+    # cam_obj.updatePt3dClosest()
+    cam_obj.updatePinPlateParam()
 
 
