@@ -8,6 +8,7 @@ matplotlib.use('qtagg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QTabWidget, QComboBox, QSpinBox, 
@@ -700,147 +701,157 @@ class Calibration3DViewer(QWidget):
             else:
                 pts_center = np.zeros(3)
             
-            # Overall bounding box including cameras and points
-            if all_pts:
-                all_pts = np.array(all_pts)
-                overall_min = np.min(all_pts, axis=0)
-                overall_max = np.max(all_pts, axis=0)
-                overall_center = (overall_min + overall_max) / 2
+            # Reference point (mean of points if available, otherwise origin)
+            if points_3d is not None and len(points_3d) > 0:
+                pts_m = points_3d / scale
+                x_ref = np.mean(pts_m, axis=0)
             else:
-                overall_center = np.zeros(3)
-            
-            # Pre-process all planes: store normals, centers, bases
-            plane_data = {}
+                x_ref = np.zeros(3)
+
+            # Overall bounding box from cameras + points (or origin fallback)
+            bbox_sources = []
+            if cam_positions:
+                bbox_sources.extend(cam_positions.values())
+            if points_3d is not None and len(points_3d) > 0:
+                bbox_sources.extend((points_3d / scale).tolist())
+            else:
+                bbox_sources.append(x_ref)
+
+            if bbox_sources:
+                bbox_sources = np.array(bbox_sources)
+                overall_min = np.min(bbox_sources, axis=0)
+                overall_max = np.max(bbox_sources, axis=0)
+                diag = np.linalg.norm(overall_max - overall_min)
+                pad = 0.1 * diag if diag > 1e-9 else 0.1
+                overall_min = overall_min - pad
+                overall_max = overall_max + pad
+            else:
+                overall_min = np.array([-0.5, -0.5, -0.5])
+                overall_max = np.array([0.5, 0.5, 0.5])
+
+            # AABB vertices (0..7) and edges
+            x0, y0, z0 = overall_min
+            x1, y1, z1 = overall_max
+            bbox_pts = np.array([
+                [x0, y0, z0], [x1, y0, z0], [x0, y1, z0], [x1, y1, z0],
+                [x0, y0, z1], [x1, y0, z1], [x0, y1, z1], [x1, y1, z1]
+            ])
+            bbox_edges = [
+                (0, 1), (1, 3), (3, 2), (2, 0),
+                (4, 5), (5, 7), (7, 6), (6, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7)
+            ]
+
+            def _unique_points(points, eps=1e-6):
+                uniq = []
+                for p in points:
+                    if not any(np.linalg.norm(p - q) < eps for q in uniq):
+                        uniq.append(p)
+                return uniq
+
+            def _plane_aabb_intersections(n, p_ref):
+                pts = []
+                for i, j in bbox_edges:
+                    p0 = bbox_pts[i]
+                    p1 = bbox_pts[j]
+                    s0 = np.dot(n, p0 - p_ref)
+                    s1 = np.dot(n, p1 - p_ref)
+
+                    if abs(s0) < 1e-9:
+                        pts.append(p0)
+                    if abs(s1) < 1e-9:
+                        pts.append(p1)
+
+                    if s0 * s1 < 0:
+                        denom = s1 - s0
+                        if abs(denom) < 1e-12:
+                            continue
+                        t = -s0 / denom
+                        if 0.0 <= t <= 1.0:
+                            pts.append(p0 + t * (p1 - p0))
+                return _unique_points(pts)
+
+            def _sort_points_on_plane(points, n):
+                if abs(n[2]) > 0.9:
+                    temp = np.array([1.0, 0.0, 0.0])
+                else:
+                    temp = np.array([0.0, 0.0, 1.0])
+                u = np.cross(n, temp)
+                u = u / (np.linalg.norm(u) + 1e-12)
+                v = np.cross(n, u)
+                v = v / (np.linalg.norm(v) + 1e-12)
+
+                pts = np.array(points)
+                proj = np.stack([pts @ u, pts @ v], axis=1)
+                center = np.mean(proj, axis=0)
+                angles = np.arctan2(proj[:, 1] - center[1], proj[:, 0] - center[0])
+                order = np.argsort(angles)
+                return pts[order]
+
+            def _clip_polygon_by_plane(poly, n, p_ref, eps=1e-9):
+                if poly is None or len(poly) == 0:
+                    return []
+                clipped = []
+                num = len(poly)
+                for i in range(num):
+                    curr = poly[i]
+                    prev = poly[i - 1]
+                    d_curr = np.dot(n, curr - p_ref)
+                    d_prev = np.dot(n, prev - p_ref)
+                    curr_in = d_curr <= eps
+                    prev_in = d_prev <= eps
+
+                    if curr_in and prev_in:
+                        clipped.append(curr)
+                    elif prev_in and not curr_in:
+                        t = d_prev / (d_prev - d_curr + eps)
+                        clipped.append(prev + t * (curr - prev))
+                    elif not prev_in and curr_in:
+                        t = d_prev / (d_prev - d_curr + eps)
+                        clipped.append(prev + t * (curr - prev))
+                        clipped.append(curr)
+                return _unique_points(clipped, eps=1e-6)
+
+            plane_defs = []
             for wid, plane in window_planes.items():
                 if 'plane_n' not in plane or 'plane_pt' not in plane:
                     continue
-                
-                n = np.array(plane['plane_n'])
-                p_ref = np.array(plane['plane_pt']) / scale
-                
+
+                n = np.array(plane['plane_n'], dtype=float)
+                p_ref = np.array(plane['plane_pt'], dtype=float) / scale
+
                 norm_n = np.linalg.norm(n)
-                if norm_n < 1e-6: continue
+                if norm_n < 1e-6:
+                    continue
                 n = n / norm_n
-                
-                # Use actual plane_pt position for visualization (NOT projected pts_center)
-                # This ensures the plane is drawn at its physical location between cameras and measurement volume
-                p_vis = p_ref  # Use actual plane position
-                
-                # Find orthogonal basis (prefer Z-aligned v for vertical planes)
-                if abs(n[2]) > 0.9:  # Horizontal plane
-                    temp = np.array([1.0, 0.0, 0.0])
-                else:  # Vertical or tilted plane
-                    temp = np.array([0.0, 0.0, 1.0])
-                
-                u = np.cross(n, temp)
-                u = u / np.linalg.norm(u)
-                v = np.cross(n, u)
-                v = v / np.linalg.norm(v)
-                
-                plane_data[wid] = {'n': n, 'p_ref': p_ref, 'p_vis': p_vis, 'u': u, 'v': v}
+                if np.dot(n, x_ref - p_ref) > 0:
+                    n = -n
 
-            
-            # Calculate plane intersection (if 2 planes exist)
-            # Calculate plane intersection (if 2 planes exist)
-            wids = list(plane_data.keys())
-            intersection_line = None
-            
-            if len(wids) == 2:
-                p0 = plane_data[wids[0]]
-                p1 = plane_data[wids[1]]
-                n0, n1 = p0['n'], p1['n']
-                
-                # Intersection direction: cross product of normals
-                line_dir = np.cross(n0, n1)
-                line_dir_norm = np.linalg.norm(line_dir)
-                
-                if line_dir_norm > 1e-6:  # Planes not parallel
-                    line_dir = line_dir / line_dir_norm
-                    
-                    # Find a point on the intersection line near pts_center
-                    d0 = np.dot(p0['p_ref'], n0)
-                    d1 = np.dot(p1['p_ref'], n1)
-                    
-                    A = np.vstack([n0, n1, line_dir])
-                    b = np.array([d0, d1, np.dot(pts_center, line_dir)])
-                    
-                    try:
-                        line_pt = np.linalg.solve(A, b)
-                        intersection_line = {'pt': line_pt, 'dir': line_dir}
-                    except:
-                        pass
-            
-            # Drawing planes
-            plane_width = 0.15  # 150mm extension from intersection
-            
-            for wid in wids:
-                pd = plane_data[wid]
-                n = pd['n']
-                p_ref = pd['p_ref']
-                
-                if intersection_line is not None and len(wids) >= 2:
-                    # Use intersection line as one edge
-                    line_pt = intersection_line['pt']
-                    line_dir = intersection_line['dir']
-                    
-                    # Direction perpendicular to intersection line, lying in this plane
-                    # This is: n × line_dir (normalized)
-                    perp_dir = np.cross(n, line_dir)
-                    perp_norm = np.linalg.norm(perp_dir)
-                    if perp_norm > 1e-6:
-                        perp_dir = perp_dir / perp_norm
-                    else:
-                        perp_dir = pd['u']
-                    
-                    # Decide which direction to extend (TOWARDS the 3D points center)
-                    # Vector from intersection line to pts_center
-                    to_pts = pts_center - line_pt
-                    
-                    # Project onto perp_dir: if negative, flip perp_dir
-                    if np.dot(perp_dir, to_pts) < 0:
-                        perp_dir = -perp_dir
+                plane_defs.append((wid, n, p_ref))
 
-                    
-                    # Construct 4 corners of the quad:
-                    # edge1: line_pt + line_dir * (±line_extent)
-                    # edge2: edge1 + perp_dir * plane_width
-                    line_extent = 0.1  # 100mm along intersection line
-                    
-                    c1 = line_pt - line_dir * line_extent  # Corner 1 on intersection
-                    c2 = line_pt + line_dir * line_extent  # Corner 2 on intersection
-                    c3 = c2 + perp_dir * plane_width       # Corner 3 opposite
-                    c4 = c1 + perp_dir * plane_width       # Corner 4 opposite
-                    
-                    # Create surface arrays
-                    X = np.array([[c1[0], c2[0]], [c4[0], c3[0]]])
-                    Y = np.array([[c1[1], c2[1]], [c4[1], c3[1]]])
-                    Z = np.array([[c1[2], c2[2]], [c4[2], c3[2]]])
-                    
-                    label_pt = (c1 + c2 + c3 + c4) / 4
-                    
-                else:
-                    # Fallback: simple square plane centered on p_vis
-                    p_vis = pd['p_vis']
-                    u, v = pd['u'], pd['v']
-                    half = plane_width
-                    
-                    c1 = p_vis - u*half - v*half
-                    c2 = p_vis + u*half - v*half
-                    c3 = p_vis + u*half + v*half
-                    c4 = p_vis - u*half + v*half
-                    
-                    X = np.array([[c1[0], c2[0]], [c4[0], c3[0]]])
-                    Y = np.array([[c1[1], c2[1]], [c4[1], c3[1]]])
-                    Z = np.array([[c1[2], c2[2]], [c4[2], c3[2]]])
-                    
-                    label_pt = p_vis
-                
-                # Plot surface
-                self.ax.plot_surface(X, Y, Z, alpha=0.3, color='#00d4ff', 
-                                     edgecolor='#00d4ff', linewidth=0.5)
-                
-                # Label
-                self.ax.text(label_pt[0], label_pt[1], label_pt[2], 
+            for wid, n, p_ref in plane_defs:
+                inter_pts = _plane_aabb_intersections(n, p_ref)
+                if len(inter_pts) < 3:
+                    continue
+
+                poly_pts = _sort_points_on_plane(inter_pts, n)
+
+                for owid, on, op_ref in plane_defs:
+                    if owid == wid:
+                        continue
+                    poly_pts = _clip_polygon_by_plane(poly_pts, on, op_ref)
+                    if len(poly_pts) < 3:
+                        break
+
+                if len(poly_pts) < 3:
+                    continue
+
+                poly = Poly3DCollection([poly_pts], alpha=0.3, facecolors='#00d4ff',
+                                        edgecolors='#00d4ff', linewidths=0.5)
+                self.ax.add_collection3d(poly)
+
+                label_pt = np.mean(poly_pts, axis=0)
+                self.ax.text(label_pt[0], label_pt[1], label_pt[2],
                              f"Win {wid}", color='#00d4ff', fontsize=8)
             
             self.canvas.draw()

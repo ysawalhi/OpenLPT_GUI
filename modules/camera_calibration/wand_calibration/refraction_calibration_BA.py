@@ -186,6 +186,20 @@ class RefractiveBAConfig:
 
     # Distortion optimization
     dist_coeff_num: int = 0
+
+    # Explicit point solver
+    explicit_point_min_rays: int = 3
+
+    # Robust loss settings
+    loss_plane: str = "linear"
+    loss_cam: str = "soft_l1"
+    loss_joint: str = "huber"
+    loss_round4: str = "huber"
+    loss_f_scale: float = 1.0
+
+    # Weak-window control
+    skip_weak_round3: bool = True
+    skip_weak_round4: bool = True
     
     
 class RefractiveBAOptimizer:
@@ -228,6 +242,8 @@ class RefractiveBAOptimizer:
         self.config = config or RefractiveBAConfig()
         self.progress_callback = progress_callback  # For UI progress updates
         self.reporter = RefractiveCalibReporter()
+
+        self._explicit_points = {}
 
         
         # Deep copy window_planes for modification
@@ -368,6 +384,8 @@ class RefractiveBAOptimizer:
                 cam_id=cid,
             )
             CppSyncAdapter.apply(self.cams_cpp, cid, update_kwargs)
+
+        self._explicit_points = {}
         
         # 1. Pre-calculate total possible counts for FIXED size
         total_ray_slots = 0
@@ -411,6 +429,11 @@ class RefractiveBAOptimizer:
         N_len_actual = 0
         num_triangulated_points = 0
         valid_points_data = [] # For barrier computation
+
+        explicit_total = 0
+        explicit_ok = 0
+        fallback_used = 0
+        fallback_ok = 0
         
         radius_A = self.dataset.get('est_radius_small_mm', 0.0)
         radius_B = self.dataset.get('est_radius_large_mm', 0.0)
@@ -436,12 +459,26 @@ class RefractiveBAOptimizer:
                 else:
                     # Fallback for missing camera object
                     rays_A_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
-            
+
+            XA_explicit, okA, _ = self._compute_explicit_point(rays_A_all)
+
+            if n_slots_A > 0:
+                explicit_total += 1
+                if okA:
+                    explicit_ok += 1
+
             validA = False
             XA = None
             rays_A_valid = [r for r in rays_A_all if r.valid]
-            if len(rays_A_valid) >= 2:
+            if okA and XA_explicit is not None:
+                XA = XA_explicit
+                validA = True
+            elif len(rays_A_valid) >= 2:
                 XA, _, validA, _ = triangulate_point(rays_A_valid)
+                if n_slots_A > 0:
+                    fallback_used += 1
+                    if validA:
+                        fallback_ok += 1
             
             # Use fixed iteration to fill slots
             start_idx_barrier_A = idx_barrier
@@ -483,12 +520,26 @@ class RefractiveBAOptimizer:
                     rays_B_all.append(r)
                 else:
                     rays_B_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
+
+            XB_explicit, okB, _ = self._compute_explicit_point(rays_B_all)
+
+            if n_slots_B > 0:
+                explicit_total += 1
+                if okB:
+                    explicit_ok += 1
             
             validB = False
             XB = None
             rays_B_valid = [r for r in rays_B_all if r.valid]
-            if len(rays_B_valid) >= 2:
+            if okB and XB_explicit is not None:
+                XB = XB_explicit
+                validB = True
+            elif len(rays_B_valid) >= 2:
                 XB, _, validB, _ = triangulate_point(rays_B_valid)
+                if n_slots_B > 0:
+                    fallback_used += 1
+                    if validB:
+                        fallback_ok += 1
             
             start_idx_barrier_B = idx_barrier
             wids_B_expected = sorted([w for w in set(self.cam_to_window.get(cid) for cid in cids_B) if w is not None and w != -1])
@@ -523,6 +574,13 @@ class RefractiveBAOptimizer:
             else:
                 res_len_fixed[idx_len] = PENALTY_LEN / self.sigma_wand
             idx_len += 1
+
+            self._explicit_points[fid] = {
+                'A': XA_explicit,
+                'B': XB_explicit,
+                'validA': okA,
+                'validB': okB
+            }
 
         # 2. Side Barrier (Adaptive)
         J_data = S_ray + lambda_eff * S_len
@@ -576,6 +634,16 @@ class RefractiveBAOptimizer:
         else:
             self._last_barrier_stats = {}
 
+        if explicit_total > 0:
+            self._last_explicit_stats = {
+                'total': explicit_total,
+                'explicit_ok': explicit_ok,
+                'fallback_used': fallback_used,
+                'fallback_ok': fallback_ok
+            }
+        else:
+            self._last_explicit_stats = {}
+
         # Update RMSE for diagnostics based on physical units
         self._last_ray_rmse = np.sqrt(S_ray / max(1, N_ray_actual))
         self._last_len_rmse = np.sqrt(S_len / max(1, N_len_actual)) if N_len_actual > 0 else 0.0
@@ -585,6 +653,34 @@ class RefractiveBAOptimizer:
         residuals = np.concatenate([res_ray_fixed, weighted_len, res_barrier_fixed])
             
         return residuals, S_ray, S_len, N_ray_actual, N_len_actual
+
+    def _compute_explicit_point(self, rays_list: List[Ray]) -> Tuple[Optional[np.ndarray], bool, str]:
+        valid_rays = [r for r in rays_list if r.valid]
+        min_rays = max(1, int(self.config.explicit_point_min_rays))
+        if len(valid_rays) < min_rays:
+            return None, False, "insufficient_valid_rays"
+
+        A = np.zeros((3, 3))
+        b = np.zeros(3)
+        I = np.eye(3)
+
+        for ray in valid_rays:
+            d = ray.d.reshape(3, 1)
+            proj_perp = I - d @ d.T
+            A += proj_perp
+            b += proj_perp @ ray.o
+
+        try:
+            cond = np.linalg.cond(A)
+            if not np.isfinite(cond):
+                return None, False, "ill_conditioned"
+            if cond < 1e12:
+                X = np.linalg.solve(A, b)
+                return X, True, ""
+            X, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+            return X, False, f"ill_conditioned: cond={cond:.2e}, rank={rank}"
+        except (np.linalg.LinAlgError, ValueError) as e:
+            return None, False, f"linalg_error: {e}"
 
     def _get_param_layout(self, enable_planes: bool, enable_cam_t: bool, enable_cam_r: bool,
                           enable_cam_f: bool = False, enable_win_t: bool = False,
@@ -808,7 +904,9 @@ class RefractiveBAOptimizer:
                           enable_cam_f: bool = False, enable_win_t: bool = False,
                           enable_cam_k1: bool = False, enable_cam_k2: bool = False,
                           plane_d_bounds: Dict[int, float] = None,
-                          ftol: float = 1e-6):
+                          ftol: float = 1e-6,
+                          loss: Optional[str] = None,
+                          f_scale: Optional[float] = None):
         """
         Generic optimization loop with explicit bounds and parameter selection.
         """
@@ -895,7 +993,7 @@ class RefractiveBAOptimizer:
         
         bounds = (np.array(lb), np.array(ub))
         
-         # Residual wrapper for event pumping
+        # Residual wrapper for event pumping
         self._res_call_count = 0
         def residuals_wrapper(x, *args, **kwargs):
             res = self._residuals(x, *args, **kwargs)
@@ -903,16 +1001,21 @@ class RefractiveBAOptimizer:
             if self.progress_callback and self._res_call_count % 30 == 0:
                 try:
                     c_approx = 0.5 * np.sum(res**2)
-                    
+
                     # [DEBUG] Print to terminal instead of UI
                     if hasattr(self, '_last_ratio_info'):
-                         # Calculate percentage
-                         j_ratio = getattr(self, '_last_ratio_cost', 0.0)
-                         pct = (j_ratio / c_approx * 100) if c_approx > 0 else 0
-                         self.reporter.detail(f"  [RefractiveCalib DEBUG] J_tot={c_approx:.1e}, J_ratio={j_ratio:.1e} ({pct:.1f}%) | {self._last_ratio_info}")
-                         
+                        # Calculate percentage
+                        j_ratio = getattr(self, '_last_ratio_cost', 0.0)
+                        pct = (j_ratio / c_approx * 100) if c_approx > 0 else 0
+                        self.reporter.detail(
+                            f"  [RefractiveCalib DEBUG] J_tot={c_approx:.1e}, J_ratio={j_ratio:.1e} "
+                            f"({pct:.1f}%) | {self._last_ratio_info}"
+                        )
+
                     if self.progress_callback:
-                        self.progress_callback(f"{description}", self._last_ray_rmse, self._last_len_rmse, c_approx)
+                        self.progress_callback(
+                            f"{description}", self._last_ray_rmse, self._last_len_rmse, c_approx
+                        )
                 except Exception as e:
                     self.reporter.detail(f"[Warning] Progress callback failed: {e}")
             return res
@@ -928,6 +1031,8 @@ class RefractiveBAOptimizer:
             verbose=0,
             x_scale='jac',
             ftol=ftol,
+            loss=loss or 'linear',
+            f_scale=self.config.loss_f_scale if f_scale is None else f_scale,
             xtol=1e-6,
             gtol=1e-6,
             max_nfev=50
@@ -1253,6 +1358,8 @@ class RefractiveBAOptimizer:
         
         while loop_iter < max_loop_iters:
             loop_iter += 1
+
+            loss_loop = 'linear' if loop_iter == 1 else 'soft_l1'
             
             # [NEW] Dynamic Detection per loop
             self._detect_weak_windows()
@@ -1298,7 +1405,8 @@ class RefractiveBAOptimizer:
                 limit_plane_d_mm=b_plane_strict[1],
                 limit_plane_angle_rad=b_plane_strict[0],
                 plane_d_bounds=plane_d_bounds, # [NEW] Pass bounds
-                ftol=5e-4
+                ftol=5e-4,
+                loss=loss_loop
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Planes")
             
@@ -1334,7 +1442,8 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=b_cam_free[1],
                 limit_plane_d_mm=0.0,
                 limit_plane_angle_rad=0.0,
-                ftol=5e-4
+                ftol=5e-4,
+                loss=loss_loop
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Cams")
 
@@ -1350,8 +1459,9 @@ class RefractiveBAOptimizer:
         if stage >= 3:
             self.reporter.section("Final Joint Optimization (Round 3 Rules)")
             
-            # [NEW] Re-detect before final joint
-            self._detect_weak_windows()
+            # [NEW] Re-detect before final joint (optional)
+            if not self.config.skip_weak_round3:
+                self._detect_weak_windows()
             # Bounds: 20 deg, 50 mm d, 10 mm tvec
             limit_rvec = np.radians(20.0)
             limit_plane_d = 50.0
@@ -1370,7 +1480,8 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=5e-4
+                ftol=5e-4,
+                loss=self.config.loss_joint
             )
             self._print_plane_diagnostics("Final Joint End")
 
@@ -1406,7 +1517,8 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=1e-5
+                ftol=1e-5,
+                loss=self.config.loss_round4
             )
             self._print_plane_diagnostics("Round4 End")
         
