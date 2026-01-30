@@ -5341,8 +5341,8 @@ class CameraCalibrationView(QWidget):
             
             ref_cal.base.initial_focal = initial_focal
             
-            # === CHECK FOR EXISTING PR5 CACHE ===
-            cache_path = os.path.join(parent_dir, "pr5_bundle_cache.json")
+            # === CHECK FOR EXISTING CACHE ===
+            cache_path = os.path.join(parent_dir, "bundle_cache.json")
             if os.path.exists(cache_path):
                 # Ask user if they want to use cache
                 from PySide6.QtWidgets import QMessageBox as QMB

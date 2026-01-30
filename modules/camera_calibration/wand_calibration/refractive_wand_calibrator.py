@@ -19,7 +19,7 @@ from .refractive_geometry import (
 )
 
 from .refractive_bootstrap import PinholeBootstrapP0, PinholeBootstrapP0Config, select_best_pair_via_precalib
-from .refractive_bundle_adjustment import RefractiveBAOptimizerPR4, PR4Config, RefractiveBAOptimizerPR5, PR5Config
+from .refractive_bundle_adjustment import RefractiveBAOptimizer, RefractiveBAConfig
 from scipy.optimize import least_squares
 
 
@@ -1464,27 +1464,27 @@ class RefractiveWandCalibrator:
 
         
 
-        # === Phase PR4: Bundle Adjustment (Selective BA) ===
+        # === Phase: Bundle Adjustment (Selective BA) ===
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
         # rs_pr4, rl_pr4 = 1.5, 2.0 # Defaults
         if X_A_scaled and X_B_scaled:
-            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="PR4 Pre-Calc")
+            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="BA Pre-Calc")
             dataset['est_radius_small_mm'] = rs
             dataset['est_radius_large_mm'] = rl
             rs_pr4, rl_pr4 = rs, rl
-            print(f"[PR4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
+            print(f"[BA] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
 
         # Pass verbosity to config
-        pr4_config = PR4Config(
-            skip_pr4=False,
-            pr4_stage=3,
+        ba_config = RefractiveBAConfig(
+            skip_optimization=False,
+            stage=4,
             verbosity=verbosity,
             R_small_mm=rs_pr4,
             R_large_mm=rl_pr4
         )
         
-        pr4_optimizer = RefractiveBAOptimizerPR4(
+        ba_optimizer = RefractiveBAOptimizer(
             dataset=dataset,
             cam_params=cam_params,
             cams_cpp=cams_cpp,
@@ -1492,69 +1492,35 @@ class RefractiveWandCalibrator:
             window_media=window_media,
             window_planes=self.window_planes,
             wand_length=wand_len_target,
-            config=pr4_config,
+            config=ba_config,
             progress_callback=progress_callback
         )
 
-        # Try to load PR4 cache
-        loaded_pr4 = pr4_optimizer.try_load_cache(out_path)
+        # Try to load cache
+        loaded_cache = ba_optimizer.try_load_cache(out_path)
         
-        if loaded_pr4:
+        if loaded_cache:
             # Cache loaded successfully, extract updated state
-            self.window_planes = pr4_optimizer.window_planes
-            cam_params = pr4_optimizer.cam_params
-            print("[PR4][CACHE] Using cached PR4 results, skipping optimization")
+            self.window_planes = ba_optimizer.window_planes
+            cam_params = ba_optimizer.cam_params
+            window_media = ba_optimizer.window_media
+            print("[CACHE] Using cached results, skipping optimization")
         else:
-            # Run PR4 optimization
-            self.window_planes, cam_params = pr4_optimizer.optimize()
-            # Save PR4 cache
-            pr4_optimizer.save_cache(out_path)
+            # Run optimization
+            self.window_planes, cam_params = ba_optimizer.optimize()
+            window_media = ba_optimizer.window_media
+            # Save cache
+            ba_optimizer.save_cache(out_path)
 
-        # === Phase PR5: Robust Bundle Adjustment (Geometric) ===
-        # [USER REQUEST] Re-estimate Radii with latest params (PR4 result)
+        # === Phase Round4: Intrinsics + Thickness ===
+        # [USER REQUEST] Re-estimate Radii with latest params (post-BA)
         if X_A_scaled and X_B_scaled:
-            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="PR5 Pre-Calc")
+            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="Round4 Pre-Calc")
             dataset['est_radius_small_mm'] = rs
             dataset['est_radius_large_mm'] = rl
-            print(f"[PR5] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
+            print(f"[ROUND4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
 
-        # Optimize planes, thickness, intrinsics, extrinsics with strong priors
-        pr5_config = PR5Config(
-            verbosity=verbosity
-        )
-        
-        pr5_optimizer = RefractiveBAOptimizerPR5(
-            dataset=dataset,
-            cam_params=cam_params,
-            cams_cpp=cams_cpp,
-            cam_to_window=cam_to_window,
-            window_media=window_media,
-            window_planes=self.window_planes,
-            wand_length=wand_len_target,
-            config=pr5_config,
-            progress_callback=progress_callback
-        )
-
-        
-        # Check Cache
-        loaded_pr5 = pr5_optimizer.try_load_cache(out_path)
-        
-        if loaded_pr5:
-            # Output loaded values updated in init ? No, try_load_cache updates internal state of optimizer.
-            # We need to extract them back to local variables?
-            # pr5_optimizer.window_planes is updated.
-            self.window_planes = pr5_optimizer.window_planes
-            cam_params = pr5_optimizer.cam_params
-            window_media = pr5_optimizer.window_media
-            
-            # Since C++ objects updated inside try_load_cache, we are good?
-            # Yes, try_load_cache calls _apply_planes_to_cpp.
-        else:
-            # Run Optimization
-            self.window_planes, cam_params, window_media = pr5_optimizer.optimize()
-            # Save Cache
-
-        # Re-export camFiles with Final (PR5 or Polish) results
+        # Re-export camFiles with Final (Round4) results
         if verbosity >= 0:
              print("\n[Refractive] Exporting Final parameters to camFiles...")
         
@@ -1615,35 +1581,16 @@ class RefractiveWandCalibrator:
                 
                 # [USER REQUEST] Sync aligned parameters back to C++ memory
                 # This ensures the in-memory state matches the exported camFiles.
-                # Reuse PR5 optimizer's sync logic if available, or manual apply.
-                if pr5_optimizer:
-                    # Update optimizer's internal state first (optional but good practice)
-                    pr5_optimizer.cam_params = cam_params
-                    pr5_optimizer.window_planes = self.window_planes
-                    
-                    # Use _apply_params_to_cpp for reliable C++ sync
-                    # Build parameter maps expected by _apply_params_to_cpp
-                    planes_update = {}
-                    for wid in pr5_optimizer.window_ids:
-                        # d_delta=0, alpha=0, beta=0 since planes are already updated in window_planes
-                        planes_update[wid] = (0.0, 0.0, 0.0)
-                    
-                    thick_map = {wid: window_media[wid]['thickness'] for wid in pr5_optimizer.window_ids}
-                    f_map = {cid: cam_params[cid][6] for cid in pr5_optimizer.active_cam_ids}
-                    rvec_map = {cid: cam_params[cid][0:3] for cid in pr5_optimizer.active_cam_ids}
-                    tvec_map = {cid: cam_params[cid][3:6] for cid in pr5_optimizer.active_cam_ids}
-                    
-                    # Call the reliable update method
-                    pr5_optimizer._apply_params_to_cpp(planes_update, thick_map, f_map, rvec_map, tvec_map)
+                if ba_optimizer:
+                    ba_optimizer.sync_cpp_state(cam_params=cam_params, window_planes=self.window_planes, window_media=window_media)
 
                     if verbosity >= 1:
-                         print("[Coordinate Alignment] Synced C++ objects with aligned parameters.")
-                         
-                    # [USER REQUEST] Also update PR5 cache with aligned parameters
-                    # pr5_optimizer.cam_params and .window_planes were updated above
-                    pr5_optimizer.save_cache(out_path)
+                        print("[Coordinate Alignment] Synced C++ objects with aligned parameters.")
+
+                    # Update cache with aligned parameters
+                    ba_optimizer.save_cache(out_path)
                     if verbosity >= 1:
-                        print(f"[Coordinate Alignment] Saved ALIGNED parameters to PR5 cache: {out_path}")
+                        print(f"[Coordinate Alignment] Saved ALIGNED parameters to cache: {out_path}")
 
                 # [VERIFICATION POST-STEP]
                 # Validate the consistency
@@ -1697,7 +1644,7 @@ class RefractiveWandCalibrator:
                     except Exception as e:
                         print(f"  [Warning] Cam {cid} reload failed: {e}")
         except Exception as e:
-            print(f"  [Error] PR5 export failed: {e}")
+            print(f"  [Error] Export failed: {e}")
 
 
         # rays_db[fid][0=A, 1=B] = [Ray, Ray, ...]
@@ -2066,7 +2013,7 @@ class RefractiveWandCalibrator:
             json.dump(safe_json(report), f_json, indent=2)
             
         print(f"\n[Refractive] Report exported to: {report_path}")
-        print("[Refractive] Status: PR5 Intrinsic Refinement Completed.")
+        print("[Refractive] Status: Round4 Intrinsic/Thickness Refinement Completed.")
         print("="*50 + "\n")
 
         # Return signature matching view.py: success, cam_params, report, dataset
@@ -2087,7 +2034,7 @@ class RefractiveWandCalibrator:
         # Verify 3D points are on correct side of window planes relative to cameras
         # Also identify specific frame IDs with points on camera side
         if tri_data and self.window_planes and cam_params:
-            print("\n[PR5] Plane Side Verification (eps=0.05mm):")
+            print("\n[ROUND4] Plane Side Verification (eps=0.05mm):")
             eps_mm = 0.05
             
             for wid, pl in self.window_planes.items():
@@ -2138,15 +2085,15 @@ class RefractiveWandCalibrator:
 
         
         # Update cache with 3D points (for visualization when loading from cache)
-        if not loaded_pr5:  # Only if we ran optimization (not loaded from cache)
-            pr5_optimizer.save_cache(out_path, points_3d=all_points_3d)
+        if not loaded_cache:  # Only if we ran optimization (not loaded from cache)
+            ba_optimizer.save_cache(out_path, points_3d=all_points_3d)
 
 
         # [Coordinate Alignment] Duplicate block removed. 
         # Alignment is already performed after optimization (Phase 5).
 
-        # Use C++ cameras from pr5_optimizer directly (already synced with final params)
-        v_cams_cpp = pr5_optimizer.cams_cpp if pr5_optimizer else None
+        # Use C++ cameras from ba_optimizer directly (already synced with final params)
+        v_cams_cpp = ba_optimizer.cams_cpp if ba_optimizer else None
         
         # [User Request] Update proj_nmax for accurate projection
         if v_cams_cpp:
