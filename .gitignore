@@ -45,3 +45,6 @@ opencode.jsonc
 
 # OpenCode directory
 .opencode/
+.opencode
+
+tmp/

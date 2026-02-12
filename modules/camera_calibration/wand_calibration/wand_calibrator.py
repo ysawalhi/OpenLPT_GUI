@@ -782,6 +782,7 @@ class WandCalibrator:
 
         # 4. Phase 3 & 4: Point Selection & Validation
         k_std = 3.0 # Threshold multiplier
+        pct_range = 0.05
         
         for f_idx, cam_data in self.wand_data_raw.items():
             frame_filtered = {}
@@ -811,9 +812,11 @@ class WandCalibrator:
                 pts = cam_data[c_idx] # [[x,y,r,m], ...] 
                 
                 # Find best Small point
-                candidates_s = [p for p in pts if abs(p[2] - mean_s) < k_std * std_s]
+                range_s = max(k_std * std_s, mean_s * pct_range)
+                range_l = max(k_std * std_l, mean_l * pct_range)
+                candidates_s = [p for p in pts if abs(p[2] - mean_s) < range_s]
                 # Filter by range Large
-                candidates_l = [p for p in pts if abs(p[2] - mean_l) < k_std * std_l]
+                candidates_l = [p for p in pts if abs(p[2] - mean_l) < range_l]
                 
                 if not candidates_s or not candidates_l:
                     frame_valid = False
@@ -907,10 +910,12 @@ class WandCalibrator:
                         mean_l, std_l = stats['l']
                         pts = cam_data[c_idx]
                         
-                        # Use tighter threshold for pass 2 (2.5 sigma instead of 3)
-                        k_std_refined = 2.5
-                        candidates_s = [p for p in pts if abs(p[2] - mean_s) < k_std_refined * std_s]
-                        candidates_l = [p for p in pts if abs(p[2] - mean_l) < k_std_refined * std_l]
+                        k_std_refined = 3.0
+                        pct_range_refined = 0.05
+                        range_s = max(k_std_refined * std_s, mean_s * pct_range_refined)
+                        range_l = max(k_std_refined * std_l, mean_l * pct_range_refined)
+                        candidates_s = [p for p in pts if abs(p[2] - mean_s) < range_s]
+                        candidates_l = [p for p in pts if abs(p[2] - mean_l) < range_l]
                         
                         if not candidates_s or not candidates_l:
                             frame_valid = False

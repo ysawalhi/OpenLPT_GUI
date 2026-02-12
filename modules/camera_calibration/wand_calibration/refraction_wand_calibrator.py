@@ -2281,7 +2281,8 @@ class RefractiveWandCalibrator:
             verbosity=verbosity,
             R_small_mm=rs_pr4,
             R_large_mm=rl_pr4,
-            dist_coeff_num=self.base.dist_coeff_num
+            dist_coeff_num=self.base.dist_coeff_num,
+            loss_f_scale=1.0,
         )
         
         ba_optimizer = RefractiveBAOptimizer(

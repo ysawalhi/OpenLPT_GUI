@@ -144,8 +144,131 @@ void Bubble3D::loadObject3D(std::istream& in)
 
 namespace Bubble {
 
+namespace {
+
+// Finite-difference step in world units [mm] for local projection Jacobian.
+constexpr double kJacStepMm = 0.05;
+// Smallest valid local projection gain [px/mm].
+constexpr double kSigmaEps = 1e-12;
+// Camera::project returns very negative sentinel on projection failure.
+constexpr double kProjInvalidCut = -1e300;
+
+bool isValidProjection(const Pt2D& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) &&
+           p[0] > kProjInvalidCut && p[1] > kProjInvalidCut;
+}
+
+bool calProjRadiusScale(double& radius_scale, const Camera& cam, const Pt3D& X,
+                        double h = kJacStepMm)
+{
+    // Estimate local image-space scaling for a 3D perturbation around X:
+    //   J = d(u,v)/d(X,Y,Z).
+    // Radius scale uses isotropic RMS gain in the tangent plane:
+    //   radius_scale = sqrt((sigma1^2 + sigma2^2)/2),
+    // where sigma1, sigma2 are singular values of J.
+    // Input:
+    //   radius_scale [out]: estimated isotropic gain [px/mm]
+    //   cam       [in] : camera model used by cam.project(...)
+    //   X         [in] : 3D center point in world coordinates [mm]
+    //   h         [in] : finite-difference step [mm]
+    // Return:
+    //   true  -> radius_scale is valid and > kSigmaEps
+    //   false -> invalid projection/Jacobian; caller should treat as unsupported
+    radius_scale = std::numeric_limits<double>::quiet_NaN();
+    if (!(h > 0.0) || !std::isfinite(h)) {
+        return false;
+    }
+
+    // 1) Baseline projection at X.
+    const Pt2D p0 = cam.project(X);
+    if (!isValidProjection(p0)) {
+        return false;
+    }
+
+    // 2) Finite differences per axis to build a 2x3 Jacobian.
+    //    Prefer central differences; if one side is invalid, fall back to one-sided.
+    double J[2][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+
+    for (int ax = 0; ax < 3; ++ax) {
+        Pt3D Xp = X;
+        Pt3D Xm = X;
+        Xp[ax] += h;
+        Xm[ax] -= h;
+
+        const Pt2D pp = cam.project(Xp);
+        const Pt2D pm = cam.project(Xm);
+        const bool vp = isValidProjection(pp);
+        const bool vm = isValidProjection(pm);
+
+        if (vp && vm) {
+            const double inv = 1.0 / (2.0 * h);
+            J[0][ax] = (pp[0] - pm[0]) * inv;
+            J[1][ax] = (pp[1] - pm[1]) * inv;
+        } else if (vp) {
+            const double inv = 1.0 / h;
+            J[0][ax] = (pp[0] - p0[0]) * inv;
+            J[1][ax] = (pp[1] - p0[1]) * inv;
+        } else if (vm) {
+            const double inv = 1.0 / h;
+            J[0][ax] = (p0[0] - pm[0]) * inv;
+            J[1][ax] = (p0[1] - pm[1]) * inv;
+        } else {
+            return false;
+        }
+
+        if (!std::isfinite(J[0][ax]) || !std::isfinite(J[1][ax])) {
+            return false;
+        }
+    }
+
+    // 3) Build A = J*J^T (2x2). Eigenvalues of A are squared singular values of J.
+    const double a00 = J[0][0] * J[0][0] + J[0][1] * J[0][1] +
+                       J[0][2] * J[0][2];
+    const double a01 = J[0][0] * J[1][0] + J[0][1] * J[1][1] +
+                       J[0][2] * J[1][2];
+    const double a11 = J[1][0] * J[1][0] + J[1][1] * J[1][1] +
+                       J[1][2] * J[1][2];
+
+    const double tr = a00 + a11;
+    const double det = a00 * a11 - a01 * a01;
+
+    // 4) Closed-form largest eigenvalue of 2x2 symmetric matrix A.
+    double disc = tr * tr - 4.0 * det;
+    if (disc < 0.0) {
+        if (disc > -1e-12) {
+            disc = 0.0;
+        } else {
+            return false;
+        }
+    }
+
+    const double lambda_max = 0.5 * (tr + std::sqrt(disc));
+    if (!std::isfinite(lambda_max) || lambda_max <= 0.0) {
+        return false;
+    }
+
+    // 5) Radius scale uses isotropic RMS singular-value gain.
+    //    trace(A) = sigma1^2 + sigma2^2 for A = J*J^T.
+    const double sigma_rms_sq = 0.5 * tr;
+    if (!std::isfinite(sigma_rms_sq) || sigma_rms_sq <= 0.0) {
+        return false;
+    }
+
+    radius_scale = std::sqrt(sigma_rms_sq);
+    return std::isfinite(radius_scale) && (radius_scale > kSigmaEps);
+}
+
+} // namespace
+
 // Exact 3D radius from one view (pinhole), pixel-domain.
 // R = d * k / sqrt(1 + k^2), where k = r_px / f_px, d = ||X - C||.
+// Input:
+//   cam  : camera used for inversion
+//   X    : 3D bubble center in world coordinates [mm]
+//   r_px : measured 2D bubble radius [px]
+// Output:
+//   estimated 3D radius R [mm], or NaN if invalid/unsupported.
 double calRadiusFromOneCam(const Camera& cam,
                            const Pt3D&   X,
                            double        r_px)
@@ -182,12 +305,23 @@ double calRadiusFromOneCam(const Camera& cam,
     }
 
     case CameraType::POLYNOMIAL:
-        // TODO: polynomial — use Jacobian at X: R ≈ r_px / sigma_max(J(X))
+        // TODO: polynomial — use Jacobian at X: R ≈ r_px / radius_scale(J(X))
         return NaN;
 
     case CameraType::PINPLATE:
+    {
+        // Refraction model: use local projection linearization at X.
+        // For small bubbles, R ≈ r_px / radius_scale.
+        double radius_scale = 0.0;
+        if (!calProjRadiusScale(radius_scale, cam, X)) {
+            return NaN;
+        }
+
+        const double R = r_px / radius_scale;
+        return (std::isfinite(R) && (R > 0.0)) ? R : NaN;
+    }
+
     default:
-        // TODO: not implemented
         return NaN;
     }
 }
@@ -195,7 +329,12 @@ double calRadiusFromOneCam(const Camera& cam,
 // Forward projection: predict image radius r_px from 3D radius R.
 // Pinhole (exact): r_px = f_px * R / sqrt(d^2 - R^2),
 //   where f_px is pixel focal length, d = ||X - C||.
-// Returns NaN if unsupported or inputs invalid.
+// Input:
+//   cam : camera used for projection
+//   X   : 3D bubble center in world coordinates [mm]
+//   R   : 3D bubble radius [mm]
+// Output:
+//   predicted image radius r_px [px], or NaN if invalid/unsupported.
 double cal2DRadius(const Camera& cam,
                    const Pt3D&   X,
                    double        R)
@@ -233,12 +372,23 @@ double cal2DRadius(const Camera& cam,
     }
 
     case CameraType::POLYNOMIAL:
-        // TODO: polynomial — use local Jacobian at X: r_px ≈ sigma_max(J(X)) * R
+        // TODO: polynomial — use local Jacobian at X: r_px ≈ radius_scale(J(X)) * R
         return NaN;
 
     case CameraType::PINPLATE:
+    {
+        // Refraction model: use local projection linearization at X.
+        // For small bubbles, r_px ≈ radius_scale * R.
+        double radius_scale = 0.0;
+        if (!calProjRadiusScale(radius_scale, cam, X)) {
+            return NaN;
+        }
+
+        const double r_px = radius_scale * R;
+        return std::isfinite(r_px) ? r_px : NaN;
+    }
+
     default:
-        // TODO: not implemented
         return NaN;
     }
 }
