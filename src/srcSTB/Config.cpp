@@ -60,6 +60,7 @@ bool BasicSetting::readConfig(const std::string &config_path) {
 
   // number of cameras
   _n_cam = std::stoi(lines[line_id++]);
+  _cam_list.clear();
   _cam_list.reserve(static_cast<size_t>(_n_cam));
   for (int i = 0; i < _n_cam; ++i) {
     parser.str(lines[line_id++]);
@@ -68,10 +69,15 @@ bool BasicSetting::readConfig(const std::string &config_path) {
     std::getline(parser, line, ',');
     int max_intensity = std::stoi(line);
 
-    Camera cam(cam_path); // read parameters from cam_path
-    cam._max_intensity = max_intensity;
-    cam._is_active = true;
-    _cam_list.emplace_back(cam);
+    auto cam_model_st = CameraFactory::loadFromFile(cam_path);
+    if (!cam_model_st) {
+      THROW_FATAL_CTX(ErrorCode::InvalidCameraState,
+                      "Failed to load camera model from:", cam_path);
+    }
+    auto cam_model = cam_model_st.value();
+    cam_model->max_intensity = max_intensity;
+    cam_model->is_active = true;
+    _cam_list.emplace_back(std::move(cam_model));
     parser.clear();
   }
 
@@ -360,10 +366,12 @@ std::unique_ptr<Object3D> BubbleConfig::creatObject3D(CreateArgs args) const {
     if (auto *bb = dynamic_cast<const Bubble3D *>(args._proto))
       up->_r3d = bb->_r3d;
   }
-  if (up->_r3d <= 0.0 && args._compute_bubble_radius && args._cams &&
+  if (up->_r3d <= 0.0 && args._compute_bubble_radius &&
       !up->_obj2d_list.empty()) {
-    up->_r3d =
-        Bubble::calRadiusFromCams(*args._cams, up->_pt_center, up->_obj2d_list);
+    if (args._cam_list) {
+      up->_r3d = Bubble::calRadiusFromCams(*args._cam_list, up->_pt_center,
+                                           up->_obj2d_list);
+    }
   }
   if (up->_r3d <= 0.0)
     up->_r3d = -1.0;

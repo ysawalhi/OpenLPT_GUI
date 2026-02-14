@@ -1245,7 +1245,7 @@ class TrackingSettingsView(QWidget):
             # Load basic settings
             basic_settings = lpt.BasicSetting()
             basic_settings.readConfig(config_file)
-            cam_list = basic_settings._cam_list
+            camera_models = basic_settings._cam_list
             
             # Select correct config object
             obj_type = self.obj_type_combo.currentText()
@@ -1298,7 +1298,7 @@ class TrackingSettingsView(QWidget):
             QApplication.processEvents()
             
             # Initial 3D match
-            stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+            stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
             obj3d_list = stereomath.match()
             count_3d = len(obj3d_list)
             print(f"[Validation] Initial Match: found {count_3d} 3D objects.")
@@ -1319,7 +1319,7 @@ class TrackingSettingsView(QWidget):
                 QApplication.processEvents()
                 
                 # Retry matching
-                stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
                 obj3d_list = stereomath.match()
                 count_3d = len(obj3d_list)
                 modified_2d = True
@@ -1341,7 +1341,7 @@ class TrackingSettingsView(QWidget):
                 QApplication.processEvents()
                 
                 # Retry matching
-                stereomath = lpt.StereoMatch(cam_list, obj2d_list, obj_cfg)
+                stereomath = lpt.StereoMatch(camera_models, obj2d_list, obj_cfg)
                 obj3d_list = stereomath.match()
                 count_3d = len(obj3d_list)
                 modified_3d = True

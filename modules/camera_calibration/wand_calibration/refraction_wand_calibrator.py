@@ -16,6 +16,7 @@ except ImportError:
 from .refractive_geometry import (
     build_pinplate_ray_cpp, closest_distance_rays, triangulate_point, 
     point_to_ray_dist, update_normal_tangent, camera_center,
+    build_pinplate_rays_cpp_batch,
     align_world_y_to_plane_intersection, update_cpp_camera_state
 )
 
@@ -60,6 +61,15 @@ def _rc_print(*args, **kwargs):
 
 
 print = _rc_print
+
+
+def _cpp_project(cam, pt_world):
+    if not hasattr(cam, "projectStatus"):
+        raise RuntimeError("projectStatus is required in hard migration mode")
+    ok, uv, err = cam.projectStatus(pt_world)
+    if not ok:
+        raise RuntimeError(f"projectStatus failed: {err}")
+    return uv
 
 
 class RefractiveCalibReporter:
@@ -832,10 +842,9 @@ class CppCameraFactory:
 
         for cid in sorted(cam_params.keys()):
             cam = lpt.Camera()
-            try:
-                cam._type = lpt.PINPLATE
-            except AttributeError:
-                cam._type = 2
+            image_size = base.image_size if hasattr(base, 'image_size') else (800, 1280)
+            n_row = max(1, int(image_size[0]))
+            n_col = max(1, int(image_size[1]))
 
             p = cam_params[cid]
             rvec, tvec = p[0:3], p[3:6]
@@ -855,43 +864,18 @@ class CppCameraFactory:
                     f"Cam {cid} (Win {wid}): Missing initialized plane data ('plane_pt' or 'plane_n') in window_planes."
                 )
 
-            pp = cam._pinplate_param
-            pp.proj_tol = 1e-5
-            pp.proj_nmax = 100
-            pp.lr = 0.5
-            pp.n_row = 0
-            pp.n_col = 0
-
-            pp.cam_mtx = lpt.MatrixDouble(3, 3, 0.0)
-            pp.r_mtx = lpt.MatrixDouble(3, 3, 0.0)
-            pp.r_mtx_inv = lpt.MatrixDouble(3, 3, 0.0)
-
-            cam._pinplate_param = pp
-
-            update_kwargs = CppSyncAdapter.build_update_kwargs(
-                cam_params=cam_params,
-                window_planes=window_planes,
-                window_media=window_media,
-                cam_to_window=cam_to_window,
-                cam_id=cid,
+            update_cpp_camera_state(
+                cam,
+                extrinsics={'rvec': rvec, 'tvec': tvec},
+                intrinsics={'f': f, 'cx': cx, 'cy': cy, 'dist': [k1, k2, 0.0, 0.0, 0.0]},
+                plane_geom={
+                    'pt': np.asarray(wp['plane_pt'], dtype=float).tolist(),
+                    'n': np.asarray(wp['plane_n'], dtype=float).tolist(),
+                },
+                media_props={'n_air': n_air, 'n_window': n_win, 'n_object': n_obj, 'thickness': thick_mm},
+                image_size=(n_row, n_col),
+                solver_opts={'proj_tol': 1e-6, 'proj_nmax': 1000, 'lr': 0.1},
             )
-            CppSyncAdapter.apply({cid: cam}, cid, update_kwargs)
-
-            image_size = base.image_size if hasattr(base, 'image_size') else (800, 1280)
-            pp = cam._pinplate_param
-            pp.n_row, pp.n_col = int(image_size[0]), int(image_size[1])
-            pp.proj_tol = 1e-6
-            pp.proj_nmax = 1000
-            pp.lr = 0.1
-            pp.refract_ratio_max = max(n_obj / n_win, n_obj / n_air, 1.0)
-
-            cam._pinplate_param = pp
-            cam.updatePinPlateParam()
-
-            pp_check = cam._pinplate_param
-            K_check = pp_check.cam_mtx
-            if abs(K_check[0, 2] - cx) > 1e-4:
-                print(f"[CRITICAL WARNING] Cam {cid} C++ Persistence Failed! CX_in={cx}, CX_out={K_check[0,2]}")
 
             cams_cpp[cid] = cam
 
@@ -1182,11 +1166,20 @@ class RefractiveWandCalibrator:
                         wid = cam_to_window.get(cid)
                         uv = dataset['obsA'][v_fid].get(cid)
                         if uv is not None:
-                            r = build_pinplate_ray_cpp(
-                                cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=v_fid, endpoint="A"
+                            rs = build_pinplate_rays_cpp_batch(
+                                cams_cpp[cid],
+                                [uv],
+                                meta_list=[
+                                    {
+                                        "cam_id": cid,
+                                        "window_id": wid,
+                                        "frame_id": v_fid,
+                                        "endpoint": "A",
+                                    }
+                                ],
                             )
-                            if r.valid:
-                                v_rays.append(r)
+                            if rs and rs[0].valid:
+                                v_rays.append(rs[0])
 
                     if len(v_rays) >= 2:
                         v_X_raw, _, _, _ = triangulate_point(v_rays)
@@ -1199,16 +1192,37 @@ class RefractiveWandCalibrator:
 
                 def _tri_all(obs_dict):
                     pts = []
+                    rays_by_fid = {fid: [] for fid in obs_dict.keys()}
+
+                    # Batch by camera across all frames to reduce Python<->C++ calls.
+                    per_cam = {}
                     for fid, cam_obs in obs_dict.items():
-                        rays = []
                         for cid, uv in cam_obs.items():
-                            if cid in cams_cpp:
-                                wid = cam_to_window.get(cid)
-                                r = build_pinplate_ray_cpp(
-                                    cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=fid, endpoint="?"
-                                )
-                                if r.valid:
-                                    rays.append(r)
+                            if cid not in cams_cpp:
+                                continue
+                            per_cam.setdefault(cid, []).append((fid, uv))
+
+                    for cid, items in per_cam.items():
+                        wid = cam_to_window.get(cid)
+                        uv_list = [uv for _, uv in items]
+                        meta_list = [
+                            {
+                                "cam_id": cid,
+                                "window_id": wid,
+                                "frame_id": fid,
+                                "endpoint": "?",
+                            }
+                            for fid, _ in items
+                        ]
+                        rays = build_pinplate_rays_cpp_batch(
+                            cams_cpp[cid], uv_list, meta_list=meta_list
+                        )
+                        for (fid, _), r in zip(items, rays):
+                            if r.valid:
+                                rays_by_fid[fid].append(r)
+
+                    for fid in obs_dict.keys():
+                        rays = rays_by_fid[fid]
                         if len(rays) >= 2:
                             X, _, valid, _ = triangulate_point(rays)
                             if valid:
@@ -1263,11 +1277,20 @@ class RefractiveWandCalibrator:
                         wid = cam_to_window.get(cid)
                         uv = dataset['obsA'][v_fid].get(cid)
                         if uv is not None:
-                            r = build_pinplate_ray_cpp(
-                                cams_cpp[cid], uv, cam_id=cid, window_id=wid, frame_id=v_fid, endpoint="A"
+                            rs = build_pinplate_rays_cpp_batch(
+                                cams_cpp[cid],
+                                [uv],
+                                meta_list=[
+                                    {
+                                        "cam_id": cid,
+                                        "window_id": wid,
+                                        "frame_id": v_fid,
+                                        "endpoint": "A",
+                                    }
+                                ],
                             )
-                            if r.valid:
-                                v_rays_new.append(r)
+                            if rs and rs[0].valid:
+                                v_rays_new.append(rs[0])
 
                     if len(v_rays_new) >= 2:
                         v_X_recalc, _, _, _ = triangulate_point(v_rays_new)
@@ -1317,6 +1340,11 @@ class RefractiveWandCalibrator:
         self.reporter.section("Phase 2/3: Building Labelled Rays (C++ Kernel)")
         print(f"  Using active cameras only: {active_cam_ids}")
 
+        # Batch ray construction by camera and endpoint over all frames.
+        per_cam_A = {}
+        per_cam_B = {}
+        debug_count = 0
+
         for fid in dataset['frames']:
             for cid in active_cam_ids:
                 wid = cam_to_window.get(cid)
@@ -1333,7 +1361,7 @@ class RefractiveWandCalibrator:
 
                 if uvA is not None:
                     total_obs += 1
-                    if self.verbose and total_obs <= 10 and cid in cam_params:
+                    if self.verbose and debug_count < 10 and cid in cam_params:
                         u, v = uvA
                         cp_check = cam_params[cid]
                         f_check = cp_check[6]
@@ -1345,26 +1373,56 @@ class RefractiveWandCalibrator:
                         print(
                             f"  uv_px=({u:.1f},{v:.1f}) -> uv_norm_calc=({u_norm_calc:.4f}, {v_norm_calc:.4f})"
                         )
-
-                    rayA = build_pinplate_ray_cpp(
-                        cam_obj, uvA, cam_id=cid, window_id=wid, frame_id=fid, endpoint="A"
-                    )
-                    if rayA.valid:
-                        rays_db[fid][0].append(rayA)
-                    else:
-                        invalid_obs += 1
-                        invalid_reasons[rayA.reason or "unknown"] = invalid_reasons.get(rayA.reason or "unknown", 0) + 1
+                        debug_count += 1
+                    per_cam_A.setdefault(cid, []).append((fid, wid, uvA))
 
                 if uvB is not None:
                     total_obs += 1
-                    rayB = build_pinplate_ray_cpp(
-                        cam_obj, uvB, cam_id=cid, window_id=wid, frame_id=fid, endpoint="B"
-                    )
-                    if rayB.valid:
-                        rays_db[fid][1].append(rayB)
-                    else:
-                        invalid_obs += 1
-                        invalid_reasons[rayB.reason or "unknown"] = invalid_reasons.get(rayB.reason or "unknown", 0) + 1
+                    per_cam_B.setdefault(cid, []).append((fid, wid, uvB))
+
+        for cid, items in per_cam_A.items():
+            cam_obj = cams_cpp.get(cid)
+            if not cam_obj:
+                continue
+            uv_list = [uv for _, _, uv in items]
+            meta_list = [
+                {
+                    "cam_id": cid,
+                    "window_id": wid,
+                    "frame_id": fid,
+                    "endpoint": "A",
+                }
+                for fid, wid, _ in items
+            ]
+            rays = build_pinplate_rays_cpp_batch(cam_obj, uv_list, meta_list=meta_list)
+            for (fid, _, _), rayA in zip(items, rays):
+                if rayA.valid:
+                    rays_db[fid][0].append(rayA)
+                else:
+                    invalid_obs += 1
+                    invalid_reasons[rayA.reason or "unknown"] = invalid_reasons.get(rayA.reason or "unknown", 0) + 1
+
+        for cid, items in per_cam_B.items():
+            cam_obj = cams_cpp.get(cid)
+            if not cam_obj:
+                continue
+            uv_list = [uv for _, _, uv in items]
+            meta_list = [
+                {
+                    "cam_id": cid,
+                    "window_id": wid,
+                    "frame_id": fid,
+                    "endpoint": "B",
+                }
+                for fid, wid, _ in items
+            ]
+            rays = build_pinplate_rays_cpp_batch(cam_obj, uv_list, meta_list=meta_list)
+            for (fid, _, _), rayB in zip(items, rays):
+                if rayB.valid:
+                    rays_db[fid][1].append(rayB)
+                else:
+                    invalid_obs += 1
+                    invalid_reasons[rayB.reason or "unknown"] = invalid_reasons.get(rayB.reason or "unknown", 0) + 1
 
         print(f"  Total Observations: {total_obs}, Invalid Rays: {invalid_obs}")
         if inactive_cam_ids:
@@ -1784,10 +1842,18 @@ class RefractiveWandCalibrator:
         v_cams_cpp = ba_optimizer.cams_cpp if ba_optimizer else None
 
         if v_cams_cpp:
-            for cam in v_cams_cpp.values():
-                pp = cam._pinplate_param
-                pp.proj_nmax = 10000
-                cam._pinplate_param = pp
+            image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
+            for cid, cam in v_cams_cpp.items():
+                update_kwargs = CppSyncAdapter.build_update_kwargs(
+                    cam_params=cam_params,
+                    window_planes=self.window_planes,
+                    window_media=window_media,
+                    cam_to_window=cam_to_window,
+                    cam_id=cid,
+                )
+                update_kwargs['image_size'] = (int(image_size[0]), int(image_size[1]))
+                update_kwargs['solver_opts'] = {'proj_nmax': 10000}
+                update_cpp_camera_state(cam, **update_kwargs)
 
         if tri_data and cam_params and v_cams_cpp:
             try:
@@ -1823,12 +1889,20 @@ class RefractiveWandCalibrator:
                     obs_map = dataset['obsA' if k == 0 else 'obsB'][v_fid]
                     for cid, uv in obs_map.items():
                         if cid in v_cams_cpp:
-                            r = build_pinplate_ray_cpp(
-                                v_cams_cpp[cid], uv, cam_id=cid, window_id=cam_to_window[cid],
-                                frame_id=v_fid, endpoint=label
+                            rs = build_pinplate_rays_cpp_batch(
+                                v_cams_cpp[cid],
+                                [uv],
+                                meta_list=[
+                                    {
+                                        "cam_id": cid,
+                                        "window_id": cam_to_window[cid],
+                                        "frame_id": v_fid,
+                                        "endpoint": label,
+                                    }
+                                ],
                             )
-                            if r.valid:
-                                v_rays.append(r)
+                            if rs and rs[0].valid:
+                                v_rays.append(rs[0])
 
                     if len(v_rays) >= 2:
                         X_manual, _, _, _ = triangulate_point(v_rays)
@@ -2430,7 +2504,7 @@ class RefractiveWandCalibrator:
                     # [CPP_PROTOCOL] Project A point
                     if XA is not None and cid in obsA:
                         pt_world_A = lpt.Pt3D(float(XA[0]), float(XA[1]), float(XA[2]))
-                        uv_proj_A = cam.project(pt_world_A)
+                        uv_proj_A = _cpp_project(cam, pt_world_A)
                         proj_A = (float(uv_proj_A[0]), float(uv_proj_A[1]))
                         
                         uv_obs_A = obsA[cid]
@@ -2443,7 +2517,7 @@ class RefractiveWandCalibrator:
                     # [CPP_PROTOCOL] Project B point
                     if XB is not None and cid in obsB:
                         pt_world_B = lpt.Pt3D(float(XB[0]), float(XB[1]), float(XB[2]))
-                        uv_proj_B = cam.project(pt_world_B)
+                        uv_proj_B = _cpp_project(cam, pt_world_B)
                         proj_B = (float(uv_proj_B[0]), float(uv_proj_B[1]))
                         
                         uv_obs_B = obsB[cid]

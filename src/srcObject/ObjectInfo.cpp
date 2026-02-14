@@ -1,23 +1,33 @@
 #include "ObjectInfo.h"
 
-bool Object3D::isReconstructable(const std::vector<Camera>& cam_list) 
+#include "Camera.h"
+
+bool Object3D::isReconstructable(
+    const std::vector<std::shared_ptr<Camera>>& camera_models)
 {
     int n_outrange = 0;
-    projectObject2D(cam_list);
+    projectObject2D(camera_models);
 
     double x, y;
-    int n_cam = cam_list.size();
-    for (int i = 0; i < n_cam; i ++)
+    const int n_cam = static_cast<int>(camera_models.size());
+    for (int i = 0; i < n_cam; i++)
     {
+        if (!camera_models[i]) {
+            n_outrange++;
+            if (n_cam - n_outrange < 2)
+            {
+                return false;
+            }
+            continue;
+        }
+
         x = _obj2d_list[i]->_pt_center[0];
         y = _obj2d_list[i]->_pt_center[1];
 
-        if (x < 0 || x >= cam_list[i].getNCol() ||
-            y < 0 || y >= cam_list[i].getNCol())
+        if (x < 0 || x >= camera_models[i]->getNCol() ||
+            y < 0 || y >= camera_models[i]->getNCol())
         {
             n_outrange ++;
-
-            // if less than 2 camera can see it, then it is not reconstructable
             if (n_cam - n_outrange < 2)
             {
                 return false;
@@ -26,49 +36,64 @@ bool Object3D::isReconstructable(const std::vector<Camera>& cam_list)
     }
 
     return true;
-
 }
 
-void Object3D::projectObject2D(std::vector<Camera> const& cam_list)
+void Object3D::projectObject2D(
+    const std::vector<std::shared_ptr<Camera>>& camera_models)
 {
-    int n_cam = cam_list.size(); 
+    const int n_cam = static_cast<int>(camera_models.size());
     _obj2d_list.clear();
-    _obj2d_list.reserve(n_cam); // reserve space for n_cam elements
+    _obj2d_list.reserve(n_cam);
 
     for (int i = 0; i < n_cam; i ++)
     {
-        auto obj2d = create2DObject(); // create a 2D object, this will call the derived class's create2DObject
-        obj2d->_pt_center = cam_list[i].project(_pt_center); // _pt2d_list[i] is a pointer to Object2D
-        _obj2d_list.push_back(std::move(obj2d)); // move the object to the vector
+        auto obj2d = create2DObject();
+        if (!camera_models[i]) {
+            obj2d->_pt_center = Pt2D{-1e10, -1e10};
+            _obj2d_list.push_back(std::move(obj2d));
+            continue;
+        }
+
+        auto proj_status = camera_models[i]->project(_pt_center);
+        if (proj_status) {
+            obj2d->_pt_center = proj_status.value();
+        } else {
+            obj2d->_pt_center = Pt2D{-1e10, -1e10};
+        }
+        _obj2d_list.push_back(std::move(obj2d));
     }
-    // project additional 2D information
-    // for example, bubbles need to project the radius
-    additional2DProjection(cam_list);
+
+    additional2DProjection(camera_models);
 }
 
-void Tracer3D::additional2DProjection(std::vector<Camera> const& cam_list)
+void Tracer3D::additional2DProjection(
+    const std::vector<std::shared_ptr<Camera>>& camera_models)
 {
-    // This function can be overridden by derived classes to add additional 2D projections
-    for (int i = 0; i < _obj2d_list.size(); i ++)
+    (void)camera_models;
+    for (int i = 0; i < static_cast<int>(_obj2d_list.size()); i ++)
     {
-        auto* tr2D = static_cast<Tracer2D*>(_obj2d_list[i].get()); // Check if the pointer is of type Tracer2D
+        auto* tr2D = static_cast<Tracer2D*>(_obj2d_list[i].get());
         if (tr2D)
         {
-            tr2D->_r_px = _r2d_px; // this updates the radius for each 2D tracer
+            tr2D->_r_px = _r2d_px;
         }
 
     }
 }
 
-void Bubble3D::additional2DProjection(std::vector<Camera> const& cam_list)
+void Bubble3D::additional2DProjection(
+    const std::vector<std::shared_ptr<Camera>>& camera_models)
 {
-    // This function can be overridden by derived classes to add additional 2D projections
-    for (int i = 0; i < _obj2d_list.size(); i ++)
+    for (int i = 0; i < static_cast<int>(_obj2d_list.size()); i ++)
     {
-        auto* bb2D = static_cast<Bubble2D*>(_obj2d_list[i].get()); // Check if the pointer is of type Bubble2D
+        auto* bb2D = static_cast<Bubble2D*>(_obj2d_list[i].get());
         if (bb2D)
         {
-            bb2D->_r_px = Bubble::cal2DRadius(cam_list[i], _pt_center, _r3d);
+            if (i < static_cast<int>(camera_models.size()) && camera_models[i]) {
+                bb2D->_r_px = Bubble::cal2DRadius(*camera_models[i], _pt_center, _r3d);
+            } else {
+                bb2D->_r_px = std::numeric_limits<double>::quiet_NaN();
+            }
         }
     }
 }
@@ -150,13 +175,42 @@ namespace {
 constexpr double kJacStepMm = 0.05;
 // Smallest valid local projection gain [px/mm].
 constexpr double kSigmaEps = 1e-12;
-// Camera::project returns very negative sentinel on projection failure.
-constexpr double kProjInvalidCut = -1e300;
-
 bool isValidProjection(const Pt2D& p)
 {
-    return std::isfinite(p[0]) && std::isfinite(p[1]) &&
-           p[0] > kProjInvalidCut && p[1] > kProjInvalidCut;
+    return std::isfinite(p[0]) && std::isfinite(p[1]);
+}
+
+bool extractPinholeData(const Camera& camera_model,
+                        double& fx,
+                        double& fy,
+                        Pt3D& cam_center)
+{
+    switch (camera_model.type()) {
+    case CameraType::Pinhole: {
+        const auto* pinhole = dynamic_cast<const PinholeCamera*>(&camera_model);
+        if (!pinhole) {
+            return false;
+        }
+        const auto& p = pinhole->param();
+        fx = std::abs(p.cam_mtx(0, 0));
+        fy = std::abs(p.cam_mtx(1, 1));
+        cam_center = p.t_vec_inv;
+        return true;
+    }
+    case CameraType::RefractionPinhole: {
+        const auto* pinplate = dynamic_cast<const RefractionPinholeCamera*>(&camera_model);
+        if (!pinplate) {
+            return false;
+        }
+        const auto& p = pinplate->param();
+        fx = std::abs(p.cam_mtx(0, 0));
+        fy = std::abs(p.cam_mtx(1, 1));
+        cam_center = p.t_vec_inv;
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 bool calProjRadiusScale(double& radius_scale, const Camera& cam, const Pt3D& X,
@@ -181,7 +235,11 @@ bool calProjRadiusScale(double& radius_scale, const Camera& cam, const Pt3D& X,
     }
 
     // 1) Baseline projection at X.
-    const Pt2D p0 = cam.project(X);
+    auto p0_status = cam.project(X);
+    if (!p0_status) {
+        return false;
+    }
+    const Pt2D p0 = p0_status.value();
     if (!isValidProjection(p0)) {
         return false;
     }
@@ -196,8 +254,10 @@ bool calProjRadiusScale(double& radius_scale, const Camera& cam, const Pt3D& X,
         Xp[ax] += h;
         Xm[ax] -= h;
 
-        const Pt2D pp = cam.project(Xp);
-        const Pt2D pm = cam.project(Xm);
+        auto pp_status = cam.project(Xp);
+        auto pm_status = cam.project(Xm);
+        const Pt2D pp = pp_status ? pp_status.value() : Pt2D();
+        const Pt2D pm = pm_status ? pm_status.value() : Pt2D();
         const bool vp = isValidProjection(pp);
         const bool vm = isValidProjection(pm);
 
@@ -270,26 +330,24 @@ bool calProjRadiusScale(double& radius_scale, const Camera& cam, const Pt3D& X,
 // Output:
 //   estimated 3D radius R [mm], or NaN if invalid/unsupported.
 double calRadiusFromOneCam(const Camera& cam,
-                           const Pt3D&   X,
-                           double        r_px)
+                           const Pt3D&        X,
+                           double             r_px)
 {
     const double NaN = std::numeric_limits<double>::quiet_NaN();
     if (!(r_px > 0.0)) return NaN;
 
-    switch (cam._type) {
-    case CameraType::PINHOLE:
+    switch (cam.type()) {
+    case CameraType::Pinhole:
     {
-        // --- Access pinhole parameters (pixels intrinsics; C = camera center in world) ---
-        // TODO: adjust accessor to your actual Camera API
-        const double fx = std::abs(cam._pinhole_param.cam_mtx(0, 0));         // pixels
-        const double fy = std::abs(cam._pinhole_param.cam_mtx(1, 1));         // pixels
+        double fx = 0.0, fy = 0.0;
+        Pt3D C;
+        if (!extractPinholeData(cam, fx, fy, C)) {
+            return NaN;
+        }
         if (!(fx > 0.0) || !(fy > 0.0)) return NaN;
 
         // Use geometric mean for generality (handles non-square pixels robustly).
         const double f_px = std::sqrt(fx * fy);
-
-        // Camera center in world coordinates (per your struct: t_vec_inv)
-        const Pt3D& C = cam._pinhole_param.t_vec_inv;               // world units, same as X/R
 
         // Distance d = ||X - C|| (same units as desired R)
         Pt3D dX = X - C;
@@ -304,11 +362,11 @@ double calRadiusFromOneCam(const Camera& cam,
         return d * k / denom;
     }
 
-    case CameraType::POLYNOMIAL:
+    case CameraType::Polynomial:
         // TODO: polynomial — use Jacobian at X: R ≈ r_px / radius_scale(J(X))
         return NaN;
 
-    case CameraType::PINPLATE:
+    case CameraType::RefractionPinhole:
     {
         // Refraction model: use local projection linearization at X.
         // For small bubbles, R ≈ r_px / radius_scale.
@@ -336,26 +394,24 @@ double calRadiusFromOneCam(const Camera& cam,
 // Output:
 //   predicted image radius r_px [px], or NaN if invalid/unsupported.
 double cal2DRadius(const Camera& cam,
-                   const Pt3D&   X,
-                   double        R)
+                   const Pt3D&        X,
+                   double             R)
 {
     const double NaN = std::numeric_limits<double>::quiet_NaN();
     if (!(R > 0.0) || !std::isfinite(R)) return NaN;
 
-    switch (cam._type) {
-    case CameraType::PINHOLE:
+    switch (cam.type()) {
+    case CameraType::Pinhole:
     {
-        // --- Access pinhole parameters (pixel intrinsics; camera center C in world) ---
-        // TODO: adjust accessor to your actual Camera API
-        const double fx = std::abs(cam._pinhole_param.cam_mtx(0, 0));         // pixels
-        const double fy = std::abs(cam._pinhole_param.cam_mtx(1, 1));         // pixels
+        double fx = 0.0, fy = 0.0;
+        Pt3D C;
+        if (!extractPinholeData(cam, fx, fy, C)) {
+            return NaN;
+        }
         if (!(fx > 0.0) || !(fy > 0.0)) return NaN;
 
         // Use geometric mean for generality (handles non-square pixels robustly).
         const double f_px = std::sqrt(fx * fy);
-
-        // Camera center in world coordinates
-        const Pt3D& C = cam._pinhole_param.t_vec_inv;
 
         // Distance from camera to bubble center
         const double d = (X - C).norm();
@@ -371,11 +427,11 @@ double cal2DRadius(const Camera& cam,
         return std::isfinite(r_px) ? r_px : NaN;
     }
 
-    case CameraType::POLYNOMIAL:
+    case CameraType::Polynomial:
         // TODO: polynomial — use local Jacobian at X: r_px ≈ radius_scale(J(X)) * R
         return NaN;
 
-    case CameraType::PINPLATE:
+    case CameraType::RefractionPinhole:
     {
         // Refraction model: use local projection linearization at X.
         // For small bubbles, r_px ≈ radius_scale * R.
@@ -403,20 +459,24 @@ double cal2DRadius(const Camera& cam,
 //     call calRadiusFromOneCam(cam_i, X, r_px), and collect valid R_i.
 //   - Aggregate R_i with the median (robust).
 // Returns NaN if no usable views.
-double calRadiusFromCams(const std::vector<Camera>&                     cams,
-                         const Pt3D&                                    X,
-                         const std::vector<std::unique_ptr<Object2D>>&  obj2d_list)
+double calRadiusFromCams(
+    const std::vector<std::shared_ptr<Camera>>& camera_models,
+    const Pt3D& X,
+    const std::vector<std::unique_ptr<Object2D>>& obj2d_list)
 {
     const double NaN = std::numeric_limits<double>::quiet_NaN();
 
-    if (cams.empty() || cams.size() != obj2d_list.size())
+    if (camera_models.empty() || camera_models.size() != obj2d_list.size())
         return NaN;
 
     std::vector<double> Rs;
-    Rs.reserve(cams.size());
+    Rs.reserve(camera_models.size());
 
-    for (size_t i = 0; i < cams.size(); ++i) {
-        const Camera&   cam  = cams[i];
+    for (size_t i = 0; i < camera_models.size(); ++i) {
+        const auto& cam = camera_models[i];
+        if (!cam) {
+            continue;
+        }
         const Object2D* base = obj2d_list[i].get();
         if (!base) continue; // no camera or no 2D for this view
 
@@ -425,7 +485,7 @@ double calRadiusFromCams(const std::vector<Camera>&                     cams,
         const double r_px = bb->_r_px;    
         if (!(r_px > 0.0) || !std::isfinite(r_px)) continue;
 
-        const double Ri = calRadiusFromOneCam(cam, X, r_px); // dispatches by cam._type
+        const double Ri = calRadiusFromOneCam(*cam, X, r_px);
         if (std::isfinite(Ri) && (Ri > 0.0)) {
             Rs.push_back(Ri);
         }
@@ -450,10 +510,10 @@ double calRadiusFromCams(const std::vector<Camera>&                     cams,
 // Policy: if fewer than 2 usable views → return true (permissive).
 // Dynamic threshold is derived from tol_2d/tol_3d via RMS combination.
 bool checkRadiusConsistency(const Pt3D&                          X,
-                            const std::vector<const Camera*>&    cams,
+                            const std::vector<const Camera*>& cams,
                             const std::vector<const Object2D*>&  obj2d_by_cam,
-                            double                               tol_2d_px,  // <=0 to disable
-                            double                               tol_3d)     // <=0 to disable
+                            double                               tol_2d_px,
+                            double                               tol_3d)
 {
     if (cams.empty() || cams.size() != obj2d_by_cam.size())
         return true; // permissive on size mismatch
@@ -467,7 +527,7 @@ bool checkRadiusConsistency(const Pt3D&                          X,
     bool   eps_has_data = false;
 
     for (size_t i = 0; i < cams.size(); ++i) {
-        const Camera*   cam  = cams[i];
+        const Camera* cam = cams[i];
         const Object2D* base = obj2d_by_cam[i];
         if (!cam || !base) continue;
 
@@ -484,13 +544,15 @@ bool checkRadiusConsistency(const Pt3D&                          X,
             ++n_ok;
 
             // --- Build dynamic threshold contributions (PINHOLE only for now) ---
-            if (cam->_type == CameraType::PINHOLE) {
-                // Access intrinsics (pixels) and camera center in world
-                const double fx = cam->_pinhole_param.cam_mtx(0,0);
-                const double fy = cam->_pinhole_param.cam_mtx(1,1);
+            if (cam->type() == CameraType::Pinhole) {
+                double fx = 0.0, fy = 0.0;
+                Pt3D C;
+                if (!extractPinholeData(*cam, fx, fy, C)) {
+                    continue;
+                }
                 if (fx > 0.0 && fy > 0.0) {
                     const double f_px = std::sqrt(fx * fy); // or use fx if that's your convention
-                    const double d_i  = (X - cam->_pinhole_param.t_vec_inv).norm();
+                    const double d_i  = (X - C).norm();
                     if (std::isfinite(d_i) && d_i > 0.0) {
                         const double k = r_px / f_px;
 
@@ -536,6 +598,4 @@ bool checkRadiusConsistency(const Pt3D&                          X,
     return (spread <= max_spread);
 }
 
-
-
-} // namespace bubble
+} // namespace Bubble

@@ -80,7 +80,8 @@ int run_openlpt(const std::string &config_path) {
     // --- Prepare image IO ---
     if (basic_settings._cam_list.size() !=
         basic_settings._image_file_paths.size()) {
-      std::cerr << "Error: #cams (" << basic_settings._cam_list.size()
+      std::cerr << "Error: #cam_list ("
+                << basic_settings._cam_list.size()
                 << ") != #image paths ("
                 << basic_settings._image_file_paths.size() << ")\n";
       return EXIT_FAILURE;

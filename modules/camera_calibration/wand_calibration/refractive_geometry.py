@@ -64,6 +64,56 @@ _RAY_STATS = {
     "reasons": {}
 }
 
+_CAMERA_UPDATE_STATS = {
+    "total": 0,
+    "success": 0,
+    "failed": 0,
+    "reasons": {}
+}
+
+
+def reset_camera_update_stats():
+    global _CAMERA_UPDATE_STATS
+    _CAMERA_UPDATE_STATS = {
+        "total": 0,
+        "success": 0,
+        "failed": 0,
+        "reasons": {}
+    }
+
+
+def get_camera_update_stats() -> dict:
+    return {
+        "total": _CAMERA_UPDATE_STATS["total"],
+        "success": _CAMERA_UPDATE_STATS["success"],
+        "failed": _CAMERA_UPDATE_STATS["failed"],
+        "reasons": dict(_CAMERA_UPDATE_STATS["reasons"]),
+    }
+
+
+def print_camera_update_report(tag: str = "Summary"):
+    stats = _CAMERA_UPDATE_STATS
+    if stats["total"] == 0:
+        return
+    print(f"\n[{tag}] Camera Update Path Report:")
+    print(f"  Total Calls      : {stats['total']:,}")
+    print(f"  Success          : {stats['success']:,}")
+    print(f"  Failed           : {stats['failed']:,}")
+    if stats["reasons"]:
+        print("  Failure Reasons:")
+        for r, count in sorted(stats["reasons"].items(), key=lambda x: x[1], reverse=True):
+            print(f"    - {r:<30}: {count:,}")
+
+
+def _record_camera_update(success: bool, reason: Optional[str] = None):
+    _CAMERA_UPDATE_STATS["total"] += 1
+    if success:
+        _CAMERA_UPDATE_STATS["success"] += 1
+        return
+    _CAMERA_UPDATE_STATS["failed"] += 1
+    if reason:
+        _CAMERA_UPDATE_STATS["reasons"][reason] = _CAMERA_UPDATE_STATS["reasons"].get(reason, 0) + 1
+
 def enable_ray_tracking(enabled: bool = True, reset: bool = True):
     """Enable or disable global ray statistics tracking."""
     global _RAY_TRACKING_ENABLED
@@ -112,12 +162,20 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
     import pyopenlpt as lpt
     
     u, v = float(uv[0]), float(uv[1])
+
+    def _line_of_sight(c, pt2):
+        if not hasattr(c, "lineOfSightStatus"):
+            raise RuntimeError("lineOfSightStatus is required in hard migration mode")
+        ok, line, err = c.lineOfSightStatus(pt2)
+        if not ok:
+            raise RuntimeError(f"lineOfSightStatus failed: {err}")
+        return line
     
     res = None
     try:
         # Use lineOfSight which accepts pixel coordinates directly
         # It calls undistort() internally, then passes to pinplateLine()
-        line = cam.lineOfSight(lpt.Pt2D(u, v))
+        line = _line_of_sight(cam, lpt.Pt2D(u, v))
         o, d = _extract_line3d(line)
         
         if np.all(np.isfinite(o)) and np.all(np.isfinite(d)):
@@ -126,26 +184,16 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
             
             d_norm = normalize(d)
             
-            try:
-                # Retrieve window normal for grazing check
-                pp = cam._pinplate_param
-                nv = pp.plane.norm_vector
-                n_win = np.array([nv[0], nv[1], nv[2]])
-                n_win = normalize(n_win)
-                cos_theta = np.dot(d_norm, n_win)
-                
-                if cos_theta <= 0.0:
-                    res = Ray(o=o, d=d_norm, valid=False, reason=f"backward_vs_window_normal={cos_theta:.4f}", 
-                                 cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
-                elif abs(cos_theta) < 0.1:
-                      res = Ray(o=o, d=d_norm, valid=False, reason=f"grazing_ray_cos={cos_theta:.4f}", 
-                                 cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
-                else:
-                      res = Ray(o=o, d=d_norm, valid=True, cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
-
-            except Exception as e:
-                # Fallback if normal access fails
-                res = Ray(o=o, d=d_norm, valid=True, cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+            res = Ray(
+                o=o,
+                d=d_norm,
+                valid=True,
+                cam_id=cam_id,
+                window_id=window_id,
+                frame_id=frame_id,
+                endpoint=endpoint,
+                uv=(u, v),
+            )
         else:
             res = Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason="non_finite_outputs", 
                        cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
@@ -175,6 +223,121 @@ def build_pinplate_ray_cpp(cam, uv, *, cam_id=-1, window_id=-1, frame_id=-1, end
     # Fallback
     return Ray(o=np.zeros(3), d=np.array([0, 0, 1.0]), valid=False, reason="extraction_failed", 
                cam_id=cam_id, window_id=window_id, frame_id=frame_id, endpoint=endpoint, uv=(u, v))
+
+
+def build_pinplate_rays_cpp_batch(cam, uv_list, *, meta_list=None) -> list:
+    """
+    Build object-side refracted rays in batch using C++ lineOfSightBatchStatus.
+
+    Args:
+        cam: pyopenlpt Camera object
+        uv_list: list of (u, v) pixel coordinates
+        meta_list: optional list of dicts with keys cam_id/window_id/frame_id/endpoint
+
+    Returns:
+        list[Ray] in the same order as uv_list
+    """
+    global _PROBE_LOGGED
+    import pyopenlpt as lpt
+
+    if not uv_list:
+        return []
+
+    if meta_list is None:
+        meta_list = [{} for _ in uv_list]
+
+    # Fallback path for old pyopenlpt builds.
+    if not hasattr(cam, "lineOfSightBatchStatus"):
+        out = []
+        for uv, meta in zip(uv_list, meta_list):
+            out.append(
+                build_pinplate_ray_cpp(
+                    cam,
+                    uv,
+                    cam_id=int(meta.get("cam_id", -1)),
+                    window_id=int(meta.get("window_id", -1)),
+                    frame_id=int(meta.get("frame_id", -1)),
+                    endpoint=str(meta.get("endpoint", "")),
+                )
+            )
+        return out
+
+    pt2_list = [lpt.Pt2D(float(uv[0]), float(uv[1])) for uv in uv_list]
+    batch = cam.lineOfSightBatchStatus(pt2_list)
+
+    rays = []
+    for idx, (ok, line, err) in enumerate(batch):
+        uv = uv_list[idx]
+        u, v = float(uv[0]), float(uv[1])
+        meta = meta_list[idx]
+        cam_id = int(meta.get("cam_id", -1))
+        window_id = int(meta.get("window_id", -1))
+        frame_id = int(meta.get("frame_id", -1))
+        endpoint = str(meta.get("endpoint", ""))
+
+        res = None
+        try:
+            if not ok:
+                raise RuntimeError(err)
+
+            o, d = _extract_line3d(line)
+            if np.all(np.isfinite(o)) and np.all(np.isfinite(d)):
+                d_norm = normalize(d)
+                if not _PROBE_LOGGED:
+                    _PROBE_LOGGED = True
+
+                res = Ray(
+                    o=o,
+                    d=d_norm,
+                    valid=True,
+                    cam_id=cam_id,
+                    window_id=window_id,
+                    frame_id=frame_id,
+                    endpoint=endpoint,
+                    uv=(u, v),
+                )
+            else:
+                res = Ray(
+                    o=np.zeros(3),
+                    d=np.array([0, 0, 1.0]),
+                    valid=False,
+                    reason="non_finite_outputs",
+                    cam_id=cam_id,
+                    window_id=window_id,
+                    frame_id=frame_id,
+                    endpoint=endpoint,
+                    uv=(u, v),
+                )
+        except Exception as e:
+            reason = f"C++ lineOfSight failed: {str(e)}"
+            if "total internal reflection" in reason.lower():
+                reason = "total_internal_reflection"
+            res = Ray(
+                o=np.zeros(3),
+                d=np.array([0, 0, 1.0]),
+                valid=False,
+                reason=reason,
+                cam_id=cam_id,
+                window_id=window_id,
+                frame_id=frame_id,
+                endpoint=endpoint,
+                uv=(u, v),
+            )
+
+        if _RAY_TRACKING_ENABLED and res is not None:
+            _RAY_STATS["total"] += 1
+            if res.valid:
+                _RAY_STATS["valid"] += 1
+            else:
+                _RAY_STATS["invalid"] += 1
+                r = res.reason or "unknown"
+                if "=" in r:
+                    r = r.split("=")[0]
+                _RAY_STATS["reasons"][r] = _RAY_STATS["reasons"].get(r, 0) + 1
+
+        rays.append(res)
+
+    return rays
 
 def triangulate_point(rays_list: list) -> Tuple[np.ndarray, float, bool, str]:
     """
@@ -628,7 +791,9 @@ def update_cpp_camera_state(cam_obj,
                             extrinsics: Optional[dict] = None,
                             intrinsics: Optional[dict] = None,
                             plane_geom: Optional[dict] = None,
-                            media_props: Optional[dict] = None) -> None:
+                            media_props: Optional[dict] = None,
+                            image_size: Optional[Tuple[int, int]] = None,
+                            solver_opts: Optional[dict] = None) -> None:
     """
     Unified function to update C++ Camera parameters (PinPlate model).
     
@@ -650,129 +815,88 @@ def update_cpp_camera_state(cam_obj,
         import pyopenlpt as lpt
     except ImportError:
         return # Cannot update if lpt not available
-        
-    # Python-side binding usually exposes a copy of the struct
-    pp = cam_obj._pinplate_param
-    
-    # --- 1. Intrinsics ---
-    if intrinsics:
-        # Create fresh K matrix
-        K = lpt.MatrixDouble(3, 3, 0.0)
-        
-        # Use existing as default
-        current_K = pp.cam_mtx
-        fx = intrinsics.get('f', current_K[0, 0])
-        fy = intrinsics.get('f', current_K[1, 1]) # Assume fx=fy if 'f' passed
-        cx = intrinsics.get('cx', current_K[0, 2])
-        cy = intrinsics.get('cy', current_K[1, 2])
-        
-        K[0, 0] = float(fx)
-        K[1, 1] = float(fy)
-        K[0, 2] = float(cx)
-        K[1, 2] = float(cy)
-        K[2, 2] = 1.0
-        pp.cam_mtx = K
-        
-        # Distortion
-        if 'dist' in intrinsics and intrinsics['dist'] is not None:
-             d = intrinsics['dist']
-             pp.dist_coeff = [float(x) for x in d]
-             pp.n_dist_coeff = len(d)
-             pp.is_distorted = any(abs(x) > 1e-9 for x in d)
 
-    # --- 2. Extrinsics ---
-    if extrinsics:
-        # Support partial updates by reading current state if needed
-        # Note: We need both R and T to recompute inverses correctly.
-        
-        has_r = 'rvec' in extrinsics
-        has_t = 'tvec' in extrinsics
-        
-        if not has_r and not has_t:
-            pass # No extrinsics to update
+    required_methods = (
+        'setPinplateImageSize',
+        'setPinplateIntrinsics',
+        'setPinplateExtrinsics',
+        'setPinplateRefraction',
+        'commitPinplateUpdate',
+    )
+    missing = [name for name in required_methods if not hasattr(cam_obj, name)]
+    if missing:
+        _record_camera_update(success=False, reason="missing_grouped_api")
+        raise RuntimeError("Hard migration mode requires grouped camera API: missing " + ", ".join(missing))
+
+    try:
+        if image_size is not None:
+            n_row, n_col = int(image_size[0]), int(image_size[1])
         else:
-            # Get current values
-            current_R_lpt = pp.r_mtx
-            current_t_lpt = pp.t_vec
-            
-            # Resolve R
-            if has_r:
-                rvec = extrinsics['rvec']
-                R_np = rodrigues_to_R(rvec)
-            else:
-                # Reconstruct numpy R from MatrixDouble
-                R_np = np.zeros((3, 3))
-                for i in range(3):
-                    for j in range(3):
-                        R_np[i, j] = current_R_lpt[i, j]
-            
-            # Resolve T
-            if has_t:
-                tvec = extrinsics['tvec']
-                t_np = np.asarray(tvec).flatten()
-            else:
-                 t_np = np.array([current_t_lpt[0], current_t_lpt[1], current_t_lpt[2]])
-            
-            # Update Forward
-            R_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            for i in range(3):
-                for j in range(3):
-                     R_lpt[i, j] = float(R_np[i, j])
-            
-            pp.r_mtx = R_lpt
-            pp.t_vec = lpt.Pt3D(float(t_np[0]), float(t_np[1]), float(t_np[2]))
-            
-            # Update Inverse (Always recompute based on final R, T)
-            R_inv_np = R_np.T
-            t_inv_np = -R_inv_np @ t_np
-            
-            R_inv_lpt = lpt.MatrixDouble(3, 3, 0.0)
-            for i in range(3):
-                for j in range(3):
-                     R_inv_lpt[i, j] = float(R_inv_np[i, j])
-                     
-            pp.r_mtx_inv = R_inv_lpt
-            pp.t_vec_inv = lpt.Pt3D(float(t_inv_np[0]), float(t_inv_np[1]), float(t_inv_np[2]))
+            try:
+                n_row = int(cam_obj.getNRow())
+                n_col = int(cam_obj.getNCol())
+            except Exception:
+                n_row, n_col = 800, 1280
+            if n_row <= 0 or n_col <= 0:
+                n_row, n_col = 800, 1280
 
-    # --- 3. Media & Thickness ---
-    current_thick = 0.0
-    if pp.w_array and len(pp.w_array) > 0:
-        current_thick = pp.w_array[0]
-        
-    if media_props:
-        # Update refractive indices if provided
-        n1 = media_props.get('n1', media_props.get('n_air'))
-        n2 = media_props.get('n2', media_props.get('n_window', media_props.get('n_glass')))
-        n3 = media_props.get('n3', media_props.get('n_object', media_props.get('n_medium')))
-        
-        if n1 is not None and n2 is not None and n3 is not None:
-             # Convention: [n_obj, n_win, n_air] (Farthest -> Nearest)
-             pp.refract_array = [float(n3), float(n2), float(n1)]
-        
-        if 'thickness' in media_props:
-            current_thick = float(media_props['thickness'])
-            pp.w_array = [current_thick]
-            pp.n_plate = len(pp.w_array)
+        if intrinsics is None:
+            intrinsics = {}
+        fx = float(intrinsics.get('f', 1.0))
+        fy = float(intrinsics.get('f', 1.0))
+        cx = float(intrinsics.get('cx', 0.0))
+        cy = float(intrinsics.get('cy', 0.0))
+        if ('dist' in intrinsics) and (intrinsics['dist'] is not None):
+            dist_coeff = [float(x) for x in intrinsics['dist']]
+        else:
+            dist_coeff = [0.0, 0.0, 0.0, 0.0, 0.0]
 
-    # --- 4. Plane Geometry (Coordinate Shift) ---
-    if plane_geom:
-        pt = np.asarray(plane_geom['pt']).flatten()
-        plane_normal = np.asarray(plane_geom['n']).flatten()
-        
-        # [CRITICAL] Coordinate Alignment: Shift to Farthest Interface
-        # C++ model wants point on Farthest interface
-        # Python tracks Closest interface (or interface point)
-        p_farthest = pt + plane_normal * current_thick
-        
-        pl_struct = pp.plane
-        pl_struct.pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
-        pl_struct.norm_vector = lpt.Pt3D(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2]))
-        
-        pp.plane = pl_struct
-        
-    # --- 5. Commit and Refresh ---
-    cam_obj._pinplate_param = pp
-    # cam_obj.updatePt3dClosest()
-    cam_obj.updatePinPlateParam()
+        if extrinsics is None:
+            extrinsics = {}
+        rvec_np = np.asarray(extrinsics.get('rvec', [0.0, 0.0, 0.0]), dtype=float).flatten()
+        tvec_np = np.asarray(extrinsics.get('tvec', [0.0, 0.0, 0.0]), dtype=float).flatten()
+        rvec = lpt.Pt3D(float(rvec_np[0]), float(rvec_np[1]), float(rvec_np[2]))
+        tvec = lpt.Pt3D(float(tvec_np[0]), float(tvec_np[1]), float(tvec_np[2]))
+
+        if media_props is None:
+            media_props = {}
+        current_thick = float(media_props.get('thickness', 10.0))
+        n1 = media_props.get('n1', media_props.get('n_air', 1.0))
+        n2 = media_props.get('n2', media_props.get('n_window', media_props.get('n_glass', 1.49)))
+        n3 = media_props.get('n3', media_props.get('n_object', media_props.get('n_medium', 1.33)))
+        refract_array = [float(n3), float(n2), float(n1)]
+        w_array = [current_thick]
+
+        proj_tol = 1e-6
+        proj_nmax = 1000
+        lr = 0.1
+        if solver_opts:
+            proj_tol = float(solver_opts.get('proj_tol', proj_tol))
+            proj_nmax = int(solver_opts.get('proj_nmax', proj_nmax))
+            lr = float(solver_opts.get('lr', lr))
+
+        if plane_geom is None:
+            plane_pt_np = np.array([0.0, 0.0, 0.0], dtype=float)
+            plane_normal = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            plane_pt_np = np.asarray(plane_geom.get('pt', [0.0, 0.0, 0.0]), dtype=float).flatten()
+            plane_normal = np.asarray(plane_geom.get('n', [0.0, 0.0, 1.0]), dtype=float).flatten()
+
+        # Python-side plane point is at the closest interface; C++ pinplate expects farthest interface.
+        p_farthest = plane_pt_np + plane_normal * current_thick
+        plane_pt = lpt.Pt3D(float(p_farthest[0]), float(p_farthest[1]), float(p_farthest[2]))
+        plane_n = lpt.Pt3D(float(plane_normal[0]), float(plane_normal[1]), float(plane_normal[2]))
+
+        cam_obj.setPinplateImageSize(n_row, n_col)
+        cam_obj.setPinplateIntrinsics(fx, fy, cx, cy, dist_coeff)
+        cam_obj.setPinplateExtrinsics(rvec, tvec)
+        cam_obj.setPinplateRefraction(plane_pt, plane_n, refract_array, w_array,
+                                      proj_tol, proj_nmax, lr)
+        cam_obj.commitPinplateUpdate(bool(getattr(cam_obj, '_is_active', True)),
+                                     float(getattr(cam_obj, '_max_intensity', 255.0)))
+        _record_camera_update(success=True)
+    except Exception as exc:
+        _record_camera_update(success=False, reason="grouped_update_failed")
+        raise RuntimeError(f"update_cpp_camera_state failed in hard migration mode: {exc}") from exc
 
 

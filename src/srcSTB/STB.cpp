@@ -90,8 +90,7 @@ void STB::processFrame(int frame_id, std::vector<Image> &img_list) {
 
 void STB::runInitPhase(int frame, std::vector<Image> &img_list) {
 
-  std::vector<Camera> &cam_list = _basic_setting._cam_list;
-  IPR ipr(cam_list);
+  IPR ipr(_basic_setting._cam_list);
   // IPR
   std::vector<std::unique_ptr<Object3D>> obj3d_list =
       ipr.runIPR(*_obj_config, img_list);

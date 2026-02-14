@@ -39,10 +39,11 @@ except ImportError:
     lpt = None
 
 from .refractive_geometry import (
-    Ray, build_pinplate_ray_cpp, triangulate_point, point_to_ray_dist,
+    Ray, build_pinplate_rays_cpp_batch, triangulate_point, point_to_ray_dist,
     update_normal_tangent, camera_center, angle_between_vectors,
     update_cpp_camera_state,
-    enable_ray_tracking, reset_ray_stats, print_ray_stats_report
+    enable_ray_tracking, reset_ray_stats, print_ray_stats_report,
+    reset_camera_update_stats, print_camera_update_report
 )
 
 
@@ -318,6 +319,65 @@ class RefractiveBAOptimizer:
     def _build_obs_cache(self):
         """Build observation cache from dataset."""
         self.obs_cache = ObsCacheBuilder.build(self.dataset, self.active_cam_ids)
+
+    def _make_invalid_ray(self, cam_id: int, frame_id: int, endpoint: str, reason: str = "missing_cam", uv=None) -> Ray:
+        """Create a consistent invalid ray placeholder for missing/failed paths."""
+        if uv is None:
+            uv = (np.nan, np.nan)
+        return Ray(
+            o=np.zeros(3),
+            d=np.array([0, 0, 1.0]),
+            valid=False,
+            reason=reason,
+            cam_id=cam_id,
+            window_id=self.cam_to_window.get(cam_id, -1),
+            frame_id=frame_id,
+            endpoint=endpoint,
+            uv=(float(uv[0]), float(uv[1])),
+        )
+
+    def _build_batched_ray_lookup(self, per_cam_items: Dict[int, List[Tuple[int, np.ndarray]]], endpoint: str) -> Dict[Tuple[int, int], Ray]:
+        """
+        Batch-build rays grouped by camera.
+
+        Args:
+            per_cam_items: {cam_id: [(frame_id, uv_px), ...]}
+            endpoint: endpoint label used for diagnostics metadata
+
+        Returns:
+            Dict[(frame_id, cam_id)] -> Ray
+        """
+        ray_lookup: Dict[Tuple[int, int], Ray] = {}
+
+        for cam_id, items in per_cam_items.items():
+            cam_obj = self.cams_cpp.get(cam_id)
+            if cam_obj is None:
+                for frame_id, uv in items:
+                    ray_lookup[(frame_id, cam_id)] = self._make_invalid_ray(
+                        cam_id=cam_id,
+                        frame_id=frame_id,
+                        endpoint=endpoint,
+                        reason="missing_cam",
+                        uv=uv,
+                    )
+                continue
+
+            uv_list = [uv for _, uv in items]
+            meta_list = [
+                {
+                    "cam_id": cam_id,
+                    "window_id": self.cam_to_window.get(cam_id, -1),
+                    "frame_id": frame_id,
+                    "endpoint": endpoint,
+                }
+                for frame_id, _ in items
+            ]
+            rays = build_pinplate_rays_cpp_batch(cam_obj, uv_list, meta_list=meta_list)
+
+            for (frame_id, _), ray in zip(items, rays):
+                ray_lookup[(frame_id, cam_id)] = ray
+
+        return ray_lookup
     
 
     def _compute_physical_sigmas(self):
@@ -329,15 +389,24 @@ class RefractiveBAOptimizer:
         
         sample_dists = []
         fids_to_sample = self.fids_optim[::max(1, len(self.fids_optim) // 100)]
+
+        # Batch-build endpoint A rays once per camera for sampled frames.
+        per_cam_items_A: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        for fid in fids_to_sample:
+            obs = self.dataset['obsA'].get(fid, {})
+            for cid, uv in obs.items():
+                per_cam_items_A.setdefault(cid, []).append((fid, uv))
+        ray_lookup_A = self._build_batched_ray_lookup(per_cam_items_A, endpoint="A")
+
         for fid in fids_to_sample:
             # Reconstruct centers
             obs = self.dataset['obsA'].get(fid, {})
             cids = sorted(obs.keys())
             rays = []
             for cid in cids:
-                if cid in self.cams_cpp:
-                    r = build_pinplate_ray_cpp(self.cams_cpp[cid], obs[cid])
-                    if r.valid: rays.append(r)
+                r = ray_lookup_A.get((fid, cid))
+                if r is not None and r.valid:
+                    rays.append(r)
             if len(rays) >= 2:
                 X, _, ok, _ = triangulate_point(rays)
                 if ok:
@@ -445,6 +514,21 @@ class RefractiveBAOptimizer:
         explicit_ok = 0
         fallback_used = 0
         fallback_ok = 0
+
+        # Batch-build all rays up front, grouped by camera (largest runtime hotspot).
+        per_cam_items_A: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        per_cam_items_B: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        for fid in self.fids_optim:
+            obs_A_f = self.dataset['obsA'].get(fid, {})
+            for cid, uv in obs_A_f.items():
+                per_cam_items_A.setdefault(cid, []).append((fid, uv))
+
+            obs_B_f = self.dataset['obsB'].get(fid, {})
+            for cid, uv in obs_B_f.items():
+                per_cam_items_B.setdefault(cid, []).append((fid, uv))
+
+        ray_lookup_A = self._build_batched_ray_lookup(per_cam_items_A, endpoint="A")
+        ray_lookup_B = self._build_batched_ray_lookup(per_cam_items_B, endpoint="B")
         
         radius_A = self.dataset.get('est_radius_small_mm', 0.0)
         radius_B = self.dataset.get('est_radius_large_mm', 0.0)
@@ -461,15 +545,10 @@ class RefractiveBAOptimizer:
             cids_A = sorted(obs_A.keys())
             rays_A_all = []
             for cid in cids_A:
-                cam_obj = self.cams_cpp.get(cid)
-                if cam_obj:
-                    r = build_pinplate_ray_cpp(cam_obj, obs_A[cid], cam_id=cid, 
-                                               window_id=self.cam_to_window.get(cid, -1), 
-                                               frame_id=fid, endpoint="A")
-                    rays_A_all.append(r)
-                else:
-                    # Fallback for missing camera object
-                    rays_A_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
+                r = ray_lookup_A.get((fid, cid))
+                if r is None:
+                    r = self._make_invalid_ray(cam_id=cid, frame_id=fid, endpoint="A", reason="missing_ray", uv=obs_A[cid])
+                rays_A_all.append(r)
 
             XA_explicit, okA, _ = self._compute_explicit_point(rays_A_all)
 
@@ -523,14 +602,10 @@ class RefractiveBAOptimizer:
             cids_B = sorted(obs_B.keys())
             rays_B_all = []
             for cid in cids_B:
-                cam_obj = self.cams_cpp.get(cid)
-                if cam_obj:
-                    r = build_pinplate_ray_cpp(cam_obj, obs_B[cid], cam_id=cid, 
-                                               window_id=self.cam_to_window.get(cid, -1), 
-                                               frame_id=fid, endpoint="B")
-                    rays_B_all.append(r)
-                else:
-                    rays_B_all.append(Ray(o=np.zeros(3), d=np.array([0,0,1]), valid=False, reason="missing_cam", cam_id=cid))
+                r = ray_lookup_B.get((fid, cid))
+                if r is None:
+                    r = self._make_invalid_ray(cam_id=cid, frame_id=fid, endpoint="B", reason="missing_ray", uv=obs_B[cid])
+                rays_B_all.append(r)
 
             XB_explicit, okB, _ = self._compute_explicit_point(rays_B_all)
 
@@ -1240,8 +1315,29 @@ class RefractiveBAOptimizer:
         # Iterate cache (subset for speed?)
         fids = sorted(list(self.obs_cache.keys()))
         step = max(1, len(fids) // 2000) # Check up to 2000 frames
+
+        selected_fids = fids[::step]
+
+        # Pre-batch rays from OTHER cameras for both endpoints on selected frames.
+        per_cam_items_A: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        per_cam_items_B: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        for fid in selected_fids:
+            obs = self.obs_cache[fid]
+            if cid not in obs:
+                continue
+
+            for other_cid, (o_uvA, o_uvB) in obs.items():
+                if other_cid == cid:
+                    continue
+                if o_uvA is not None:
+                    per_cam_items_A.setdefault(other_cid, []).append((fid, o_uvA))
+                if o_uvB is not None:
+                    per_cam_items_B.setdefault(other_cid, []).append((fid, o_uvB))
+
+        ray_lookup_A = self._build_batched_ray_lookup(per_cam_items_A, endpoint="A")
+        ray_lookup_B = self._build_batched_ray_lookup(per_cam_items_B, endpoint="B")
         
-        for fid in fids[::step]:
+        for fid in selected_fids:
             obs = self.obs_cache[fid]
             if cid not in obs: continue
             
@@ -1257,13 +1353,16 @@ class RefractiveBAOptimizer:
                     if other_cid == cid: continue
                     val = o_uvA if endpoint == 'A' else o_uvB
                     if val is not None:
-                        # Build ray
-                        r = build_pinplate_ray_cpp(
-                            self.cams_cpp[other_cid], val, 
-                            cam_id=other_cid, 
-                            window_id=self.cam_to_window.get(other_cid, -1),
-                            frame_id=fid, endpoint=endpoint
-                        )
+                        lookup = ray_lookup_A if endpoint == 'A' else ray_lookup_B
+                        r = lookup.get((fid, other_cid))
+                        if r is None:
+                            r = self._make_invalid_ray(
+                                cam_id=other_cid,
+                                frame_id=fid,
+                                endpoint=endpoint,
+                                reason="missing_ray",
+                                uv=val,
+                            )
                         if r.valid:
                             rays_other.append(r)
                 
@@ -1457,6 +1556,7 @@ class RefractiveBAOptimizer:
         self._weak_window_refs = {}
         
         enable_ray_tracking(True, reset=True)
+        reset_camera_update_stats()
         self.reporter.section(f"Bundle Adjustment Start ({len(self.active_cam_ids)} cameras, {len(self.window_ids)} windows)")
         for wid, pl in sorted(self.window_planes.items()):
             pt = pl['plane_pt']
@@ -1648,6 +1748,7 @@ class RefractiveBAOptimizer:
         self.print_diagnostics()
         self.reporter.section("Bundle Adjustment Complete")
         print_ray_stats_report("Bundle")
+        print_camera_update_report("Bundle")
         enable_ray_tracking(False)
         
         return self.window_planes, self.cam_params
