@@ -1437,6 +1437,7 @@ class CameraCalibrationView(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load points:\n{msg}")
     def __init__(self):
         super().__init__()
+        self._busy_tokens = {}
         
         # Style Constants
         self.GROUP_BOX_STYLE = """
@@ -1458,6 +1459,21 @@ class CameraCalibrationView(QWidget):
         self.INDEXING_BTN_STYLE = "background-color: #2a2a2a; border: 1px solid #555; color: #fff; padding: 6px; font-weight: bold;"
         
         self.setup_ui()
+
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
 
     def setup_ui(self):
         # Initialize data structures
@@ -2815,6 +2831,7 @@ class CameraCalibrationView(QWidget):
         1. Fix intrinsics, solve for extrinsics (Pose) via PnP.
         2. Refine both intrinsics (f, cx, cy) and extrinsics via calibrateCamera.
         """
+        self._busy_begin('plate_calibration', 'Running plate calibration')
         target_cam_idx = self.cal_target_cam_combo.currentIndex()
         print(f"Running Plate Calibration for Camera {target_cam_idx+1}...")
         
@@ -2827,6 +2844,7 @@ class CameraCalibrationView(QWidget):
         
         if not relevant_keys:
             QMessageBox.warning(self, "No Data", f"No calibration data found for Camera {target_cam_idx+1}.\nPlease add data point in detection tab or read from CSV first.")
+            self._busy_end('plate_calibration')
             return
             
         for key in relevant_keys:
@@ -2846,6 +2864,7 @@ class CameraCalibrationView(QWidget):
                 
         if not img_points:
             QMessageBox.warning(self, "No Data", "No valid point sets found.")
+            self._busy_end('plate_calibration')
             return
 
         # Image size
@@ -2874,6 +2893,7 @@ class CameraCalibrationView(QWidget):
         success_pnp, rvec, tvec = cv2.solvePnP(obj_points[0], img_points[0], K, dist_coeffs)
         if not success_pnp:
             QMessageBox.critical(self, "Error", "Initial pose estimation (PnP) failed.")
+            self._busy_end('plate_calibration')
             return
             
         # 4. Stage 2: Refine All (Intrinsics + Extrinsics)
@@ -2907,6 +2927,7 @@ class CameraCalibrationView(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Calibration Failed", f"Optimization error: {str(e)}")
+            self._busy_end('plate_calibration')
             return
             
         # 5. Display Results
@@ -2939,6 +2960,7 @@ class CameraCalibrationView(QWidget):
         # 8. Notify user (no per-camera save prompt - use Save All button instead)
         QMessageBox.information(self, "Calibration Complete", 
                                f"Camera {target_cam_idx+1} calibrated successfully.\nRMS: {rms:.4f} px\n\nUse 'Save All Camera Parameters' to export.")
+        self._busy_end('plate_calibration')
 
     def _save_plate_calibration_params(self, cam_idx, K, dist, R, T, img_size):
         """Save calibrated parameters in OpenLPT format (consistent with Wand calibration)."""
@@ -3098,6 +3120,8 @@ class CameraCalibrationView(QWidget):
         if not single_frame_dict:
             return
 
+        self._busy_begin('wand_detect_single', 'Detecting single frame')
+
         print(f"Detecting frame {idx}, mode='{wand_type}', radius=[{min_r},{max_r}], sensitivity={sensitivity}")
         
         # Worker Setup
@@ -3191,6 +3215,7 @@ class CameraCalibrationView(QWidget):
                     lbl.setPixmap(scaled)
         
         self.status_label.setText(f"Frame {idx}: Found {total_points} points in {len(res)} cameras.")
+        self._busy_end('wand_detect_single')
 
     def _process_wand_frames(self, checked=False):
         from .wand_calibration.wand_calibrator import WandCalibrator, WandDetectionWorker
@@ -3257,12 +3282,14 @@ class CameraCalibrationView(QWidget):
         
         self._proc_thread.progress.connect(self._proc_dialog.update_progress)
         self._proc_thread.finished_signal.connect(self._on_process_finished)
+        self._busy_begin('wand_process_all', 'Processing wand frames')
         
         self._proc_thread.start()
         self._proc_dialog.exec() # Modal blocking
         
     def _on_process_finished(self, success, msg):
         self._proc_dialog.close()
+        self._busy_end('wand_process_all')
         
         if success:
              self.status_label.setText(f"Done: {msg}")
@@ -3411,6 +3438,7 @@ class CameraCalibrationView(QWidget):
         print(f"[Wand] distortion_params={dist_coeff_num}")
         print(f"Running Wand Calibration with length {wand_len}mm, f0={init_focal}px, dist_coeffs={dist_coeff_num}...")
         self.status_label.setText(f"Calibrating (L={wand_len}mm, f0={init_focal}px, k={dist_coeff_num})...")
+        self._busy_begin('wand_calibration', 'Running wand calibration')
     
         # Store precalibration state
         self._is_precalibrating = precalibrate
@@ -3693,6 +3721,7 @@ class CameraCalibrationView(QWidget):
             # If Pre-calibration, SKIP save prompt
             if getattr(self, '_is_precalibrating', False):
                 QMessageBox.information(self, "Check Complete", "Pre-calibration check complete.\nReview errors in the table.")
+                self._busy_end('wand_calibration')
                 return
 
             # Prompt to save with custom buttons
@@ -3720,6 +3749,7 @@ class CameraCalibrationView(QWidget):
         else:
             self.status_label.setText(f"Calibration Failed: {msg}")
             QMessageBox.critical(self, "Calibration Failed", msg)
+        self._busy_end('wand_calibration')
 
     def _update_3d_viz(self):
         """Update the 3D visualization with calibrated camera positions and wand points."""
@@ -5335,6 +5365,7 @@ class CameraCalibrationView(QWidget):
             parent_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Save Refraction camFile")
             if not parent_dir:
                 print("[Refractive] Calibration cancelled: No directory selected.")
+                self._busy_end('wand_calibration')
                 return
             
             # Create a timestamped subfolder
@@ -5433,6 +5464,7 @@ class CameraCalibrationView(QWidget):
                         
                         QMB.information(self, "Loaded", "Calibration loaded from cache.")
                         print(f"[Refractive] Loaded cached results from: {cache_path}")
+                        self._busy_end('wand_calibration')
                         return  # Exit early, skip calibration
                         
                     except Exception as e:
@@ -5507,6 +5539,7 @@ class CameraCalibrationView(QWidget):
             QMessageBox.critical(self, "Setup Error", f"Failed to start calibration:\n{str(e)}")
             if hasattr(self, 'btn_calibrate_wand'):
                 self.btn_calibrate_wand.setEnabled(True)
+            self._busy_end('wand_calibration')
 
 
     def _on_window_count_changed(self):
@@ -5736,6 +5769,7 @@ class CameraCalibrationView(QWidget):
                 print(f"[Refractive] Error table population failed: {e}")
         else:
             QMessageBox.warning(self, "Result", "Calibration finished but no params returned.")
+        self._busy_end('wand_calibration')
 
     def export_refractive_camfiles_to_dir(self, out_dir):
         """Export latest refractive calibration result into target camFile directory."""
@@ -5779,6 +5813,7 @@ class CameraCalibrationView(QWidget):
         QMessageBox.critical(self, "Calibration Error", f"Worker thread failed:\n{traceback_str}")
         if hasattr(self, 'status_label'):
             self.status_label.setText("Refractive Calibration Failed")
+        self._busy_end('wand_calibration')
 
     def _update_refraction_cam_table(self, cam_count):
         """Sync refraction camera table with current cameras and window options."""

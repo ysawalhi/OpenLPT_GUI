@@ -41,7 +41,7 @@ except ImportError:
 from .refractive_geometry import (
     Ray, build_pinplate_rays_cpp_batch, triangulate_point, point_to_ray_dist,
     update_normal_tangent, camera_center, angle_between_vectors,
-    update_cpp_camera_state,
+    update_cpp_camera_state, align_world_y_to_plane_intersection,
     enable_ray_tracking, reset_ray_stats, print_ray_stats_report,
     reset_camera_update_stats, print_camera_update_report
 )
@@ -165,7 +165,7 @@ class RefractiveBAConfig:
     random_seed: int = 42
     
     # Unit Normalization
-    px_target: float = 0.5            # 投影误差目标 (px)
+    px_target: float = 1.0            # 投影误差目标 (px)
     wand_tol_pct: float = 0.02        # 棒长容忍度 (2% 即 0.2mm)
     
     # Sphere Radii (Estimated or Config)
@@ -180,6 +180,12 @@ class RefractiveBAConfig:
     alpha_side_gate: float = 10.0   # Gate magnitude: C_gate = alpha * J_ref
     beta_side_dir: float = 1e4      # Directional weight when gate is active
     beta_side_soft: float = 100.0   # Soft floor weight when gate is NOT active (defaults to ON)
+    barrier_continuation_enabled: bool = True
+    barrier_schedule: Dict[str, Dict[str, object]] = field(default_factory=lambda: {
+        'early': {'gate_scale': 0.1, 'beta_dir_scale': 0.1, 'tau': 0.05, 'soft_on': True},
+        'mid': {'gate_scale': 0.5, 'beta_dir_scale': 0.5, 'tau': 0.02, 'soft_on': True},
+        'final': {'gate_scale': 1.0, 'beta_dir_scale': 1.0, 'tau': 0.01, 'soft_on': False},
+    })
 
     # Bounds for Round 4 refinement
     bounds_thick_pct: float = 0.05
@@ -194,9 +200,9 @@ class RefractiveBAConfig:
 
     # Robust loss settings
     loss_plane: str = "linear"
-    loss_cam: str = "soft_l1"
-    loss_joint: str = "huber"
-    loss_round4: str = "huber"
+    loss_cam: str = "linear"
+    loss_joint: str = "linear"
+    loss_round4: str = "linear"
     loss_f_scale: float = 1.0
 
     # Weak-window control
@@ -212,6 +218,8 @@ class RefractiveBAConfig:
     diff_step_thick: float = 1e-3
     diff_step_k: float = 1e-6
     diff_step_default: float = 1e-4
+    diff_step_mode_joint: str = "auto"     # manual|auto
+    diff_step_mode_final: str = "auto"     # manual|auto
     
     
 class RefractiveBAOptimizer:
@@ -275,6 +283,13 @@ class RefractiveBAOptimizer:
         self.initial_media = {w: m.copy() for w, m in self.window_media.items()}
         self.initial_f = {cid: float(p[6]) for cid, p in self.cam_params.items() if len(p) > 6}
         self._j_ref = 1.0 # Reference cost for barrier scaling
+        self._barrier_profile = {
+            'name': 'final',
+            'gate_scale': 1.0,
+            'beta_dir_scale': 1.0,
+            'tau': 0.01,
+            'soft_on': False,
+        }
         
         # Derived data
         self.window_ids = sorted(self.window_planes.keys())
@@ -298,6 +313,11 @@ class RefractiveBAOptimizer:
              self.fids_optim = sorted(rnd.sample(all_frames, self.config.max_frames))
         else:
              self.fids_optim = all_frames
+
+        # Per-round plane references for anchor parameterization.
+        self._plane_anchor = {}
+        self._plane_d0 = {}
+        self._refresh_plane_round_reference()
         
     def _sync_initial_state(self):
         """Update initial_planes/cams from current state (Relinearization)."""
@@ -314,6 +334,44 @@ class RefractiveBAOptimizer:
         
         self.sigma_ray_global = 0.04  # Default, will be recalculated
         self.sigma_wand = 0.1        # Default, will be recalculated
+
+        # Recompute per-round plane references after relinearization.
+        self._refresh_plane_round_reference()
+
+    def _refresh_plane_round_reference(self):
+        """Rebuild plane anchors and signed-distance bases for current round.
+
+        Anchor A is the mean camera center of cameras mapped to each window
+        using current initial camera parameters. If unavailable, fall back to
+        the current plane point.
+        """
+        self._plane_anchor = {}
+        self._plane_d0 = {}
+
+        for wid in self.window_ids:
+            pl = self.initial_planes.get(wid, self.window_planes.get(wid, {}))
+            if not pl:
+                continue
+
+            n0 = np.asarray(pl['plane_n'], dtype=np.float64)
+            pt0 = np.asarray(pl['plane_pt'], dtype=np.float64)
+
+            centers = []
+            for cid in self.window_to_cams.get(wid, []):
+                p = self.initial_cam_params.get(cid)
+                if p is None:
+                    continue
+                R, _ = cv2.Rodrigues(p[0:3])
+                C = camera_center(R, p[3:6])
+                centers.append(C)
+
+            if centers:
+                A = np.mean(np.asarray(centers), axis=0)
+            else:
+                A = pt0.copy()
+
+            self._plane_anchor[wid] = A
+            self._plane_d0[wid] = float(np.dot(n0, pt0 - A))
     
     
     def _build_obs_cache(self):
@@ -427,6 +485,58 @@ class RefractiveBAOptimizer:
                 f"Unit Normalization: sigma_ray={self.sigma_ray_global:.4f}mm "
                 f"({cfg.px_target}px at Z={avg_dist_z:.1f}mm), "
                 f"sigma_wand={self.sigma_wand:.4f}mm ({cfg.wand_tol_pct*100}%)"
+            )
+
+    def _resolve_barrier_profile(self, mode: str) -> Dict[str, object]:
+        cfg = self.config
+        schedule = cfg.barrier_schedule or {}
+        default_profile = {
+            'name': 'final',
+            'gate_scale': 1.0,
+            'beta_dir_scale': 1.0,
+            'tau': 0.01,
+            'soft_on': False,
+        }
+
+        if not cfg.barrier_continuation_enabled:
+            return default_profile
+
+        profile_name = 'final'
+        if mode.startswith('loop_'):
+            loop_idx = None
+            parts = mode.split('_')
+            if len(parts) >= 2:
+                try:
+                    loop_idx = int(parts[1])
+                except ValueError:
+                    loop_idx = None
+            if loop_idx is not None and loop_idx <= 2:
+                profile_name = 'early'
+            else:
+                profile_name = 'mid'
+        elif mode == 'joint':
+            profile_name = 'mid'
+        elif mode == 'final_refined' or mode == 'final':
+            profile_name = 'final'
+
+        base = schedule.get(profile_name, {})
+        profile = {
+            'name': profile_name,
+            'gate_scale': float(base.get('gate_scale', default_profile['gate_scale'])),
+            'beta_dir_scale': float(base.get('beta_dir_scale', default_profile['beta_dir_scale'])),
+            'tau': float(base.get('tau', default_profile['tau'])),
+            'soft_on': bool(base.get('soft_on', default_profile['soft_on'])),
+        }
+        profile['tau'] = max(profile['tau'], 1e-6)
+        return profile
+
+    def _set_barrier_profile_for_mode(self, mode: str, log: bool = False) -> None:
+        self._barrier_profile = self._resolve_barrier_profile(mode)
+        if log and self.config.verbosity >= 1:
+            p = self._barrier_profile
+            self.reporter.detail(
+                f"  [Barrier] profile={p['name']}, gate_scale={p['gate_scale']:.3f}, "
+                f"beta_dir_scale={p['beta_dir_scale']:.3f}, tau={p['tau']:.3f}, soft_on={p['soft_on']}"
             )
 
     def _print_plane_diagnostics(self, stage_name: str):
@@ -672,12 +782,22 @@ class RefractiveBAOptimizer:
         J_data = S_ray + lambda_eff * S_len
         margin_mm = self.config.margin_side_mm
         sX_vals = []
-        
-        # Hard Barrier Constants (PR5-style)
-        C_gate = self.config.alpha_side_gate * self._j_ref
+        profile = self._barrier_profile if hasattr(self, '_barrier_profile') else {
+            'gate_scale': 1.0,
+            'beta_dir_scale': 1.0,
+            'tau': 0.01,
+            'soft_on': False,
+        }
+
+        # Hard Barrier Constants (continuation-aware)
+        C_gate = self.config.alpha_side_gate * float(profile['gate_scale']) * self._j_ref
         r_fix_const = np.sqrt(2.0 * C_gate)
-        r_grad_const = np.sqrt(2.0 * self.config.beta_side_dir)
-        tau = 0.01
+        beta_dir_eff = self.config.beta_side_dir * float(profile['beta_dir_scale'])
+        r_grad_const = np.sqrt(2.0 * beta_dir_eff)
+        tau = float(profile['tau'])
+        soft_on = bool(profile['soft_on'])
+        beta_soft_eff = self.config.beta_side_soft * float(profile['beta_dir_scale'])
+        r_soft_const = np.sqrt(2.0 * beta_soft_eff) if soft_on else 0.0
 
         violations_count = 0
         for (X, wids, endpoint, b_start_idx) in valid_points_data:
@@ -705,6 +825,11 @@ class RefractiveBAOptimizer:
                     # Feasible
                     res_barrier_fixed[curr_b_idx] = 0.0
                     res_barrier_fixed[curr_b_idx + 1] = 0.0
+
+                # Soft floor guidance in early/mid stages.
+                if soft_on:
+                    soft_step = r_soft_const * tau * np.log1p(np.exp(gap / tau))
+                    res_barrier_fixed[curr_b_idx] += soft_step
                 
                 curr_b_idx += 2
 
@@ -878,20 +1003,22 @@ class RefractiveBAOptimizer:
             if wid not in current_planes: continue
             
             n0 = self.initial_planes[wid]['plane_n']
-            pt0 = self.initial_planes[wid]['plane_pt']
+            A = self._plane_anchor.get(wid, self.initial_planes[wid]['plane_pt'])
+            d0 = self._plane_d0.get(
+                wid,
+                float(np.dot(self.initial_planes[wid]['plane_n'], self.initial_planes[wid]['plane_pt'] - A))
+            )
             
-            # 1. Update distance (d)
-            # d_new = d_old + delta_d
-            # pt_new = pt_old + delta_d * n0  (approximation of shift along normal)
-            d_shift = deltas['d']
-            pt_shifted = pt0 + d_shift * n0
-            
-            # 2. Update normal (alpha, beta) using tangent space
+            # 1. Update normal (alpha, beta) using tangent space
             alpha, beta = deltas['a'], deltas['b']
             n_new = update_normal_tangent(n0, alpha, beta)
+
+            # 2. Update signed distance along UPDATED normal in anchor coordinates
+            d_new = d0 + deltas['d']
+            pt_new = A + d_new * n_new
             
             current_planes[wid]['plane_n'] = n_new
-            current_planes[wid]['plane_pt'] = pt_shifted
+            current_planes[wid]['plane_pt'] = pt_new
             current_planes[wid]['initialized'] = True
 
             # Thickness delta (if present in media)
@@ -992,11 +1119,39 @@ class RefractiveBAOptimizer:
                           enable_cam_k1: bool = False, enable_cam_k2: bool = False,
                           plane_d_bounds: Dict[int, float] = None,
                           ftol: float = 1e-6,
+                          xtol: float = 1e-6,
+                          gtol: float = 1e-6,
                           loss: Optional[str] = None,
-                          f_scale: Optional[float] = None):
+                          f_scale: Optional[float] = None,
+                          max_nfev: int = 50):
         """
         Generic optimization loop with explicit bounds and parameter selection.
         """
+        # Recompute round-wise plane anchors/d0 from current relinearization state.
+        self._refresh_plane_round_reference()
+        # Recompute physical sigmas for current round state.
+        self._compute_physical_sigmas()
+        self._set_barrier_profile_for_mode(mode, log=True)
+
+        effective_loss = loss or 'linear'
+
+        diff_step_mode = 'manual'
+        if mode == 'joint':
+            diff_step_mode = str(getattr(self.config, 'diff_step_mode_joint', 'manual')).lower()
+        elif mode == 'final_refined' or mode == 'final':
+            diff_step_mode = str(getattr(self.config, 'diff_step_mode_final', 'manual')).lower()
+
+        if diff_step_mode not in ('manual', 'auto'):
+            self.reporter.detail(f"  [RoundConfig] invalid diff_step_mode={diff_step_mode}, fallback to manual")
+            diff_step_mode = 'manual'
+
+        if self.config.verbosity >= 1:
+            self.reporter.detail(
+                f"  [RoundConfig] mode={mode}, loss={effective_loss}, "
+                f"ftol={ftol:g}, xtol={xtol:g}, gtol={gtol:g}, max_nfev={max_nfev}, "
+                f"diff_step_mode={diff_step_mode}"
+            )
+
         layout = self._get_param_layout(
             enable_planes, enable_cam_t, enable_cam_r,
             enable_cam_f, enable_win_t, enable_cam_k1, enable_cam_k2
@@ -1009,54 +1164,48 @@ class RefractiveBAOptimizer:
         x0 = np.zeros(len(layout), dtype=np.float64)
         cfg = self.config
 
-        diff_step = []
-        for (ptype, _, _) in layout:
-            if ptype == 'cam_r':
-                diff_step.append(cfg.diff_step_rvec)
-            elif ptype == 'cam_t':
-                diff_step.append(cfg.diff_step_tvec)
-            elif ptype == 'plane_d':
-                diff_step.append(cfg.diff_step_plane_d)
-            elif ptype == 'plane_a' or ptype == 'plane_b':
-                diff_step.append(cfg.diff_step_plane_ang)
-            elif ptype == 'cam_f':
-                diff_step.append(cfg.diff_step_f)
-            elif ptype == 'win_t':
-                diff_step.append(cfg.diff_step_thick)
-            elif ptype == 'cam_k1' or ptype == 'cam_k2':
-                diff_step.append(cfg.diff_step_k)
-            else:
-                diff_step.append(cfg.diff_step_default)
+        diff_step = None
+        if diff_step_mode == 'manual':
+            diff_step_vals = []
+            for (ptype, _, _) in layout:
+                if ptype == 'cam_r':
+                    diff_step_vals.append(cfg.diff_step_rvec)
+                elif ptype == 'cam_t':
+                    diff_step_vals.append(cfg.diff_step_tvec)
+                elif ptype == 'plane_d':
+                    diff_step_vals.append(cfg.diff_step_plane_d)
+                elif ptype == 'plane_a' or ptype == 'plane_b':
+                    diff_step_vals.append(cfg.diff_step_plane_ang)
+                elif ptype == 'cam_f':
+                    diff_step_vals.append(cfg.diff_step_f)
+                elif ptype == 'win_t':
+                    diff_step_vals.append(cfg.diff_step_thick)
+                elif ptype == 'cam_k1' or ptype == 'cam_k2':
+                    diff_step_vals.append(cfg.diff_step_k)
+                else:
+                    diff_step_vals.append(cfg.diff_step_default)
 
-        diff_step = np.array(diff_step, dtype=np.float64)
-        if cfg.verbosity >= 1:
-            self.reporter.detail(
-                f"  diff_step: rvec={cfg.diff_step_rvec:g}, tvec={cfg.diff_step_tvec:g}, "
-                f"plane_d={cfg.diff_step_plane_d:g}, plane_ang={cfg.diff_step_plane_ang:g}, "
-                f"f={cfg.diff_step_f:g}, thick={cfg.diff_step_thick:g}, k={cfg.diff_step_k:g}"
-            )
+            diff_step = np.array(diff_step_vals, dtype=np.float64)
+            if cfg.verbosity >= 1:
+                self.reporter.detail(
+                    f"  diff_step: rvec={cfg.diff_step_rvec:g}, tvec={cfg.diff_step_tvec:g}, "
+                    f"plane_d={cfg.diff_step_plane_d:g}, plane_ang={cfg.diff_step_plane_ang:g}, "
+                    f"f={cfg.diff_step_f:g}, thick={cfg.diff_step_thick:g}, k={cfg.diff_step_k:g}"
+                )
+        elif cfg.verbosity >= 1:
+            self.reporter.detail("  diff_step: auto (scipy default)")
         
         self.reporter.detail(f"  [{description}] optimizing {len(x0)} parameters ({len(layout)//3} blocks)...")
         # Calc initial RMSE for rollback reference
         planes0, cams0, media0 = self._unpack_params_delta(x0, layout)
         
         # [USER REQUEST] Fixed Weighting Strategy
-        # Lambda = 2.0 * N_active_cams
-        n_cams = max(1, len(self.active_cam_ids))
+        # Lambda = 2.0 * N_total_cams (loaded cam_params)
+        n_cams = max(1, len(self.cam_params))
         lambda_fixed = 2.0 * n_cams
         
         # Initial evaluation
         _, S_ray0, S_len0, N_ray, N_len = self.evaluate_residuals(planes0, cams0, lambda_fixed, window_media=media0)
-        
-        # [Constraint] Force lambda=1 if S_ray / S_len < 10 (User Request)
-        if S_len0 > 1e-9:
-            ratio_s = S_ray0 / S_len0
-            if ratio_s < 10.0:
-                self.reporter.detail(
-                    f"    [Constraint] S_ray/S_len ({ratio_s:.2f}) < 10. "
-                    f"Forcing lambda=1.0 (was {lambda_fixed:.1f})"
-                )
-                lambda_fixed = 1.0
         
         rmse_ray0 = np.sqrt(S_ray0 / max(N_ray, 1))
         rmse_len0 = np.sqrt(S_len0 / max(N_len, 1)) if N_len > 0 else 0.0
@@ -1065,7 +1214,7 @@ class RefractiveBAOptimizer:
         J0 = (rmse_ray0**2) + lambda_fixed * (rmse_len0**2)
         self._j_ref = J0 if J0 > 1e-6 else 1.0
         
-        self.reporter.detail(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams={n_cams})")
+        self.reporter.detail(f"    Global Fixed Weighting: lambda={lambda_fixed:.1f} (N_cams_total={n_cams})")
         self.reporter.detail(f"    Initial: S_ray={S_ray0:.2f}, S_len={S_len0:.2f} (J0={J0:.4f})")
         
         # Build Bounds
@@ -1112,7 +1261,7 @@ class RefractiveBAOptimizer:
         def residuals_wrapper(x, *args, **kwargs):
             res = self._residuals(x, *args, **kwargs)
             self._res_call_count += 1
-            if self.progress_callback and self._res_call_count % 30 == 0:
+            if self.progress_callback and self._res_call_count % 10 == 0:
                 try:
                     c_approx = 0.5 * np.sum(res**2)
 
@@ -1145,11 +1294,11 @@ class RefractiveBAOptimizer:
             verbose=0,
             x_scale='jac',
             ftol=ftol,
-            loss=loss or 'linear',
+            loss=effective_loss,
             f_scale=self.config.loss_f_scale if f_scale is None else f_scale,
-            xtol=1e-6,
-            gtol=1e-6,
-            max_nfev=50,
+            xtol=xtol,
+            gtol=gtol,
+            max_nfev=max_nfev,
             diff_step=diff_step
         )
 
@@ -1261,6 +1410,10 @@ class RefractiveBAOptimizer:
         self.window_planes = planes_final
         self.cam_params = cams_final
         self.window_media = media_final
+
+        # Refresh references for next round and explicitly sync to C++ state.
+        self._refresh_plane_round_reference()
+        self.sync_cpp_state(cam_params=self.cam_params, window_planes=self.window_planes, window_media=self.window_media)
         
         return res, layout
 
@@ -1534,6 +1687,91 @@ class RefractiveBAOptimizer:
             
         print(f"  Ref Distance d1 (Initial Strong Avg): {self._d1_avg_ref:.2f} mm")
 
+    def _collect_points_for_alignment(self) -> List[np.ndarray]:
+        """Collect triangulated points from obsA/obsB for coordinate alignment."""
+        points_3d: List[np.ndarray] = []
+        obsA = self.dataset.get('obsA', {})
+        obsB = self.dataset.get('obsB', {})
+
+        def _tri_all(obs_dict: Dict[int, Dict[int, np.ndarray]]) -> List[np.ndarray]:
+            pts: List[np.ndarray] = []
+            rays_by_fid: Dict[int, List[Ray]] = {fid: [] for fid in obs_dict.keys()}
+
+            per_cam: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+            for fid, cam_obs in obs_dict.items():
+                for cid, uv in cam_obs.items():
+                    if cid not in self.cams_cpp or cid not in self.cam_params:
+                        continue
+                    per_cam.setdefault(cid, []).append((fid, uv))
+
+            for cid, items in per_cam.items():
+                wid = self.cam_to_window.get(cid)
+                uv_list = [uv for _, uv in items]
+                meta_list = [
+                    {
+                        "cam_id": cid,
+                        "window_id": wid,
+                        "frame_id": fid,
+                        "endpoint": "?",
+                    }
+                    for fid, _ in items
+                ]
+                rays = build_pinplate_rays_cpp_batch(self.cams_cpp[cid], uv_list, meta_list=meta_list)
+                for (fid, _), ray in zip(items, rays):
+                    if ray.valid:
+                        rays_by_fid[fid].append(ray)
+
+            for fid in obs_dict.keys():
+                rays = rays_by_fid[fid]
+                if len(rays) >= 2:
+                    X, _, valid, _ = triangulate_point(rays)
+                    if valid:
+                        pts.append(X)
+            return pts
+
+        points_3d.extend(_tri_all(obsA))
+        points_3d.extend(_tri_all(obsB))
+        return points_3d
+
+    def _apply_coordinate_alignment(self, tag: str, refresh_initial: bool = True) -> bool:
+        """Apply world-frame alignment and sync aligned parameters to C++ state."""
+        if len(self.window_planes) < 2:
+            if self.config.verbosity >= 1:
+                self.reporter.detail(f"[Coordinate Alignment] Skip ({tag}): less than two windows")
+            return False
+
+        points_3d = self._collect_points_for_alignment()
+        if self.config.verbosity >= 1:
+            self.reporter.detail(f"[Coordinate Alignment] {tag}: collected {len(points_3d)} points")
+
+        try:
+            new_cam_params, new_window_planes, _, _, _ = align_world_y_to_plane_intersection(
+                self.window_planes, self.cam_params, points_3d=points_3d
+            )
+        except Exception as e:
+            self.reporter.detail(f"[Coordinate Alignment] {tag}: failed ({e})")
+            return False
+
+        self.cam_params = {int(cid): np.asarray(p, dtype=np.float64) for cid, p in new_cam_params.items()}
+
+        converted_planes: Dict[int, Dict] = {}
+        for wid, pl in new_window_planes.items():
+            pl_new = dict(pl)
+            pl_new['plane_pt'] = np.asarray(pl['plane_pt'], dtype=np.float64)
+            pl_new['plane_n'] = np.asarray(pl['plane_n'], dtype=np.float64)
+            converted_planes[int(wid)] = pl_new
+        self.window_planes = converted_planes
+
+        self.sync_cpp_state(cam_params=self.cam_params, window_planes=self.window_planes, window_media=self.window_media)
+
+        if refresh_initial:
+            self._sync_initial_state()
+            self._compute_physical_sigmas()
+
+        if self.config.verbosity >= 1:
+            self.reporter.detail(f"[Coordinate Alignment] {tag}: applied and synced")
+        return True
+
     def optimize(self, skip_optimization: bool = False, stage: Optional[int] = None) -> Tuple[Dict[int, Dict], Dict[int, np.ndarray]]:
         """
         Execute bundle adjustment (Alternating Refinement).
@@ -1571,13 +1809,15 @@ class RefractiveBAOptimizer:
         max_loop_iters = 6
         loop_iter = 0
         hit_boundary = True # Assume hit to start
+        pre_last_loop_align_done = False
         
         self.reporter.section(f"Alternating Loop (Max {max_loop_iters} passes)")
         
         while loop_iter < max_loop_iters:
             loop_iter += 1
 
-            loss_loop = 'linear' if loop_iter == 1 else 'soft_l1'
+            loss_plane = self.config.loss_plane or 'linear'
+            loss_cam = self.config.loss_cam or 'linear'
             
             # [NEW] Dynamic Detection per loop
             self._detect_weak_windows()
@@ -1585,6 +1825,7 @@ class RefractiveBAOptimizer:
             # [Fix] Sync initial state because _detect_weak_windows might have moved planes (GeoInit)
             # This ensures the optimization starts from the correct new position (delta=0 -> new_pt)
             self._sync_initial_state()
+            self._compute_physical_sigmas()
             
             # [NEW] Calculate Shrinking Bounds for Weak Windows
             # Loop 1: +/- 10% of d_min
@@ -1624,7 +1865,9 @@ class RefractiveBAOptimizer:
                 limit_plane_angle_rad=b_plane_strict[0],
                 plane_d_bounds=plane_d_bounds, # [NEW] Pass bounds
                 ftol=5e-4,
-                loss=loss_loop
+                xtol=1e-5,
+                gtol=1e-5,
+                loss=loss_plane
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Planes")
             
@@ -1646,6 +1889,14 @@ class RefractiveBAOptimizer:
             else:
                 self.reporter.detail(f"  [LOOP {loop_iter}] Plane constraints INACTIVE (all within 2.5 deg). Loop condition satisfied.")
 
+            # Apply coordinate alignment once before the last camera-extrinsic step.
+            # Last step means either convergence-triggered final loop or max-iter final loop.
+            is_last_loop_for_cam = (not hit_boundary) or (loop_iter == max_loop_iters)
+            if (not pre_last_loop_align_done) and is_last_loop_for_cam:
+                self.reporter.section("Coordinate Alignment Before Last Loop Camera Step")
+                self._apply_coordinate_alignment(tag="pre-last-loop-cam", refresh_initial=True)
+                pre_last_loop_align_done = True
+
             # Step B: Optimize Cameras (Fixed Planes) - Free Bounds
             self.reporter.header(f"Loop {loop_iter} - Step B: Optimize Cameras (Free Bounds)")
             b_cam_free = (np.deg2rad(180.0), 2000.0)
@@ -1661,7 +1912,9 @@ class RefractiveBAOptimizer:
                 limit_plane_d_mm=0.0,
                 limit_plane_angle_rad=0.0,
                 ftol=5e-4,
-                loss=loss_loop
+                xtol=1e-5,
+                gtol=1e-5,
+                loss=loss_cam
             )
             self._print_plane_diagnostics(f"Loop {loop_iter} Cams")
 
@@ -1673,23 +1926,21 @@ class RefractiveBAOptimizer:
         if hit_boundary and loop_iter == max_loop_iters:
              self.reporter.info(f"Loop reached max iterations ({max_loop_iters}). Proceeding to Joint.")
 
-        # --- Final Joint Optimization (Round 3) ---
+        # --- Joint Optimization (Round 3) ---
         if stage >= 3:
-            self.reporter.section("Final Joint Optimization (Round 3 Rules)")
-            
-            # [NEW] Re-detect before final joint (optional)
-            if not self.config.skip_weak_round3:
-                self._detect_weak_windows()
+            self.reporter.section("Joint Optimization (Round 3 Rules)")
+
+            # Skip weak-window checks for final joint (ExpB-style).
             # Bounds: 20 deg, 50 mm d, 10 deg plane_ang, 50 mm tvec
             limit_rvec = np.radians(20.0)
             limit_plane_d = 50.0
             limit_plane_ang = np.radians(10.0)
             limit_tvec = 50.0
-            
+
             print("  Bounds: rvec < 20deg, plane_d < 50mm, plane_ang < 10deg, tvec < 50mm")
-            
+
             self._optimize_generic(
-                mode='final_joint', 
+                mode='joint',
                 description="Optimizing plane and camera extrinsic parameters ...",
                 enable_planes=True,
                 enable_cam_t=True,
@@ -1698,14 +1949,17 @@ class RefractiveBAOptimizer:
                 limit_trans_mm=limit_tvec,
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
-                ftol=5e-4,
-                loss=self.config.loss_joint
+                ftol=1e-5,
+                xtol=1e-5,
+                gtol=1e-5,
+                loss=self.config.loss_joint,
+                max_nfev=50
             )
-            self._print_plane_diagnostics("Final Joint End")
+            self._print_plane_diagnostics("Joint End")
 
-        # --- Round 4: Joint + Intrinsics + Thickness ---
+        # --- Final Refined: Joint + Intrinsics + Thickness ---
         if stage >= 4:
-            self.reporter.section("Round 4: Joint Optimization + Intrinsics/Thickness")
+            self.reporter.section("Final Refined: Joint Optimization + Intrinsics/Thickness")
             limit_rvec = np.radians(20.0)
             limit_plane_d = 10.0
             limit_plane_ang = np.radians(5.0)
@@ -1722,7 +1976,7 @@ class RefractiveBAOptimizer:
                 print(f"  Distortion: optimize k1={enable_k1}, k2={enable_k2} (|k| <= {self.config.bounds_dist_abs:.3f})")
 
             self._optimize_generic(
-                mode='round4_full',
+                mode='final_refined',
                 description="Optimizing plane and all camera parameters ...",
                 enable_planes=True,
                 enable_cam_t=True,
@@ -1736,13 +1990,20 @@ class RefractiveBAOptimizer:
                 limit_plane_d_mm=limit_plane_d,
                 limit_plane_angle_rad=limit_plane_ang,
                 ftol=1e-5,
-                loss=self.config.loss_round4
+                xtol=1e-5,
+                gtol=1e-5,
+                loss=self.config.loss_round4,
+                max_nfev=100
             )
-            self._print_plane_diagnostics("Round4 End")
+            self._print_plane_diagnostics("Final Refined End")
+
+            self.reporter.section("Coordinate Alignment Final Export")
+            self._apply_coordinate_alignment(tag="final-export", refresh_initial=True)
         
         # Explicit sync call to be safe for returning
-        n_cams = max(1, len(self.active_cam_ids))
+        n_cams = max(1, len(self.cam_params))
         lambda_fixed = 2.0 * n_cams
+        self._set_barrier_profile_for_mode('final', log=False)
         self.evaluate_residuals(self.window_planes, self.cam_params, lambda_fixed, window_media=self.window_media)
 
         self.print_diagnostics()
@@ -1759,7 +2020,7 @@ class RefractiveBAOptimizer:
         self.reporter.section("Final Diagnostics")
         
         # Evaluate final residuals
-        n_cams = max(1, len(self.active_cam_ids))
+        n_cams = max(1, len(self.cam_params))
         lambda_fixed = 2.0 * n_cams
         residuals, S_ray, S_len, N_ray, N_len = self.evaluate_residuals(
             self.window_planes, self.cam_params, lambda_fixed, window_media=self.window_media

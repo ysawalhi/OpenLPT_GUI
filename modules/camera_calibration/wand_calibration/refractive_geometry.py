@@ -378,7 +378,7 @@ def point_to_ray_dist(X: np.ndarray, o: np.ndarray, d: np.ndarray) -> float:
     """
     Distance from point X to ray (o, d) treated as a HALF-LINE.
     If projection is backward (t < 0), clamp to ray origin.
-    
+
     This enforces forward-only ray geometry to prevent non-physical
     solutions where objects appear on the camera-side of refractive planes.
     """

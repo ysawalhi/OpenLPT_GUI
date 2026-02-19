@@ -17,7 +17,7 @@ from .refractive_geometry import (
     build_pinplate_ray_cpp, closest_distance_rays, triangulate_point, 
     point_to_ray_dist, update_normal_tangent, camera_center,
     build_pinplate_rays_cpp_batch,
-    align_world_y_to_plane_intersection, update_cpp_camera_state
+    update_cpp_camera_state
 )
 
 from .refractive_bootstrap import PinholeBootstrapP0, PinholeBootstrapP0Config, select_best_pair_via_precalib
@@ -1168,166 +1168,9 @@ class RefractiveWandCalibrator:
             window_planes=window_planes,
         )
 
-    def _align_and_export(self, cam_params, window_media, cam_to_window, ba_optimizer, cams_cpp, dataset, out_path, verbosity):
+    def _export_and_reload_camfiles(self, cam_params, window_media, cam_to_window, cams_cpp, dataset, out_path, verbosity):
         if verbosity >= 0:
             self.reporter.section("Exporting Final parameters to camFiles")
-
-        if len(self.window_planes) >= 2:
-            try:
-                v_fid = None
-                v_X_raw = None
-                if dataset['frames']:
-                    v_fid = dataset['frames'][len(dataset['frames']) // 2]
-                    v_rays = []
-                    for cid in cams_cpp:
-                        if cid not in cam_params:
-                            continue
-                        wid = cam_to_window.get(cid)
-                        uv = dataset['obsA'][v_fid].get(cid)
-                        if uv is not None:
-                            rs = build_pinplate_rays_cpp_batch(
-                                cams_cpp[cid],
-                                [uv],
-                                meta_list=[
-                                    {
-                                        "cam_id": cid,
-                                        "window_id": wid,
-                                        "frame_id": v_fid,
-                                        "endpoint": "A",
-                                    }
-                                ],
-                            )
-                            if rs and rs[0].valid:
-                                v_rays.append(rs[0])
-
-                    if len(v_rays) >= 2:
-                        v_X_raw, _, _, _ = triangulate_point(v_rays)
-                        if verbosity >= 1:
-                            print(f"[Verification] Frame {v_fid} Raw 3D (Unaligned): {v_X_raw}")
-
-                points_3d_for_align = []
-                obsA = dataset.get('obsA', {})
-                obsB = dataset.get('obsB', {})
-
-                def _tri_all(obs_dict):
-                    pts = []
-                    rays_by_fid = {fid: [] for fid in obs_dict.keys()}
-
-                    # Batch by camera across all frames to reduce Python<->C++ calls.
-                    per_cam = {}
-                    for fid, cam_obs in obs_dict.items():
-                        for cid, uv in cam_obs.items():
-                            if cid not in cams_cpp:
-                                continue
-                            per_cam.setdefault(cid, []).append((fid, uv))
-
-                    for cid, items in per_cam.items():
-                        wid = cam_to_window.get(cid)
-                        uv_list = [uv for _, uv in items]
-                        meta_list = [
-                            {
-                                "cam_id": cid,
-                                "window_id": wid,
-                                "frame_id": fid,
-                                "endpoint": "?",
-                            }
-                            for fid, _ in items
-                        ]
-                        rays = build_pinplate_rays_cpp_batch(
-                            cams_cpp[cid], uv_list, meta_list=meta_list
-                        )
-                        for (fid, _), r in zip(items, rays):
-                            if r.valid:
-                                rays_by_fid[fid].append(r)
-
-                    for fid in obs_dict.keys():
-                        rays = rays_by_fid[fid]
-                        if len(rays) >= 2:
-                            X, _, valid, _ = triangulate_point(rays)
-                            if valid:
-                                pts.append(X)
-                    return pts
-
-                points_3d_for_align.extend(_tri_all(obsA))
-                points_3d_for_align.extend(_tri_all(obsB))
-
-                if verbosity >= 1:
-                    print(f"[Coordinate Alignment] Collected {len(points_3d_for_align)} points for centroid.")
-
-                cam_params, self.window_planes, _, R_align, t_shift = align_world_y_to_plane_intersection(
-                    self.window_planes, cam_params, points_3d=points_3d_for_align
-                )
-                if verbosity >= 1:
-                    print("[Coordinate Alignment] Aligned Y-axis and Centered at Cloud Centroid.")
-
-                if ba_optimizer:
-                    ba_optimizer.cam_params = cam_params
-                    ba_optimizer.window_planes = self.window_planes
-                    ba_optimizer.window_media = window_media
-
-                    for cid in cams_cpp:
-                        if cid not in cam_params:
-                            continue
-                        update_kwargs = CppSyncAdapter.build_update_kwargs(
-                            cam_params=cam_params,
-                            window_planes=self.window_planes,
-                            window_media=window_media,
-                            cam_to_window=cam_to_window,
-                            cam_id=cid,
-                        )
-                        CppSyncAdapter.apply(cams_cpp, cid, update_kwargs)
-
-                    if verbosity >= 1:
-                        print("[Coordinate Alignment] Synced C++ objects with aligned parameters.")
-
-                    ba_optimizer.save_cache(out_path)
-                    if verbosity >= 1:
-                        print(f"[Coordinate Alignment] Saved ALIGNED parameters to cache: {out_path}")
-
-                if v_X_raw is not None and R_align is not None:
-                    if t_shift is None:
-                        t_shift = np.zeros(3)
-                    v_X_expected = R_align @ (v_X_raw + t_shift)
-
-                    v_rays_new = []
-                    for cid in cams_cpp:
-                        if cid not in cam_params:
-                            continue
-                        wid = cam_to_window.get(cid)
-                        uv = dataset['obsA'][v_fid].get(cid)
-                        if uv is not None:
-                            rs = build_pinplate_rays_cpp_batch(
-                                cams_cpp[cid],
-                                [uv],
-                                meta_list=[
-                                    {
-                                        "cam_id": cid,
-                                        "window_id": wid,
-                                        "frame_id": v_fid,
-                                        "endpoint": "A",
-                                    }
-                                ],
-                            )
-                            if rs and rs[0].valid:
-                                v_rays_new.append(rs[0])
-
-                    if len(v_rays_new) >= 2:
-                        v_X_recalc, _, _, _ = triangulate_point(v_rays_new)
-
-                        diff = np.linalg.norm(v_X_recalc - v_X_expected)
-                        print(f"\n[Verification] End-to-End Consistency Check (Frame {v_fid}):")
-                        print(f"  X_raw (Unaligned) : {v_X_raw}")
-                        print(f"  X_expected (R*X)  : {v_X_expected}")
-                        print(f"  X_recalc (C++ Tri): {v_X_recalc}")
-                        print(f"  Difference        : {diff:.6f} mm")
-
-                        if diff < 1e-4:
-                            print("  [SUCCESS] C++ Engine is perfectly synced with Coordinate Alignment!")
-                        else:
-                            print("  [WARNING] Discrepancy detected! Check C++ parameter updates.")
-
-            except Exception as e:
-                print(f"[Coordinate Alignment] Warning: alignment failed: {e}")
 
         stored_dir = None
         try:
@@ -2440,11 +2283,10 @@ class RefractiveWandCalibrator:
             dataset['est_radius_large_mm'] = rl
             print(f"[ROUND4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
 
-        cam_params, cams_cpp, stored_dir = self._align_and_export(
+        cam_params, cams_cpp, stored_dir = self._export_and_reload_camfiles(
             cam_params=cam_params,
             window_media=window_media,
             cam_to_window=cam_to_window,
-            ba_optimizer=ba_optimizer,
             cams_cpp=cams_cpp,
             dataset=dataset,
             out_path=out_path,

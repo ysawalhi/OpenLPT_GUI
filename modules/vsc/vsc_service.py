@@ -27,7 +27,7 @@ class VSCService:
     2. Filter good tracks (length > min_track_len)
     3. Sample 3D points uniformly from volume
     4. Find 2D correspondences with isolation check
-    5. Run TRF optimization with triangulation error
+    5. Run model-aware TRF optimization (ray-consistency for refraction)
     6. Save optimized cameras and update config.txt
     """
     
@@ -52,6 +52,12 @@ class VSCService:
         
         # Data
         self.cameras: Dict[int, dict] = {}
+        self.camera_paths: Dict[int, str] = {}
+        self.camera_models: Dict[int, str] = {}
+        self.cpp_cameras: Dict[int, object] = {}
+        self.window_planes: Dict[int, dict] = {}
+        self.cam_to_window: Dict[int, int] = {}
+        self._overlay_points_optim: Dict[int, np.ndarray] = {}
         self.obj_radius = 5.0
         self.obj_type = "Tracer"
         self.image_size = (1024, 1024)
@@ -94,6 +100,7 @@ class VSCService:
         vsc_data = {}
         
         try:
+            self._overlay_points_optim = {}
             self._log("=" * 60)
             self._log("Volume Self-Calibration (VSC) Started")
             self._log("=" * 60)
@@ -138,6 +145,8 @@ class VSCService:
             # Step 5: Find 2D correspondences
             self._log("\n[Step 5] Finding 2D correspondences with isolation check...")
             correspondences = self._find_correspondences(sampled_points)
+            for corr_id, corr in enumerate(correspondences):
+                corr['corr_id'] = int(corr_id)
             self._log(f"  Valid correspondences: {len(correspondences)}")
             
             vsc_data['valid_points'] = correspondences
@@ -145,8 +154,8 @@ class VSCService:
             if len(correspondences) < self.min_valid_points:
                 return False, f"Only {len(correspondences)} valid points found, need {self.min_valid_points}", vsc_data
             
-            # Step 6: Run optimization per camera
-            self._log("\n[Step 6] Running TRF optimization (triangulation error)...")
+            # Step 6: Run model-aware optimization
+            self._log("\n[Step 6] Running TRF optimization (model-aware ray consistency)...")
             success, msg = self._run_optimization(correspondences)
             if not success:
                 return False, msg, vsc_data
@@ -158,6 +167,7 @@ class VSCService:
             
             vsc_data['cameras_optim'] = copy.deepcopy(self.cameras)
             vsc_data['tracks'] = self.tracks # Add tracks for GUI return
+            vsc_data['overlay_points_optim'] = self._overlay_points_optim
             
             self._log("\n" + "=" * 60)
             self._log("VSC Completed Successfully!")
@@ -238,7 +248,10 @@ class VSCService:
                 cam_idx = int(match.group(1))
                 try:
                     params = parse_camera_file(cam_path)
+                    params['file_path'] = cam_path
                     self.cameras[cam_idx] = params
+                    self.camera_paths[cam_idx] = cam_path
+                    self.camera_models[cam_idx] = str(params.get('model', 'PINHOLE')).upper()
                     self._log(f"  Loaded Camera {cam_idx} from {cam_path}")
                     
                     # Track output directory (use first camera's directory)
@@ -253,6 +266,8 @@ class VSCService:
         
         if not self.cameras:
             return False, "Failed to load any cameras"
+
+        self._build_refraction_window_map()
         
         self._log(f"  Loaded {len(self.cameras)} cameras")
         return True, ""
@@ -274,7 +289,10 @@ class VSCService:
                 
                 try:
                     params = parse_camera_file(file_path)
+                    params['file_path'] = file_path
                     self.cameras[cam_idx] = params
+                    self.camera_paths[cam_idx] = file_path
+                    self.camera_models[cam_idx] = str(params.get('model', 'PINHOLE')).upper()
                     self._log(f"  Loaded Camera {cam_idx} from {cam_file}")
                     
                     if 'img_size' in params:
@@ -284,9 +302,111 @@ class VSCService:
         
         if not self.cameras:
             return False, "Failed to load any cameras"
+
+        self._build_refraction_window_map()
         
         self._log(f"  Loaded {len(self.cameras)} cameras")
         return True, ""
+
+    def _build_refraction_window_map(self):
+        """Build per-window plane map from camera refraction metadata."""
+        self.cam_to_window = {}
+        self.window_planes = {}
+
+        for cam_idx, cam in self.cameras.items():
+            model = str(cam.get('model', 'PINHOLE')).upper()
+            if model != 'PINPLATE':
+                continue
+
+            meta = cam.get('ref_meta', {}) or {}
+            wid = meta.get('window_id', None)
+            plane_pt = meta.get('plane_pt_export', None)
+            plane_n = meta.get('plane_n', None)
+
+            # Fallback when optional metadata block is missing.
+            if wid is None:
+                wid = int(cam_idx)
+                self._log(
+                    f"  Warning: cam{cam_idx} missing REFRACTION_META WINDOW_ID; "
+                    f"fallback window_id={wid}"
+                )
+            if plane_pt is None:
+                plane_pt = cam.get('plane_pt', None)
+            if plane_n is None:
+                plane_n = cam.get('plane_n', None)
+
+            self.cam_to_window[int(cam_idx)] = int(wid)
+            if plane_pt is not None and plane_n is not None:
+                self.window_planes[int(wid)] = {
+                    'plane_pt': np.asarray(plane_pt, dtype=np.float64).reshape(3),
+                    'plane_n': np.asarray(plane_n, dtype=np.float64).reshape(3),
+                }
+
+        if self.window_planes:
+            self._log(f"  Refractive windows loaded: {len(self.window_planes)}")
+
+    def _build_refraction_window_map_from_cpp(self):
+        """Rebuild refractive window map using C++ PINPLATE state as source of truth."""
+        self.cam_to_window = {}
+        self.window_planes = {}
+
+        for cam_idx, cam in self.cameras.items():
+            model = str(self.camera_models.get(cam_idx, cam.get('model', 'PINHOLE'))).upper()
+            if model != 'PINPLATE':
+                continue
+
+            meta = cam.get('ref_meta', {}) or {}
+            wid = meta.get('window_id', None)
+            if wid is None:
+                wid = int(cam_idx)
+                self._log(
+                    f"  Warning: cam{cam_idx} missing REFRACTION_META WINDOW_ID; "
+                    f"fallback window_id={wid}"
+                )
+            wid = int(wid)
+            self.cam_to_window[int(cam_idx)] = wid
+
+            cpp_cam = self.cpp_cameras.get(cam_idx)
+            if cpp_cam is None:
+                self._log(f"  Warning: Missing cpp camera for cam{cam_idx}; cannot read refractive plane")
+                continue
+
+            try:
+                pin = cpp_cam._pinplate_param
+                plane = pin.plane
+                pt = plane.pt
+                n = plane.norm_vector
+
+                plane_pt = np.array([float(pt[0]), float(pt[1]), float(pt[2])], dtype=np.float64)
+                plane_n = np.array([float(n[0]), float(n[1]), float(n[2])], dtype=np.float64)
+                n_norm = np.linalg.norm(plane_n)
+                if n_norm > 1e-12:
+                    plane_n = plane_n / n_norm
+
+                if not (np.all(np.isfinite(plane_pt)) and np.all(np.isfinite(plane_n))):
+                    raise ValueError("non-finite plane parameters")
+
+                if wid in self.window_planes:
+                    prev = self.window_planes[wid]
+                    dp = float(np.linalg.norm(plane_pt - prev['plane_pt']))
+                    dn = float(np.linalg.norm(plane_n - prev['plane_n']))
+                    if dp > 1e-6 or dn > 1e-6:
+                        self._log(
+                            f"  Warning: window {wid} plane mismatch across cameras; "
+                            f"using cam{cam_idx} values (dpt={dp:.3e}, dn={dn:.3e})"
+                        )
+
+                self.window_planes[wid] = {
+                    'plane_pt': plane_pt,
+                    'plane_n': plane_n,
+                }
+            except Exception as e:
+                self._log(f"  Warning: Failed reading pinplate plane from cam{cam_idx}: {e}")
+
+        if self.window_planes:
+            self._log(f"  Refractive windows loaded from CPP: {len(self.window_planes)}")
+        else:
+            self._log("  Warning: No refractive window plane loaded from CPP")
     
     def _load_object_config(self) -> Tuple[bool, str]:
         """Load object configuration to get obj_radius."""
@@ -373,7 +493,7 @@ class VSCService:
         Load tracks from ConvergeTrack CSV files.
         
         Returns:
-            dict: {track_id: [(frame_id, x, y, z, cam0_x, cam0_y, cam1_x, cam1_y, ...), ...]}
+            dict: {track_id: [(frame_id, x, y, z, r3d_mm, cam_2d_dict), ...]}
         """
         # Read Output Folder Path from config.txt
         config_path = os.path.join(self.proj_dir, "config.txt")
@@ -431,7 +551,14 @@ class VSCService:
                         try:
                             orig_id = int(row[0])
                             frame_id = int(row[1])
+                            is_bubble = (self.obj_type == "Bubble")
                             x, y, z = float(row[2]), float(row[3]), float(row[4])
+                            r3d_mm = 0.0
+                            if is_bubble and len(row) > 5:
+                                try:
+                                    r3d_mm = float(row[5])
+                                except Exception:
+                                    r3d_mm = 0.0
                             
                             track_id = orig_id + offset
                             
@@ -439,7 +566,6 @@ class VSCService:
                             # Tracer: [ID, F, X, Y, Z, C0_x, C0_y, C1_x, C1_y, ...] -> Start 5, Stride 2
                             # Bubble: [ID, F, X, Y, Z, R3D, C0_x, C0_y, C0_r, C1_x, ...] -> Start 6, Stride 3
                             
-                            is_bubble = (self.obj_type == "Bubble")
                             if is_bubble:
                                 start_col = 6
                                 stride = 3
@@ -468,7 +594,7 @@ class VSCService:
                                 col += stride
                                 cam_idx += 1
                             
-                            tracks[track_id].append((frame_id, x, y, z, cam_2d))
+                            tracks[track_id].append((frame_id, x, y, z, r3d_mm, cam_2d))
                             
                             if orig_id > local_max_id_in_file:
                                 local_max_id_in_file = orig_id
@@ -492,13 +618,13 @@ class VSCService:
         Sample 3D points uniformly from view volume using voxel grid.
         
         Returns:
-            List of (x, y, z, frame_id, cam_2d_dict) tuples
+            List of (x, y, z, frame_id, r3d_mm, cam_2d_dict) tuples
         """
         # Collect all points
         all_points = []
         for track_id, pts in tracks.items():
-            for frame_id, x, y, z, cam_2d in pts:
-                all_points.append((x, y, z, frame_id, cam_2d))
+            for frame_id, x, y, z, r3d_mm, cam_2d in pts:
+                all_points.append((x, y, z, frame_id, r3d_mm, cam_2d))
         
         if not all_points:
             return []
@@ -595,7 +721,7 @@ class VSCService:
         # Group points by frame for efficient image loading
         points_by_frame = {}
         for pt in sampled_points:
-            x, y, z, frame_id, cam_2d = pt
+            x, y, z, frame_id, r3d_mm, cam_2d = pt
             if frame_id not in points_by_frame:
                 points_by_frame[frame_id] = []
             points_by_frame[frame_id].append(pt)
@@ -816,7 +942,7 @@ class VSCService:
         n_cams = len(self.cameras)
         
         for pt in sampled_points:
-            x, y, z, frame_id, cam_2d = pt
+            x, y, z, frame_id, r3d_mm, cam_2d = pt
             
             if len(cam_2d) < n_cams:
                 continue
@@ -846,6 +972,7 @@ class VSCService:
             if all_valid:
                 valid_correspondences.append({
                     'pt3d': np.array([x, y, z]),
+                    'r3d_mm': float(r3d_mm),
                     '2d_per_cam': pts_2d
                 })
         
@@ -922,56 +1049,172 @@ class VSCService:
         return None
     
     def _run_optimization(self, correspondences: List[dict]) -> Tuple[bool, str]:
-        """Run joint optimization for all cameras (wand_calibration Phase 3 style)."""
-        from .optimizer import VSCOptimizer
-        
+        """Run model-aware camera optimization (PINHOLE or PINPLATE)."""
         self._log("Running joint camera optimization...")
-        
+
+        has_refraction = any(
+            str(self.camera_models.get(cid, self.cameras.get(cid, {}).get('model', 'PINHOLE'))).upper() == 'PINPLATE'
+            for cid in self.cameras.keys()
+        )
+
+        if has_refraction:
+            try:
+                import pyopenlpt as lpt
+            except Exception as e:
+                return False, f"Refraction VSC requires pyopenlpt: {e}"
+
+            from .refraction_optimizer import RefractionVSCOptimizer
+
+            self.cpp_cameras = {}
+            camera_states = {}
+            for cam_idx, cam in self.cameras.items():
+                model = str(self.camera_models.get(cam_idx, cam.get('model', 'PINHOLE'))).upper()
+                if model != 'PINPLATE':
+                    continue
+                cam_path = self.camera_paths.get(cam_idx, cam.get('file_path', None))
+                if not cam_path:
+                    return False, f"Missing camera file path for cam{cam_idx}"
+                cpp_cam = lpt.Camera(cam_path)
+                self.cpp_cameras[cam_idx] = cpp_cam
+
+                # Use C++ camera state as source of truth (do not trust parsed rvec text).
+                try:
+                    pin = cpp_cam._pinplate_param
+                    rvec_cpp = cpp_cam.rmtxTorvec(pin.r_mtx)
+                    tvec_cpp = pin.t_vec
+                    rvec = np.asarray([rvec_cpp[0], rvec_cpp[1], rvec_cpp[2]],
+                                      dtype=np.float64).reshape(3)
+                    tvec = np.asarray([tvec_cpp[0], tvec_cpp[1], tvec_cpp[2]],
+                                      dtype=np.float64).reshape(3)
+                except Exception:
+                    # Fallback for compatibility if direct pinplate state is unavailable.
+                    rvec = np.asarray(cam.get('rvec', np.zeros(3)), dtype=np.float64).reshape(3)
+                    tvec = np.asarray(cam.get('tvec', np.zeros(3)), dtype=np.float64).reshape(3)
+                camera_states[cam_idx] = {
+                    'rvec': rvec,
+                    'tvec': tvec,
+                    'is_active': bool(getattr(cpp_cam, '_is_active', True)),
+                    'max_intensity': float(getattr(cpp_cam, '_max_intensity', 255.0)),
+                }
+
+            if len(self.cpp_cameras) < 2:
+                return False, "Refraction VSC needs at least 2 PINPLATE cameras"
+
+            # Rebuild cam->window and window plane map from C++ camera state.
+            # This avoids text-parser brittleness and ensures barrier uses loaded PINPLATE geometry.
+            self._build_refraction_window_map_from_cpp()
+            self._log(
+                f"  Refraction map: cam_to_window={len(self.cam_to_window)}, "
+                f"window_planes={len(self.window_planes)}"
+            )
+
+            # Keep only correspondences with at least 2 participating refraction cameras.
+            corr_ref = []
+            ref_cam_set = set(self.cpp_cameras.keys())
+            for c in correspondences:
+                obs = c.get('2d_per_cam', {})
+                n_ref = sum(1 for cid in obs.keys() if cid in ref_cam_set)
+                if n_ref >= 2:
+                    corr_ref.append(c)
+
+            if len(corr_ref) < 10:
+                return False, f"Not enough PINPLATE correspondences ({len(corr_ref)})"
+
+            optimizer = RefractionVSCOptimizer(
+                max_nfev=50,
+                ftol=1e-6,
+                xtol=1e-6,
+                margin_side_mm=0.05,
+                alpha_side_gate=10.0,
+                beta_side_dir=1e4,
+                tau=0.01,
+            )
+            optimizer.set_log_callback(self._log)
+            optimized_states, info = optimizer.optimize_all_cameras(
+                self.cpp_cameras,
+                camera_states,
+                corr_ref,
+                self.cam_to_window,
+                self.window_planes,
+            )
+            self._overlay_points_optim = info.get('overlay_points_optim', {})
+
+            # Reflect optimized extrinsics back to parsed camera dict.
+            import cv2
+            for cam_idx, st in optimized_states.items():
+                self.cameras[cam_idx]['rvec'] = np.asarray(st['rvec'], dtype=np.float64)
+                self.cameras[cam_idx]['tvec'] = np.asarray(st['tvec'], dtype=np.float64)
+                R, _ = cv2.Rodrigues(self.cameras[cam_idx]['rvec'])
+                self.cameras[cam_idx]['R'] = R
+                self.cameras[cam_idx]['R_inv'] = R.T
+                self.cameras[cam_idx]['tvec_inv'] = (-R.T @ self.cameras[cam_idx]['tvec'].reshape(3, 1)).flatten()
+
+            stats = info.get('full_stats', {})
+            proj_mean = stats.get('proj_mean', 0.0)
+            proj_std = stats.get('proj_std', 0.0)
+            triang_mean = stats.get('triang_mean', 0.0)
+            triang_std = stats.get('triang_std', 0.0)
+            self._log(
+                f"  Final ProjErr: {proj_mean:.4f} ± {proj_std:.4f} px "
+                f"(Tol: {stats.get('proj_tol', 0.0):.4f})"
+            )
+            self._log(
+                f"  Final TriangErr: {triang_mean:.4f} ± {triang_std:.4f} mm "
+                f"(Tol: {stats.get('triang_tol', 0.0):.4f})"
+            )
+
+            for cam_idx in self.cpp_cameras.keys():
+                self.cameras[cam_idx]['proj_error'] = (proj_mean, proj_std)
+                self.cameras[cam_idx]['triang_error'] = (triang_mean, triang_std)
+
+            # Update tolerance fields using available keys.
+            stats_for_cfg = {
+                'proj_tol': stats.get('proj_tol', proj_mean + 3.0 * proj_std),
+                'triang_tol': stats.get('triang_tol', triang_mean + 3.0 * triang_std),
+            }
+            self._update_object_config(stats_for_cfg)
+            return True, ""
+
+        # PINHOLE path (existing behavior)
+        from .optimizer import VSCOptimizer
+
         optimizer = VSCOptimizer()
         optimizer.set_log_callback(self._log)
-        
-        # Run joint optimization of all cameras with re-triangulation
+
         optimized_cameras, info = optimizer.optimize_all_cameras(
             self.cameras, correspondences, self.image_size
         )
-        
-        # Update cameras
         self.cameras = optimized_cameras
-        
-        # Use stats from optimizer if available
+        self._overlay_points_optim = {}
+
         if 'full_stats' in info:
             stats = info['full_stats']
             proj_mean = stats.get('proj_mean', 0.0)
             proj_std = stats.get('proj_std', 0.0)
             triang_mean = stats.get('triang_mean', 0.0)
             triang_std = stats.get('triang_std', 0.0)
-            
+
             self._log(f"  Final ProjErr: {proj_mean:.4f} ± {proj_std:.4f} px (Tol: {stats.get('proj_tol',0):.4f})")
             self._log(f"  Final TriangErr: {triang_mean:.4f} ± {triang_std:.4f} mm (Tol: {stats.get('triang_tol',0):.4f})")
-            
-            # Store error info
+
             for cam_idx in self.cameras:
                 self.cameras[cam_idx]['proj_error'] = (proj_mean, proj_std)
                 self.cameras[cam_idx]['triang_error'] = (triang_mean, triang_std)
-                
-            # Update Object Config (tracerConfig.txt)
+
             self._update_object_config(stats)
-            
         else:
-            # Fallback (should not happen with new optimizer)
             self._log("  Computing final error statistics...")
             proj_errors, triang_errors = self._compute_final_errors(correspondences)
-            
+
             if len(proj_errors) > 0:
                 proj_mean = np.mean(proj_errors)
                 proj_std = np.std(proj_errors)
                 triang_mean = np.mean(triang_errors)
                 triang_std = np.std(triang_errors)
-                
+
                 self._log(f"  Final ProjErr: {proj_mean:.4f} ± {proj_std:.4f} px")
                 self._log(f"  Final TriangErr: {triang_mean:.4f} ± {triang_std:.4f} mm")
-                
-                # Store error info
+
                 for cam_idx in self.cameras:
                     self.cameras[cam_idx]['proj_error'] = (proj_mean, proj_std)
                     self.cameras[cam_idx]['triang_error'] = (triang_mean, triang_std)
@@ -980,7 +1223,7 @@ class VSCService:
                 for cam_idx in self.cameras:
                     self.cameras[cam_idx]['proj_error'] = (0.0, 0.0)
                     self.cameras[cam_idx]['triang_error'] = (0.0, 0.0)
-        
+
         return True, ""
     
     def _compute_final_errors(self, correspondences: List[dict]) -> Tuple[np.ndarray, np.ndarray]:
@@ -1094,6 +1337,24 @@ class VSCService:
         
         for cam_idx, cam_params in self.cameras.items():
             output_path = os.path.join(cam_dir, f"vsc_cam{cam_idx}.txt")
+            model = str(self.camera_models.get(cam_idx, cam_params.get('model', 'PINHOLE'))).upper()
+
+            if model == 'PINPLATE':
+                cpp_cam = self.cpp_cameras.get(cam_idx)
+                if cpp_cam is None:
+                    self._log(f"  Warning: Missing PINPLATE camera handle for cam{cam_idx}; skipping save")
+                    continue
+                cpp_cam.saveParameters(output_path)
+
+                # Patch error-stat lines because current C++ saveParameters() writes
+                # these two fields as "None" for pinhole/pinplate models.
+                proj_error = cam_params.get('proj_error', None)
+                tri_error = cam_params.get('triang_error', None)
+                self._patch_camfile_error_stats(output_path, proj_error, tri_error)
+                self._patch_camfile_refraction_meta(output_path, cam_idx)
+
+                self._log(f"  Saved Camera {cam_idx} to vsc_cam{cam_idx}.txt")
+                continue
             
             # Get error stats
             proj_error = cam_params.get('proj_error', None)
@@ -1101,6 +1362,103 @@ class VSCService:
             
             save_camera_file(output_path, cam_params, proj_error, tri_error)
             self._log(f"  Saved Camera {cam_idx} to vsc_cam{cam_idx}.txt")
+
+    def _patch_camfile_error_stats(self, file_path: str, proj_error: tuple = None, tri_error: tuple = None):
+        """Replace camera/pose error lines in existing cam file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            proj_line = "None\n"
+            tri_line = "None\n"
+            if proj_error and len(proj_error) >= 2:
+                proj_line = f"{float(proj_error[0]):.8g},{float(proj_error[1]):.8g}\n"
+            if tri_error and len(tri_error) >= 2:
+                tri_line = f"{float(tri_error[0]):.8g},{float(tri_error[1]):.8g}\n"
+
+            def patch_after_header(header: str, value_line: str):
+                for i, line in enumerate(lines):
+                    if header in line and i + 1 < len(lines):
+                        lines[i + 1] = value_line
+                        return True
+                return False
+
+            ok_proj = patch_after_header("# Camera Calibration Error", proj_line)
+            ok_tri = patch_after_header("# Pose Calibration Error", tri_line)
+
+            if ok_proj or ok_tri:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+            else:
+                self._log(f"  Warning: Could not patch error stats in {os.path.basename(file_path)}")
+        except Exception as e:
+            self._log(f"  Warning: Failed to patch error stats for {os.path.basename(file_path)}: {e}")
+
+    def _patch_camfile_refraction_meta(self, file_path: str, cam_idx: int):
+        """Upsert REFRACTION_META block for PINPLATE camera files."""
+        try:
+            wid = self.cam_to_window.get(int(cam_idx), None)
+            if wid is None:
+                self._log(
+                    f"  Warning: cam{cam_idx} missing cam_to_window mapping; "
+                    f"skip REFRACTION_META patch"
+                )
+                return
+
+            plane = self.window_planes.get(int(wid), None)
+            if not plane:
+                self._log(
+                    f"  Warning: cam{cam_idx} window {wid} missing plane data; "
+                    f"skip REFRACTION_META patch"
+                )
+                return
+
+            if 'plane_pt' not in plane or 'plane_n' not in plane:
+                self._log(
+                    f"  Warning: cam{cam_idx} window {wid} plane fields incomplete; "
+                    f"skip REFRACTION_META patch"
+                )
+                return
+
+            plane_pt = np.asarray(plane['plane_pt'], dtype=np.float64).reshape(3)
+            plane_n = np.asarray(plane['plane_n'], dtype=np.float64).reshape(3)
+
+            if not (np.all(np.isfinite(plane_pt)) and np.all(np.isfinite(plane_n))):
+                self._log(
+                    f"  Warning: cam{cam_idx} has non-finite plane data; "
+                    f"skip REFRACTION_META patch"
+                )
+                return
+
+            block = (
+                "# --- BEGIN_REFRACTION_META ---\n"
+                "# VERSION=2\n"
+                f"# CAM_ID={int(cam_idx)}\n"
+                f"# WINDOW_ID={int(wid)}\n"
+                f"# PLANE_PT_EXPORT=[{plane_pt[0]:.4f},{plane_pt[1]:.4f},{plane_pt[2]:.4f}]\n"
+                f"# PLANE_N=[{plane_n[0]:.6f},{plane_n[1]:.6f},{plane_n[2]:.6f}]\n"
+                "# --- END_REFRACTION_META ---\n"
+            )
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+
+            pattern = re.compile(
+                r"#\s*---\s*BEGIN_REFRACTION_META\s*---.*?#\s*---\s*END_REFRACTION_META\s*---\s*\n?",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+            if pattern.search(text):
+                text_new = pattern.sub(block, text, count=1)
+            else:
+                if text and not text.endswith("\n"):
+                    text += "\n"
+                text_new = text + block
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(text_new)
+        except Exception as e:
+            self._log(f"  Warning: Failed to patch REFRACTION_META for cam{cam_idx}: {e}")
     
     def _update_config(self):
         """Update config.txt to use optimized camera files."""
@@ -1384,7 +1742,7 @@ def process_frame_task(frame_id: int, points: List[Tuple],
         
         # Process Points
         for pt in points:
-            x, y, z, fid, cam_2d = pt
+            x, y, z, fid, r3d_mm, cam_2d = pt
             stats['processed'] += 1
             
             # Use total cameras derived from IO availability
@@ -1499,10 +1857,17 @@ def process_frame_task(frame_id: int, points: List[Tuple],
                     break
             
             if all_valid:
+                pts_2d_csv = {
+                    int(c_idx): np.array([float(vals[0]), float(vals[1])], dtype=np.float64)
+                    for c_idx, vals in cam_2d.items()
+                    if vals is not None and len(vals) >= 2
+                }
                 valid_corrs.append({
-                    'frame_id': frame_id,
+                    'frame_id': fid,
                     'pt3d': np.array([x, y, z]),
-                    '2d_per_cam': pts_2d_detected
+                    'r3d_mm': float(r3d_mm),
+                    '2d_per_cam': pts_2d_detected,
+                    '2d_csv_per_cam': pts_2d_csv,
                 })
                 stats['valid'] += 1
             else:

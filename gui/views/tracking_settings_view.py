@@ -27,7 +27,23 @@ class TrackingSettingsView(QWidget):
         self.tri_err_3sigma_mm = None # Store for dynamic voxel conversion
         self.detected_cam_files = [] # Store detected camera filenames (e.g. cam0.txt or vsc_cam1.txt)
         self.last_project_path = None # Track changes to prevent overwriting manual paths
+        self._busy_tokens = {}
         self._setup_ui()
+
+    def _busy_begin(self, key, task_name):
+        if key in self._busy_tokens:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'begin_busy'):
+            self._busy_tokens[key] = wnd.begin_busy(task_name)
+
+    def _busy_end(self, key):
+        token = self._busy_tokens.pop(key, None)
+        if token is None:
+            return
+        wnd = self.window()
+        if wnd is not None and hasattr(wnd, 'end_busy'):
+            wnd.end_busy(token)
     
     def showEvent(self, event):
         """Called when this view is shown. Refresh paths/data from other modules."""
@@ -1292,6 +1308,7 @@ class TrackingSettingsView(QWidget):
         """Validate current settings by running 2D detection and 3D matching on the first frame."""
         from PySide6.QtWidgets import QProgressDialog, QApplication
         from PySide6.QtCore import Qt
+        self._busy_begin('validate_settings', 'Validating tracking settings')
         
         # 1. Save configuration first to ensure files are up to date
         self._save_configuration()
@@ -1478,3 +1495,5 @@ class TrackingSettingsView(QWidget):
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, "Validation Error", f"An error occurred during validation:\n{str(e)}")
+        finally:
+            self._busy_end('validate_settings')
