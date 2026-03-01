@@ -1306,10 +1306,6 @@ class ImagePreprocessingView(QWidget):
             return
         
         self.root_path = root_dir
-        # Auto-set project path to parent of root_dir if empty
-        if not self.project_path_input.text():
-            parent_dir = os.path.dirname(root_dir)
-            self.project_path_input.setText(parent_dir)
             
         self._scan_images(root_dir)
 
@@ -1553,9 +1549,7 @@ class ImagePreprocessingView(QWidget):
     def _get_project_output_dir(self):
         project_path = self.project_path_input.text().strip()
         if project_path:
-            return project_path
-        if self.root_path:
-            return os.path.dirname(self.root_path)
+            return os.path.abspath(project_path)
         return ""
 
     def _background_cache_paths(self):
@@ -1909,11 +1903,11 @@ class ImagePreprocessingView(QWidget):
 
         project_path = self.project_path_input.text().strip()
         if not project_path:
-            if self.root_path:
-                project_path = os.path.dirname(self.root_path)
-            else:
-                self._busy_end('batch_process')
-                return
+            QMessageBox.warning(self, "Project Path Required", "Please set Project Path (for Output) before batch processing.")
+            self._busy_end('batch_process')
+            return
+        project_path = os.path.abspath(project_path)
+        self._batch_project_path = project_path
 
         os.makedirs(project_path, exist_ok=True)
         img_file_dir = os.path.join(project_path, "imgFile")
@@ -2105,12 +2099,21 @@ class ImagePreprocessingView(QWidget):
         )
 
     def _write_image_name_files(self, img_file_dir, cam_output_paths):
+        project_root = getattr(self, "_batch_project_path", None) or self.project_path_input.text().strip()
+        project_root = os.path.abspath(project_root) if project_root else ""
+
         for cam_idx, indexed_paths in cam_output_paths.items():
             indexed_paths = sorted(indexed_paths, key=lambda x: x[0])
             txt_path = os.path.join(img_file_dir, f"cam{cam_idx}ImageNames.txt")
             with open(txt_path, "w") as f:
                 for _, p in indexed_paths:
-                    f.write(p + "\n")
+                    out_path = p
+                    if project_root:
+                        try:
+                            out_path = os.path.relpath(p, start=project_root)
+                        except ValueError:
+                            out_path = p
+                    f.write(out_path.replace('\\', '/') + "\n")
 
     def _on_pixel_clicked(self, x, y, intensity):
         """Handle pixel click signal."""

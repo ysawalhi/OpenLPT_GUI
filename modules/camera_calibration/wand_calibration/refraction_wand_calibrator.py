@@ -453,112 +453,52 @@ class PlaneInitializer:
             if verbose:
                 print(f"  C_mean (cams_used) = {C_mean.round(2)}")
 
-            if X_mids:
-                X_mean = np.mean(X_mids, axis=0)
-                if verbose:
-                    print(f"  X_mean (bootstrap midpoints) = {X_mean.round(2)}")
+            if not X_mids:
+                raise RuntimeError(f"Win {wid}: no valid bootstrap 3D points for plane initialization")
 
-                optical_axes = []
-                ref_dir_guide = X_mean - C_mean
-                ref_dir_guide /= (np.linalg.norm(ref_dir_guide) + 1e-12)
+            X_arr = np.asarray(X_mids, dtype=np.float64)
 
-                for cid in cams_used:
-                    p = cam_params[cid]
-                    R, _ = cv2.Rodrigues(p[0:3])
-                    axis = (R.T @ np.array([0, 0, 1.0])).reshape(3,)
-                    axis /= (np.linalg.norm(axis) + 1e-12)
-                    optical_axes.append(axis)
+            # Normal should be parallel to optical axis: single cam axis or sign-aligned mean axis.
+            optical_axes = []
+            for cid in cams_used:
+                p = cam_params[cid]
+                R, _ = cv2.Rodrigues(p[0:3])
+                axis = (R.T @ np.array([0.0, 0.0, 1.0], dtype=np.float64)).reshape(3,)
+                na = np.linalg.norm(axis)
+                if na > 1e-12:
+                    optical_axes.append(axis / na)
+            if not optical_axes:
+                raise RuntimeError(f"Win {wid}: failed to compute optical axis from mapped cameras")
 
-                optical_axes = np.array(optical_axes)
+            ref_axis = np.asarray(optical_axes[0], dtype=np.float64)
+            aligned_axes = []
+            for axis in optical_axes:
+                a = np.asarray(axis, dtype=np.float64)
+                if np.dot(a, ref_axis) < 0.0:
+                    a = -a
+                aligned_axes.append(a)
+            n_win = np.mean(np.asarray(aligned_axes, dtype=np.float64), axis=0)
+            nn = np.linalg.norm(n_win)
+            if nn < 1e-12:
+                raise RuntimeError(f"Win {wid}: degenerate optical-axis average")
+            n_win = n_win / nn
 
-                mean_internal = np.mean(optical_axes, axis=0)
-                if np.linalg.norm(mean_internal) < 1e-6:
-                    mean_internal = optical_axes[0]
-                mean_internal /= (np.linalg.norm(mean_internal) + 1e-12)
+            # Midpoint between camera reference and closest 3D point (no clamp).
+            dists = np.linalg.norm(X_arr - C_mean.reshape(1, 3), axis=1)
+            if dists.size == 0:
+                raise RuntimeError(f"Win {wid}: no valid 3D points for midpoint initialization")
+            i_min = int(np.argmin(dists))
+            X_min = X_arr[i_min]
+            depth_med = float(dists[i_min])
+            d0_mm = 0.5 * depth_med
+            plane_pt = 0.5 * (C_mean + X_min)
+            thick_mm = window_media.get(wid, {}).get('thickness', 10.0)
 
-                aligned_axes = []
-                for axis in optical_axes:
-                    if np.dot(axis, mean_internal) < 0:
-                        axis *= -1.0
-                    aligned_axes.append(axis)
-                aligned_axes = np.array(aligned_axes)
-
-                mean_aligned = np.mean(aligned_axes, axis=0)
-                na = np.linalg.norm(mean_aligned)
-                if na < 1e-6:
-                    mean_aligned = mean_internal
-                else:
-                    mean_aligned /= (na + 1e-12)
-
-                if np.dot(mean_aligned, ref_dir_guide) < 0:
-                    aligned_axes *= -1.0
-
-                mean_rough = np.mean(aligned_axes, axis=0)
-                norm_mr = np.linalg.norm(mean_rough)
-                if norm_mr < 1e-6:
-                    mean_rough = aligned_axes[0]
-                else:
-                    mean_rough /= norm_mr
-
-                weights = []
-                for axis in aligned_axes:
-                    w = max(0.0, np.dot(axis, mean_rough))**2
-                    weights.append(w)
-
-                weights = np.array(weights)
-                w_sum = np.sum(weights)
-                if w_sum < 1e-12:
-                    n0 = np.mean(aligned_axes, axis=0)
-                else:
-                    n0 = np.average(aligned_axes, axis=0, weights=weights)
-
-                n_win = n0 / (np.linalg.norm(n0) + 1e-12)
-
-                dot_val = np.dot(n_win, ref_dir_guide)
-                angle_deg = np.degrees(np.arccos(np.clip(dot_val, -1.0, 1.0)))
-
-                if verbose:
-                    print(f"  n_win (Robust Weighted) = {n_win.round(4)}")
-                    print(f"  [DIAG] Angle vs (X-C): {angle_deg:.2f} deg")
-                    print(f"  [CONVENTION] n_win points: camera -> object (away from camera)")
-
-                depths = []
-                for cid in cams_used:
-                    C_cam = centers[cid]
-                    for X_mid in X_mids[:200]:
-                        depth = np.dot(n_win, X_mid - C_cam)
-                        if depth > 0:
-                            depths.append(depth)
-
-                depth_med = np.median(depths) if depths else np.linalg.norm(X_mean - C_mean)
-
-                s_X_vals = [np.dot(n_win, X - C_mean) for X in X_mids[:100]]
-                obj_pct = np.mean(np.array(s_X_vals) > 0) * 100.0 if s_X_vals else 0.0
-                if verbose:
-                    print(f"  [DIR] Using C_mean anchor (NOT plane-side check): {obj_pct:.1f}% points have dot(n, X-C_mean)>0.")
-                    print(f"  depth_med = {depth_med:.1f} mm (from {len(depths)} samples)")
-
-                thick_mm = window_media.get(wid, {}).get('thickness', 10.0)
-                d0_min = max(10.0 * thick_mm, 0.02 * depth_med, 20.0)
-                d0_max = min(1.2 * depth_med, 2500.0)
-                d0_init = 0.4 * depth_med
-                d0_mm = np.clip(d0_init, d0_min, d0_max)
-
-                if verbose:
-                    print(f"  d0_init = 0.4 * {depth_med:.1f} = {d0_init:.1f} mm")
-                    print(f"  d0 range = [{d0_min:.1f}, {d0_max:.1f}], d0_final = {d0_mm:.1f} mm")
-
-                plane_pt = C_mean + n_win * d0_mm
-                if verbose:
-                    print(f"  plane_pt = C_mean + n*d0 = {plane_pt.round(2)}")
-
-            else:
-                print(f"  [WARNING] No bootstrap points - using fallback")
-                n_win = np.array([0.0, 0.0, 1.0])
-                d0_mm = 100.0
-                depth_med = 200.0
-                plane_pt = C_mean + n_win * d0_mm
-                thick_mm = window_media.get(wid, {}).get('thickness', 10.0)
+            if verbose:
+                print(f"  X_min (closest to C_mean) = {X_min.round(2)}")
+                print(f"  depth_min = {depth_med:.1f} mm, midpoint d0 = {d0_mm:.1f} mm")
+                print(f"  n_win (axis-parallel init) = {n_win.round(4)}")
+                print(f"  plane_pt (midpoint init) = {plane_pt.round(2)}")
 
             def compute_score(n_test):
                 cams_ok = 0
@@ -747,10 +687,15 @@ class CamFileExporter:
                 f"Cam {cid}: len(refract_array)={len(refract_array)} != len(w_array)+2={len(w_array)+2}"
             assert len(refract_array) >= 3, f"Cam {cid}: refract_array too short"
 
-            h, w = base.image_size if hasattr(base, 'image_size') else (800, 1280)
+            cam_settings = getattr(base, 'camera_settings', {}) or {}
+            cset = cam_settings.get(cid, {})
+            h = int(cset.get('height', base.image_size[0] if hasattr(base, 'image_size') else 800))
+            w = int(cset.get('width', base.image_size[1] if hasattr(base, 'image_size') else 1280))
             img_size_str = f"{h},{w}"
             dist_coeff_str = f"{k1:.8g},{k2:.8g},0,0,0"
-            rvec_placeholder = "0,0,0"
+            rvec_export, _ = cv2.Rodrigues(R)
+            rvec_export = rvec_export.ravel()
+            rvec_line = f"{rvec_export[0]:.8g},{rvec_export[1]:.8g},{rvec_export[2]:.8g}"
             refract_str = ",".join([f"{n:.4f}" for n in refract_array])
             w_str = ",".join([f"{w:.4f}" for w in w_array])
 
@@ -780,7 +725,7 @@ class CamFileExporter:
                 f_out.write("# Distortion Coefficients:\n")
                 f_out.write(f"{dist_coeff_str}\n")
                 f_out.write("# Rotation Vector:\n")
-                f_out.write(f"{rvec_placeholder}\n")
+                f_out.write(f"{rvec_line}\n")
                 f_out.write("# Rotation Matrix:\n")
                 for row in R:
                     f_out.write(f"{row[0]:.8g} {row[1]:.8g} {row[2]:.8g}\n")
@@ -850,9 +795,12 @@ class CppCameraFactory:
 
         for cid in sorted(cam_params.keys()):
             cam = lpt.Camera()
-            image_size = base.image_size if hasattr(base, 'image_size') else (800, 1280)
-            n_row = max(1, int(image_size[0]))
-            n_col = max(1, int(image_size[1]))
+            cam_settings = getattr(base, 'camera_settings', {}) or {}
+            cset = cam_settings.get(cid, {})
+            n_row = int(cset.get('height', base.image_size[0] if hasattr(base, 'image_size') else 800))
+            n_col = int(cset.get('width', base.image_size[1] if hasattr(base, 'image_size') else 1280))
+            n_row = max(1, int(n_row))
+            n_col = max(1, int(n_col))
 
             p = cam_params[cid]
             rvec, tvec = p[0:3], p[3:6]
@@ -908,6 +856,31 @@ class RefractiveWandCalibrator:
         self.logger = logging.getLogger("RefractiveCalibrator")
         self.reporter = RefractiveCalibReporter()
         self._bootstrap_cache = BootstrapCacheStore(self.reporter)
+
+    def _get_cam_setting(self, cid):
+        cam_settings = getattr(self.base, 'camera_settings', None) or {}
+        if cid not in cam_settings:
+            raise ValueError(f"CRITICAL: Missing camera_settings for cam {cid}")
+        cs = cam_settings[cid]
+        focal = float(cs.get('focal', 0.0))
+        width = int(cs.get('width', 0))
+        height = int(cs.get('height', 0))
+        if focal <= 0 or width <= 0 or height <= 0:
+            raise ValueError(
+                f"CRITICAL: Invalid camera_settings for cam {cid}: "
+                f"focal={focal}, width={width}, height={height}"
+            )
+        return focal, width, height
+
+    def _get_cam_image_size_hw(self, cid):
+        _, width, height = self._get_cam_setting(cid)
+        return int(height), int(width)
+
+    def _get_cam_intrinsics(self, cid):
+        focal, width, height = self._get_cam_setting(cid)
+        cx = width * 0.5
+        cy = height * 0.5
+        return float(focal), float(cx), float(cy)
     
     # ==========================================
     # Bootstrap Cache Functions
@@ -1046,13 +1019,18 @@ class RefractiveWandCalibrator:
             active_cam_ids=active_cam_ids,
         )
         
-    def _estimate_and_log_sphere_radii(self, dataset, cam_params, points_3d_A, points_3d_B, tag="P1"):
+    def _estimate_and_log_sphere_radii(self, dataset, cam_params, points_3d_A, points_3d_B, tag="P1", cams_cpp=None):
         """
         Step 1: Estimate and Log sphere radii (mm)
-        Model: R_mm = r_px * Zc / f
+        Model priority:
+        1) lpt.Bubble.calRadiusFromOneCam(camera, X_world, r_px)
+        2) Fallback pinhole approximation: R_mm = r_px * Zc / f
         """
         print(f"\n[SPHERE_RADIUS_ESTIMATION]")
-        print(f"  Method: R_mm = r_px * Zc / fx")
+        if lpt and cams_cpp and hasattr(lpt, "Bubble") and hasattr(lpt.Bubble, "calRadiusFromOneCam"):
+            print(f"  Method: lpt.Bubble.calRadiusFromOneCam (fallback: R_mm = r_px * Zc / fx)")
+        else:
+            print(f"  Method: R_mm = r_px * Zc / fx")
         print(f"  Computed at: {tag} initialization (once per round)")
         
         radii_small = dataset.get('radii_small', {})
@@ -1071,21 +1049,35 @@ class RefractiveWandCalibrator:
                 for cid, r_px in cam_dict.items():
                     if cid not in cam_params: continue
                     if r_px <= 0: continue
-                    
-                    # Project X_world to Cam
-                    # C = -R.T @ t -> this is center.
-                    # We need X_cam = R @ X_world + t
-                    p = cam_params[cid]
-                    rvec, tvec = p[0:3], p[3:6]
-                    f = p[6]
-                    
-                    R, _ = cv2.Rodrigues(rvec)
-                    X_cam = R @ X_world + tvec
-                    Zc = X_cam[2]
-                    
-                    if Zc <= 10.0: continue # Sanity check (too close or behind)
-                    
-                    R_mm = r_px * Zc / f
+
+                    R_mm = None
+
+                    # Preferred: use OpenLPT bubble radius model from camera geometry.
+                    if lpt and cams_cpp and cid in cams_cpp and hasattr(lpt, "Bubble") and hasattr(lpt.Bubble, "calRadiusFromOneCam"):
+                        try:
+                            X_obj = lpt.Pt3D(float(X_world[0]), float(X_world[1]), float(X_world[2]))
+                            R_mm = float(lpt.Bubble.calRadiusFromOneCam(cams_cpp[cid], X_obj, float(r_px)))
+                        except Exception:
+                            R_mm = None
+
+                    # Fallback: pinhole approximation.
+                    if R_mm is None:
+                        p = cam_params[cid]
+                        rvec, tvec = p[0:3], p[3:6]
+                        f = p[6]
+
+                        R, _ = cv2.Rodrigues(rvec)
+                        X_cam = R @ X_world + tvec
+                        Zc = X_cam[2]
+
+                        if Zc <= 10.0:
+                            continue  # too close or behind camera
+
+                        R_mm = float(r_px * Zc / f)
+
+                    if not np.isfinite(R_mm) or R_mm <= 0.0:
+                        continue
+
                     vals_global.append(R_mm)
                     vals_per_cam[cid].append(R_mm)
             
@@ -1713,7 +1705,6 @@ class RefractiveWandCalibrator:
         v_cams_cpp = ba_optimizer.cams_cpp if ba_optimizer else None
 
         if v_cams_cpp:
-            image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
             for cid, cam in v_cams_cpp.items():
                 update_kwargs = CppSyncAdapter.build_update_kwargs(
                     cam_params=cam_params,
@@ -1722,7 +1713,8 @@ class RefractiveWandCalibrator:
                     cam_to_window=cam_to_window,
                     cam_id=cid,
                 )
-                update_kwargs['image_size'] = (int(image_size[0]), int(image_size[1]))
+                cam_h, cam_w = self._get_cam_image_size_hw(cid)
+                update_kwargs['image_size'] = (int(cam_h), int(cam_w))
                 update_kwargs['solver_opts'] = {'proj_nmax': 10000}
                 update_cpp_camera_state(cam, **update_kwargs)
 
@@ -1828,7 +1820,16 @@ class RefractiveWandCalibrator:
 
         return True, cam_params, report, dataset
 
-    def calibrate(self, num_windows, cam_to_window, window_media, out_path, verbosity: int = 1, progress_callback=None):
+    def calibrate(
+        self,
+        num_windows,
+        cam_to_window,
+        window_media,
+        out_path,
+        verbosity: int = 1,
+        progress_callback=None,
+        use_proj_residuals: bool = False,
+    ):
         """
         PR1 MVP Stub: Validate, Log, Export Snapshot, and Exit (Engineering Guardrail #5).
         """
@@ -1942,16 +1943,15 @@ class RefractiveWandCalibrator:
                 # Prepare observations for P0
                 observations = self._prepare_observations_for_bootstrap(cam_to_window)
                 # Task 1: Fix W/H definition. image_size is usually (H, W) from numpy shape.
-                image_size = self.base.image_size if hasattr(self.base, 'image_size') else (800, 1280)
-                img_h, img_w = image_size
-                print(f"[BOOT] image_size (H, W) = {image_size}. Using W={img_w}, H={img_h}")
+                camera_settings = getattr(self.base, 'camera_settings', None) or {}
+                if not camera_settings:
+                    raise ValueError("CRITICAL: camera_settings is required for refractive bootstrap.")
                 
                 all_cam_ids = dataset['cam_ids']
                 
                 # Run P0 (Phase 1 + Phase 2 + Phase 3)
                 config = PinholeBootstrapP0Config(
                     wand_length_mm=wand_len_target,
-                    ui_focal_px=initial_focal,
                 )
                 bootstrap = PinholeBootstrapP0(config)
                 
@@ -1960,24 +1960,18 @@ class RefractiveWandCalibrator:
                     cam_i=cam_i,
                     cam_j=cam_j,
                     observations=observations,
-                    image_size=image_size,
+                    camera_settings=camera_settings,
                     all_cam_ids=all_cam_ids,
                     progress_callback=progress_callback
                 )
 
                 
                 # Convert P0 output to expected format: {cid: [rvec, tvec, f, cx, cy, k1, k2]}
-                # Task 1: Correct cx, cy
-                cx = img_w * 0.5
-                cy = img_h * 0.5
-                
-                # Task 4: [K_CHECK] 
-                print(f"[K_CHECK] img_w={img_w}, img_h={img_h}, cx={cx}, cy={cy}, (img_w/2, img_h/2)=({img_w/2}, {img_h/2})")
                 
                 cam_params = {}
                 for cid, params in cam_params_p0.items():
-                    # params is [rvec(3), tvec(3)]
-                    cam_params[cid] = np.concatenate([params, [initial_focal, cx, cy, 0.0, 0.0]])
+                    focal_cid, cx, cy = self._get_cam_intrinsics(cid)
+                    cam_params[cid] = np.concatenate([params, [focal_cid, cx, cy, 0.0, 0.0]])
                 
                 points_3d = report.get('points_3d', {})
                 X_A_scaled = {fid: XA for fid, (XA, XB) in points_3d.items()}
@@ -2077,7 +2071,9 @@ class RefractiveWandCalibrator:
             est_r_small = 0.0
             est_r_large = 0.0
             if X_A_scaled and X_B_scaled:
-                 est_r_small, est_r_large = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="Bootstrap")
+                 est_r_small, est_r_large = self._estimate_and_log_sphere_radii(
+                     dataset, cam_params, X_A_scaled, X_B_scaled, tag="Bootstrap", cams_cpp=None
+                 )
             
             # Store in dataset for later stages (Step 2)
             dataset['est_radius_small_mm'] = est_r_small
@@ -2210,12 +2206,12 @@ class RefractiveWandCalibrator:
         # REPLACED: Export/Reload loop with direct in-memory initialization
         cams_cpp = self._init_cams_cpp_in_memory(cam_params, window_media, cam_to_window, self.window_planes)
         
-        self.reporter.section("Phase 2/3: Building Rays (C++ Kernel)")
+        self.reporter.section("Adjusting plane parameters ...")
         
         # Progress callback: report Phase 2/3
         if progress_callback:
             try:
-                progress_callback("Phase 2/3: Building Rays", 0.0, 0.0, 0.0)
+                progress_callback("Adjusting plane parameters ...", 0.0, 0.0, 0.0)
             except:
                 pass
 
@@ -2227,7 +2223,9 @@ class RefractiveWandCalibrator:
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
         # rs_pr4, rl_pr4 = 1.5, 2.0 # Defaults
         if X_A_scaled and X_B_scaled:
-            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="BA Pre-Calc")
+            rs, rl = self._estimate_and_log_sphere_radii(
+                dataset, cam_params, X_A_scaled, X_B_scaled, tag="BA Pre-Calc", cams_cpp=cams_cpp
+            )
             dataset['est_radius_small_mm'] = rs
             dataset['est_radius_large_mm'] = rl
             rs_pr4, rl_pr4 = rs, rl
@@ -2242,6 +2240,7 @@ class RefractiveWandCalibrator:
             R_large_mm=rl_pr4,
             dist_coeff_num=self.base.dist_coeff_num,
             loss_f_scale=1.0,
+            use_proj_residuals=bool(use_proj_residuals),
         )
         
         ba_optimizer = RefractiveBAOptimizer(
@@ -2278,7 +2277,9 @@ class RefractiveWandCalibrator:
         # === Phase Round4: Intrinsics + Thickness ===
         # [USER REQUEST] Re-estimate Radii with latest params (post-BA)
         if X_A_scaled and X_B_scaled:
-            rs, rl = self._estimate_and_log_sphere_radii(dataset, cam_params, X_A_scaled, X_B_scaled, tag="Round4 Pre-Calc")
+            rs, rl = self._estimate_and_log_sphere_radii(
+                dataset, cam_params, X_A_scaled, X_B_scaled, tag="Round4 Pre-Calc", cams_cpp=cams_cpp
+            )
             dataset['est_radius_small_mm'] = rs
             dataset['est_radius_large_mm'] = rl
             print(f"[ROUND4] Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")

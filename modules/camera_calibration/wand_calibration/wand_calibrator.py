@@ -184,7 +184,11 @@ def run_detection_task(args):
     args: (frame_idx, cam_idx, img_path, wand_type, min_radius, max_radius, sensitivity)
     Returns: (frame_idx, cam_idx, points_array_or_None)
     """
-    f_idx, c_idx, img_path, wand_type, min_radius, max_radius, sensitivity = args
+    if len(args) >= 8:
+        f_idx, c_idx, img_path, wand_type, min_radius, max_radius, sensitivity, detect_mode = args
+    else:
+        f_idx, c_idx, img_path, wand_type, min_radius, max_radius, sensitivity = args
+        detect_mode = "fast"
     
     try:
         # 1. Read Image
@@ -203,19 +207,19 @@ def run_detection_task(args):
         if wand_type == "dark":
             img = cv2.bitwise_not(img)
             
-        # --- STRATEGY: Try Robust DT First ---
-        try:
-             robust_pts = detect_circles_robust(img, float(min_radius), float(max_radius))
-             if len(robust_pts) >= 2:
-                 # Success: Return Top 2 Highest Metric
-                 final_pts = robust_pts[:2]
-                 # Re-sort by radius (Small -> Large) as expected by downstream logic
-                 final_pts = sorted(final_pts, key=lambda p: p[2])
-                 return f_idx, c_idx, np.array(final_pts)
-        except Exception as e:
-             # If Robust fails, fallback silent
-             # print(f"Robust DT Error: {e}")
-             pass
+        if str(detect_mode).lower() == "fast":
+            # --- STRATEGY: Try Fast Robust DT First ---
+            try:
+                 robust_pts = detect_circles_robust(img, float(min_radius), float(max_radius))
+                 if len(robust_pts) >= 2:
+                     # Success: Return Top 2 Highest Metric
+                     final_pts = robust_pts[:2]
+                     # Re-sort by radius (Small -> Large) as expected by downstream logic
+                     final_pts = sorted(final_pts, key=lambda p: p[2])
+                     return f_idx, c_idx, np.array(final_pts)
+            except Exception:
+                 # If Robust fails, fallback silent
+                 pass
 
         # --- FALLBACK: LPT Algorithm ---
         from pyopenlpt import Image as LPTImage, CircleIdentifier
@@ -250,7 +254,7 @@ def run_detection_task(args):
 class WandDetectionSingleFrameWorker(QThread):
     finished_signal = Signal(object) # Returns dict of results
 
-    def __init__(self, calibrator, image_paths_dict, wand_type, min_r, max_r, sensitivity):
+    def __init__(self, calibrator, image_paths_dict, wand_type, min_r, max_r, sensitivity, detect_mode="fast"):
         super().__init__()
         self.calibrator = calibrator
         self.image_paths_dict = image_paths_dict
@@ -258,6 +262,7 @@ class WandDetectionSingleFrameWorker(QThread):
         self.min_r = min_r
         self.max_r = max_r
         self.sensitivity = sensitivity
+        self.detect_mode = detect_mode
 
     def run(self):
         # Run detection
@@ -267,7 +272,8 @@ class WandDetectionSingleFrameWorker(QThread):
                 self.wand_type, 
                 self.min_r, 
                 self.max_r, 
-                self.sensitivity
+                self.sensitivity,
+                self.detect_mode
             )
             self.finished_signal.emit(res)
         except Exception as e:
@@ -278,7 +284,7 @@ class WandDetectionWorker(QThread):
     progress = Signal(int, int) # current, total
     finished_signal = Signal(bool, str) # success, msg
     
-    def __init__(self, calibrator, image_paths, wand_type, min_r, max_r, sens, autosave_path=None, resume=False):
+    def __init__(self, calibrator, image_paths, wand_type, min_r, max_r, sens, autosave_path=None, resume=False, detect_mode="fast"):
         super().__init__()
         self.calibrator = calibrator
         self.image_paths = image_paths
@@ -286,6 +292,7 @@ class WandDetectionWorker(QThread):
         self.min_r = min_r
         self.max_r = max_r
         self.sens = sens
+        self.detect_mode = detect_mode
         self.autosave_path = autosave_path
         self.resume_flag = resume
         
@@ -305,7 +312,7 @@ class WandDetectionWorker(QThread):
 
             gen = self.calibrator.detect_wand_points_generator(
                 self.image_paths, self.wand_type, self.min_r, self.max_r, self.sens,
-                self.autosave_path, self.resume_flag,
+                self.autosave_path, self.resume_flag, self.detect_mode,
                 stop_check=lambda: self._is_stopped
             )
             
@@ -431,6 +438,21 @@ class WandCalibrator:
             raise RuntimeError(
                 f"dist_coeff_num={self.dist_coeff_num} not supported. Only 0/1/2 are supported (None/k1/k1+k2)."
             )
+
+    def _get_cam_setting(self, cam_id):
+        settings = getattr(self, 'camera_settings', None) or {}
+        if cam_id in settings:
+            cs = settings[cam_id]
+            focal = float(cs.get('focal', 0.0))
+            width = int(cs.get('width', 0))
+            height = int(cs.get('height', 0))
+            if focal > 0 and width > 0 and height > 0:
+                return focal, width, height
+
+        # Fallback to global values for legacy flows
+        h, w = self.image_size if self.image_size is not None else (800, 1280)
+        focal_fallback = 5000.0
+        return focal_fallback, int(w), int(h)
     
     def calculate_per_frame_errors(self):
         """
@@ -626,7 +648,7 @@ class WandCalibrator:
         
         return (m_s, s_s), (m_l, s_l)
 
-    def detect_wand_points_generator(self, image_paths_dict, wand_type, min_radius, max_radius, sensitivity, autosave_path=None, resume=False, stop_check=None):
+    def detect_wand_points_generator(self, image_paths_dict, wand_type, min_radius, max_radius, sensitivity, autosave_path=None, resume=False, detect_mode="fast", stop_check=None):
         """
         Generator for detecting wand points. Yields (current_frame_idx, total_frames).
         Implements dual-radius logic and strict filtering.
@@ -674,7 +696,7 @@ class WandCalibrator:
             for c_idx in cam_indices:
                 if f_idx < len(image_paths_dict[c_idx]):
                     img_path = str(image_paths_dict[c_idx][f_idx])
-                    all_tasks.append((f_idx, c_idx, img_path, wand_type, min_radius, max_radius, sensitivity))
+                    all_tasks.append((f_idx, c_idx, img_path, wand_type, min_radius, max_radius, sensitivity, detect_mode))
         
         total_tasks = len(all_tasks)
         print(f"Parallel Execution: {total_tasks} tasks to run (Skipped {num_frames * num_cams - total_tasks})")
@@ -1067,7 +1089,7 @@ class WandCalibrator:
             return False, str(e)
 
 
-    def detect_single_frame(self, image_dict, wand_type="bright", min_radius=20, max_radius=200, sensitivity=0.85):
+    def detect_single_frame(self, image_dict, wand_type="bright", min_radius=20, max_radius=200, sensitivity=0.85, detect_mode="fast"):
         """
         Run detection on a single frame dictionary {cam_idx: path}.
         Returns {cam_idx: points} for visualization.
@@ -1079,7 +1101,7 @@ class WandCalibrator:
         tasks = []
         for c_idx, path in image_dict.items():
             # Frame index is dummy 0 here
-            tasks.append((0, c_idx, str(path), wand_type, min_radius, max_radius, sensitivity))
+            tasks.append((0, c_idx, str(path), wand_type, min_radius, max_radius, sensitivity, detect_mode))
             
         # Run Parallel
         try:
@@ -1098,7 +1120,7 @@ class WandCalibrator:
             print(f"Parallel detection failed: {e}. Fallback to sequential.")
             # Fallback Sequential
             for c_idx, path in image_dict.items():
-                pts = self._detect_in_image(str(path), wand_type, min_radius, max_radius, sensitivity)
+                _, _, pts = run_detection_task((0, c_idx, str(path), wand_type, min_radius, max_radius, sensitivity, detect_mode))
                 if pts is not None:
                     results[c_idx] = pts
                     
@@ -1353,7 +1375,7 @@ class WandCalibrator:
         return success, f"Optimal f0={optimal_f0}\n{msg}", optimal_f0, final_rms
 
 
-    def initialize_geometry_from_pair(self, cam1_idx, cam2_idx, wand_data, K, dist_coeff, wand_length_mm):
+    def initialize_geometry_from_pair(self, cam1_idx, cam2_idx, wand_data, wand_length_mm):
         """
         Robust Geometric Initialization using 8-Point Algorithm (Essential Matrix).
         
@@ -1361,8 +1383,6 @@ class WandCalibrator:
             cam1_idx: Index of first camera (Base, will be at I, 0).
             cam2_idx: Index of second camera (rel pose to be computed).
             wand_data: The filtered wand points dict.
-            K: Intrinsic Matrix (3x3). Assumed same for both for simplicity or provided.
-            dist_coeff: Distortion coefficients.
             wand_length_mm: Physical wand length.
 
         Returns:
@@ -1393,36 +1413,50 @@ class WandCalibrator:
             print(f"  Geometry Init: Not enough common points ({len(pts1)} < 8) for cam {cam1_idx}-{cam2_idx}")
             return None, None, None
 
-        # 2. Compute Essential Matrix using PIXEL coordinates
-        E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        # 2. Build per-camera intrinsics from table and normalize image points
+        f1, w1, h1 = self._get_cam_setting(cam1_idx)
+        K1 = np.array([[f1, 0, w1 / 2.0], [0, f1, h1 / 2.0], [0, 0, 1]], dtype=np.float64)
+
+        f2, w2, h2 = self._get_cam_setting(cam2_idx)
+        K2 = np.array([[f2, 0, w2 / 2.0], [0, f2, h2 / 2.0], [0, 0, 1]], dtype=np.float64)
+
+        pts1_norm = cv2.undistortPoints(pts1.reshape(-1, 1, 2), K1, None).reshape(-1, 2)
+        pts2_norm = cv2.undistortPoints(pts2.reshape(-1, 1, 2), K2, None).reshape(-1, 2)
+
+        # 3. Compute Essential Matrix in normalized coordinates
+        E, mask = cv2.findEssentialMat(
+            pts1_norm,
+            pts2_norm,
+            focal=1.0,
+            pp=(0.0, 0.0),
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1e-3,
+        )
         
         if E is None or E.shape != (3,3):
             print("  Geometry Init: Essential Matrix computation failed.")
             return None, None, None
 
-        # 3. Recover Pose (R, t) from E
+        # 4. Recover Pose (R, t) from E
         # This returns R, t from cam1 to cam2
-        points, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K)
+        points, R, t, mask_pose = cv2.recoverPose(E, pts1_norm, pts2_norm, focal=1.0, pp=(0.0, 0.0))
         
         print(f"  Geometry Init: Pose Recovered using {points} inliers from {len(pts1)} points.")
 
-        # 4. Triangulate to Recover Scale
-        # Construct Projection Matrices using pixel coordinates
+        # 5. Triangulate to Recover Scale (normalized camera coordinates)
         P1 = np.hstack((np.eye(3), np.zeros((3,1)))) # Cam1 is Origin
         P2 = np.hstack((R, t))                       # Cam2
-        
-        P1_full = K @ P1
-        P2_full = K @ P2
-        
+
         # Triangulate all points
-        pts1_T = pts1.T
-        pts2_T = pts2.T
+        pts1_T = pts1_norm.T
+        pts2_T = pts2_norm.T
         
-        points_4d_hom = cv2.triangulatePoints(P1_full, P2_full, pts1_T, pts2_T)
+        points_4d_hom = cv2.triangulatePoints(P1, P2, pts1_T, pts2_T)
         points_3d = points_4d_hom[:3] / points_4d_hom[3] # (3, N)
         points_3d = points_3d.T # (N, 3)
 
-        # 5. Compute Scale Factor
+        # 6. Compute Scale Factor
         # Calculate distance between Wand Endpoints in 3D
         dists = []
         for i in range(0, len(points_3d), 2): # Step 2 (A and B)
@@ -1448,7 +1482,7 @@ class WandCalibrator:
         
         print(f"  Geometry Init: Raw Median Length={median_dist:.4f} units. Scale Factor={scale_factor:.4f}")
         
-        # Apply Scale
+        # 7. Apply Scale
         t_scaled = t * scale_factor
         
         # Return R, T_scaled
@@ -1724,15 +1758,6 @@ class WandCalibrator:
         if num_cams < 2:
             raise RuntimeError("Need at least 2 cameras.")
 
-        # Intrinsic Matrix (Initial Guess)
-        cx, cy = self.image_size[1] / 2.0, self.image_size[0] / 2.0
-        K_init = np.array([
-            [initial_focal_len_px, 0, cx],
-            [0, initial_focal_len_px, cy],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        dist_init = np.zeros(5) 
-
         # Find best pair for initialization (max shared frames)
         # Support pair_override for forced pair selection
         if pair_override is not None:
@@ -1787,8 +1812,10 @@ class WandCalibrator:
             
             print(f"[Phase 1] Auto-selected best pair: Cam {best_pair[0]} <-> Cam {best_pair[1]} ({max_shared_pts} points)")
         
-        # Run 8-Point Algo
-        R_rel, T_rel, scale_factor_est = self.initialize_geometry_from_pair(best_pair[0], best_pair[1], wand_data, K_init, dist_init, wand_length_mm)
+        # Run 8-Point Algo with per-camera intrinsics from table
+        R_rel, T_rel, scale_factor_est = self.initialize_geometry_from_pair(
+            best_pair[0], best_pair[1], wand_data, wand_length_mm
+        )
         
         # Initialize Cameras
         cam_params = np.zeros((num_cams, 11)) # rvec(3), tvec(3), f, cx, cy, k1, k2
@@ -1806,10 +1833,14 @@ class WandCalibrator:
             else:
                 cam_focal = initial_focal_len_px  # Fallback to default
             
+            _, cam_w, cam_h = self._get_cam_setting(orig_cam_id)
+            cam_cx = cam_w / 2.0
+            cam_cy = cam_h / 2.0
+
             # Intrinsics
             cam_params[i, 6] = cam_focal
-            cam_params[i, 7] = cx
-            cam_params[i, 8] = cy
+            cam_params[i, 7] = cam_cx
+            cam_params[i, 8] = cam_cy
             # k1, k2 = 0
             
             # Extrinsics
@@ -2037,9 +2068,11 @@ class WandCalibrator:
                     f_init = self.camera_settings[sec_cam]['focal']
                 else:
                     f_init = initial_focal_len_px  # Fallback to default
-                cx, cy = self.image_size[1] / 2.0, self.image_size[0] / 2.0
+                _, sec_w, sec_h = self._get_cam_setting(sec_cam)
+                cx, cy = sec_w / 2.0, sec_h / 2.0
                 K_sec = np.array([[f_init, 0, cx], [0, f_init, cy], [0, 0, 1]], dtype=np.float64)
                 d_sec = np.zeros(5)
+                sec_img_size = (sec_h, sec_w)
                 
                 success, rvec, tvec = cv2.solvePnP(p3d_arr, p2d_arr, K_sec, d_sec, flags=cv2.SOLVEPNP_EPNP)
                 if success:
@@ -2082,7 +2115,7 @@ class WandCalibrator:
                         res_cam = scipy.optimize.least_squares(
                             self._residuals_single_cam,
                             x0_cam,
-                            args=(p3d_arr, p2d_arr, self.image_size),
+                            args=(p3d_arr, p2d_arr, sec_img_size),
                             method='trf',
                             bounds=(lb_cam, ub_cam),
                             ftol=1e-5,
@@ -2097,7 +2130,7 @@ class WandCalibrator:
                             cam_params[c_idx, 9] = res_cam.x[7]  # k1
                         
                         # Calculate initial and final reprojection error
-                        err_init = np.sqrt(np.mean(self._residuals_single_cam(x0_cam, p3d_arr, p2d_arr, self.image_size)**2))
+                        err_init = np.sqrt(np.mean(self._residuals_single_cam(x0_cam, p3d_arr, p2d_arr, sec_img_size)**2))
                         err_final = np.sqrt(np.mean(res_cam.fun**2))
                         if self.dist_coeff_num >= 1:
                             print(f"    Optimized: f={res_cam.x[6]:.1f}px, k1={res_cam.x[7]:.4f}, RMS: {err_init:.2f}→{err_final:.2f}px")
@@ -3136,8 +3169,9 @@ class WandCalibrator:
             # Ensure tvec is column vector for matrix operations
             tvec_col = tvec.reshape(3, 1)
             
+            _, cam_w, cam_h = self._get_cam_setting(c_idx)
             self.final_params[c_idx] = {
-                'R': R, 'T': tvec_col, 'K': K, 'dist': dist, 'img_size': (h,w)
+                'R': R, 'T': tvec_col, 'K': K, 'dist': dist, 'img_size': (cam_h, cam_w)
             }
             
             # Debug: print camera center

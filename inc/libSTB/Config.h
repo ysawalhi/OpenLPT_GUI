@@ -27,6 +27,7 @@ public:
   std::vector<std::shared_ptr<Camera>> _cam_list;
   AxisLimit _axis_limit;
   double _voxel_to_mm;
+  std::string _config_root;
   std::string _output_path;
   std::vector<std::string> _image_file_paths;
   std::vector<std::string> _object_types;

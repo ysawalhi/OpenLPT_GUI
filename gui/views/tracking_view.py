@@ -1040,7 +1040,10 @@ class TrackingView(QWidget):
                         if i + 1 < len(lines):
                             path_line = lines[i+1].strip()
                             if path_line and not path_line.startswith('#'):
-                                output_dir = path_line
+                                if os.path.isabs(path_line):
+                                    output_dir = path_line
+                                else:
+                                    output_dir = os.path.normpath(os.path.join(proj_dir, path_line))
                                 break
         
         track_dir = os.path.join(output_dir, "ConvergeTrack")
@@ -1373,7 +1376,10 @@ class TrackingView(QWidget):
                         if i + 1 < len(lines):
                             path_line = lines[i+1].strip()
                             if path_line and not path_line.startswith('#'):
-                                output_dir = path_line
+                                if os.path.isabs(path_line):
+                                    output_dir = path_line
+                                else:
+                                    output_dir = os.path.normpath(os.path.join(proj_dir, path_line))
                                 break
         
         track_dir = os.path.join(output_dir, "ConvergeTrack")
@@ -1655,15 +1661,23 @@ class TrackingView(QWidget):
                     with open(txt_path, 'r') as f:
                         img_lines = [l.strip() for l in f if l.strip()]
                         
-                        # VSC Protocol: Paths are relative to the directory containing the .txt file
+                        # Path semantics:
+                        # 1) prefer project-root-relative (current config/preprocess behavior)
+                        # 2) fallback to txt-directory-relative (legacy behavior)
                         base_dir = os.path.dirname(txt_path)
                         resolved_paths = []
                         for l in img_lines:
                              if os.path.isabs(l):
                                  resolved_paths.append(os.path.normpath(l))
                              else:
-                                 # Correctly join filename with its parent directory
-                                 resolved_paths.append(os.path.normpath(os.path.join(base_dir, l)))
+                                 cand_proj = os.path.normpath(os.path.join(proj_path, l)) if proj_path else ""
+                                 cand_base = os.path.normpath(os.path.join(base_dir, l))
+                                 if cand_proj and os.path.exists(cand_proj):
+                                     resolved_paths.append(cand_proj)
+                                 elif os.path.exists(cand_base):
+                                     resolved_paths.append(cand_base)
+                                 else:
+                                     resolved_paths.append(cand_proj if cand_proj else cand_base)
                         
                         self.cam_image_paths[cam_key] = resolved_paths
                 except Exception as e:

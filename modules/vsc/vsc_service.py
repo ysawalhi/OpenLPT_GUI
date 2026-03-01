@@ -407,6 +407,64 @@ class VSCService:
             self._log(f"  Refractive windows loaded from CPP: {len(self.window_planes)}")
         else:
             self._log("  Warning: No refractive window plane loaded from CPP")
+
+    def _build_window_refraction_from_cpp(self) -> Dict[int, dict]:
+        """Collect per-window refractive media/solver settings from C++ PINPLATE state."""
+        window_refraction: Dict[int, dict] = {}
+
+        for cam_idx, cpp_cam in self.cpp_cameras.items():
+            wid = self.cam_to_window.get(int(cam_idx), None)
+            if wid is None:
+                continue
+            wid = int(wid)
+
+            try:
+                pin = cpp_cam._pinplate_param
+                refract_array = [float(v) for v in list(pin.refract_array)]
+                w_array = [float(v) for v in list(pin.w_array)]
+                proj_tol = float(pin.proj_tol)
+                proj_nmax = int(pin.proj_nmax)
+                lr = float(pin.lr)
+            except Exception as e:
+                self._log(f"  Warning: Failed reading refraction settings from cam{cam_idx}: {e}")
+                continue
+
+            if len(refract_array) < 3 or len(w_array) < 1:
+                self._log(
+                    f"  Warning: cam{cam_idx} has incomplete refraction arrays; "
+                    f"skip window {wid} settings"
+                )
+                continue
+
+            curr = {
+                'refract_array': refract_array,
+                'w_array': w_array,
+                'proj_tol': proj_tol,
+                'proj_nmax': proj_nmax,
+                'lr': lr,
+            }
+
+            if wid in window_refraction:
+                prev = window_refraction[wid]
+                mismatch = (
+                    len(prev['refract_array']) != len(curr['refract_array'])
+                    or len(prev['w_array']) != len(curr['w_array'])
+                    or np.linalg.norm(np.asarray(prev['refract_array']) - np.asarray(curr['refract_array'])) > 1e-9
+                    or np.linalg.norm(np.asarray(prev['w_array']) - np.asarray(curr['w_array'])) > 1e-9
+                    or abs(float(prev['proj_tol']) - float(curr['proj_tol'])) > 1e-12
+                    or int(prev['proj_nmax']) != int(curr['proj_nmax'])
+                    or abs(float(prev['lr']) - float(curr['lr'])) > 1e-12
+                )
+                if mismatch:
+                    self._log(
+                        f"  Warning: window {wid} refraction settings mismatch across cameras; "
+                        f"using cam{cam_idx} values"
+                    )
+
+            window_refraction[wid] = curr
+
+        self._log(f"  Refractive window settings loaded: {len(window_refraction)}")
+        return window_refraction
     
     def _load_object_config(self) -> Tuple[bool, str]:
         """Load object configuration to get obj_radius."""
@@ -1005,10 +1063,11 @@ class VSCService:
                 return img_loaders
             
             # Create ImageIO for each camera
+            folder_base = os.path.abspath(self.proj_dir).replace('\\', '/') + '/'
             for cam_idx, path in enumerate(image_paths):
                 try:
                     io = lpt.ImageIO()
-                    io.loadImgPath("", path)
+                    io.loadImgPath(folder_base, path)
                     img_loaders[cam_idx] = io
                     self._log(f"  Loaded ImageIO for camera {cam_idx}: {path}")
                 except Exception as e:
@@ -1120,7 +1179,10 @@ class VSCService:
             if len(corr_ref) < 10:
                 return False, f"Not enough PINPLATE correspondences ({len(corr_ref)})"
 
-            optimizer = RefractionVSCOptimizer(
+            window_refraction = self._build_window_refraction_from_cpp()
+
+            self._log("  [Refraction VSC] Stage 1/3: optimize camera extrinsics (max_nfev=50)")
+            optimizer_stage1 = RefractionVSCOptimizer(
                 max_nfev=50,
                 ftol=1e-6,
                 xtol=1e-6,
@@ -1129,10 +1191,56 @@ class VSCService:
                 beta_side_dir=1e4,
                 tau=0.01,
             )
-            optimizer.set_log_callback(self._log)
-            optimized_states, info = optimizer.optimize_all_cameras(
+            optimizer_stage1.set_log_callback(self._log)
+            optimized_states_stage1, info_stage1 = optimizer_stage1.optimize_all_cameras(
                 self.cpp_cameras,
                 camera_states,
+                corr_ref,
+                self.cam_to_window,
+                self.window_planes,
+            )
+
+            self._log(
+                "  [Refraction VSC] Stage 2/3: optimize window planes "
+                "(delta_d<5mm, delta_theta<2deg, max_nfev=50)"
+            )
+            optimizer_stage2 = RefractionVSCOptimizer(
+                max_nfev=50,
+                ftol=1e-6,
+                xtol=1e-6,
+                margin_side_mm=0.05,
+                alpha_side_gate=10.0,
+                beta_side_dir=1e4,
+                tau=0.01,
+            )
+            optimizer_stage2.set_log_callback(self._log)
+            window_planes_stage2, info_stage2 = optimizer_stage2.optimize_window_planes(
+                self.cpp_cameras,
+                optimized_states_stage1,
+                corr_ref,
+                self.cam_to_window,
+                self.window_planes,
+                window_refraction,
+                max_nfev=50,
+                max_delta_d_mm=5.0,
+                max_delta_theta_deg=2.0,
+            )
+            self.window_planes = window_planes_stage2
+
+            self._log("  [Refraction VSC] Stage 3/3: refine camera extrinsics (max_nfev=20)")
+            optimizer_stage3 = RefractionVSCOptimizer(
+                max_nfev=20,
+                ftol=1e-6,
+                xtol=1e-6,
+                margin_side_mm=0.05,
+                alpha_side_gate=10.0,
+                beta_side_dir=1e4,
+                tau=0.01,
+            )
+            optimizer_stage3.set_log_callback(self._log)
+            optimized_states, info = optimizer_stage3.optimize_all_cameras(
+                self.cpp_cameras,
+                optimized_states_stage1,
                 corr_ref,
                 self.cam_to_window,
                 self.window_planes,
@@ -1638,6 +1746,7 @@ def init_worker(proj_dir: str, params: Dict, cameras_indices: List[int]):
     
     global _worker_context
     _worker_context = {}
+    _worker_context['proj_dir'] = proj_dir
     
     try:
         import pyopenlpt as lpt
@@ -1674,7 +1783,8 @@ def init_worker(proj_dir: str, params: Dict, cameras_indices: List[int]):
             if cam_idx < len(image_paths):
                 try:
                     io = lpt.ImageIO()
-                    io.loadImgPath("", image_paths[cam_idx])
+                    folder_base = os.path.abspath(proj_dir).replace('\\', '/') + '/'
+                    io.loadImgPath(folder_base, image_paths[cam_idx])
                     img_ios[cam_idx] = io
                 except Exception:
                     pass

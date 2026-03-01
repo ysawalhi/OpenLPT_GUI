@@ -40,6 +40,8 @@ def select_best_pair_via_precalib(base_calibrator, wand_len_mm: float, initial_f
     print("\n[BOOT] Running Precalibration Check to select best pair...")
     
     try:
+        if not hasattr(base_calibrator, 'run_precalibration_check'):
+            raise AttributeError("run_precalibration_check is unavailable on base calibrator")
         ret, msg, precalib_result = base_calibrator.run_precalibration_check(
             wand_length=wand_len_mm,
             init_focal_length=initial_focal_px
@@ -70,10 +72,45 @@ def select_best_pair_via_precalib(base_calibrator, wand_len_mm: float, initial_f
                  return (cams[0], cams[1])
              return None
 
-        # Sort by count desc
+        # Sort by shared count desc; tie-break by median pixel disparity (larger is better).
         sorted_pairs = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        best_pair = sorted_pairs[0][0]
-        print(f"[BOOT] Fallback: Selected pair {best_pair} with {sorted_pairs[0][1]} shared frames.")
+
+        def _extract_uv(pts):
+            if pts is None:
+                return None
+            arr = np.asarray(pts)
+            if arr.ndim == 1 and arr.shape[0] >= 2:
+                return np.array(arr[:2], dtype=np.float64)
+            if arr.ndim >= 2 and arr.shape[0] >= 1 and arr.shape[1] >= 2:
+                # Use centroid of first two detected points (small/large) when available.
+                n = min(2, arr.shape[0])
+                return np.mean(arr[:n, :2].astype(np.float64), axis=0)
+            return None
+
+        def _pair_disparity(pair):
+            c1, c2 = pair
+            d = []
+            for _, cams in points.items():
+                if c1 not in cams or c2 not in cams:
+                    continue
+                uv1 = _extract_uv(cams[c1])
+                uv2 = _extract_uv(cams[c2])
+                if uv1 is None or uv2 is None:
+                    continue
+                disp = np.linalg.norm(uv1 - uv2)
+                if np.isfinite(disp):
+                    d.append(float(disp))
+            if not d:
+                return -1.0
+            return float(np.median(d))
+
+        top_count = sorted_pairs[0][1]
+        top_pairs = [p for p, cnt in sorted_pairs if cnt == top_count]
+        best_pair = max(top_pairs, key=_pair_disparity)
+        print(
+            f"[BOOT] Fallback: Selected pair {best_pair} with {top_count} shared frames "
+            f"(median disparity={_pair_disparity(best_pair):.2f}px)."
+        )
         return best_pair
 
     if not ret:
@@ -143,13 +180,29 @@ class PinholeBootstrapP0:
     
     def __init__(self, config: PinholeBootstrapP0Config):
         self.config = config
+
+    @staticmethod
+    def _get_camera_intrinsics(cam_id: int, camera_settings: Dict[int, dict]) -> Tuple[np.ndarray, float, float, float]:
+        if cam_id not in camera_settings:
+            raise ValueError(f"[P0] Missing camera_settings for cam {cam_id}")
+        cfg = camera_settings[cam_id]
+        f = float(cfg.get('focal', 0.0))
+        w = float(cfg.get('width', 0.0))
+        h = float(cfg.get('height', 0.0))
+        if f <= 0 or w <= 0 or h <= 0:
+            raise ValueError(
+                f"[P0] Invalid camera_settings for cam {cam_id}: focal={f}, width={w}, height={h}"
+            )
+        cx, cy = w / 2.0, h / 2.0
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        return K, f, cx, cy
         
     def run(
         self,
         cam_i: int,
         cam_j: int,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
-        image_size: Tuple[int, int],
+        camera_settings: Dict[int, dict],
         progress_callback=None
     ) -> Tuple[np.ndarray, np.ndarray, dict]:
         """
@@ -160,7 +213,7 @@ class PinholeBootstrapP0:
         Args:
             cam_i, cam_j: Camera IDs (cam_i fixed at origin)
             observations: {fid: {cid: (uvA, uvB)}}
-            image_size: (width, height) in pixels
+            camera_settings: per-camera intrinsics source from UI table
             progress_callback: Optional callback(phase, ray, len, cost)
             
         Returns:
@@ -168,16 +221,8 @@ class PinholeBootstrapP0:
             params_j: [rvec(3), tvec(3)] for cam_j (from 8-Point + refinement)
             report: diagnostics dict
         """
-        W, H = image_size
-        cx, cy = W / 2, H / 2
-        f_ui = self.config.ui_focal_px
-        
-        # Build frozen camera matrix
-        K = np.array([
-            [f_ui, 0, cx],
-            [0, f_ui, cy],
-            [0, 0, 1]
-        ], dtype=np.float64)
+        K_i, f_i, cx_i, cy_i = self._get_camera_intrinsics(cam_i, camera_settings)
+        K_j, f_j, cx_j, cy_j = self._get_camera_intrinsics(cam_j, camera_settings)
         
         print(f"\n{'='*60}")
         print(f"[P0] Pinhole Bootstrap - Frozen Intrinsics (8-Point)")
@@ -186,7 +231,7 @@ class PinholeBootstrapP0:
         
         if progress_callback:
             try:
-                progress_callback("P0 Pair Init", 0, 0, 0)
+                progress_callback("P0 Pair Init", -1, 0, 0, 0)
             except:
                 pass
         
@@ -216,18 +261,30 @@ class PinholeBootstrapP0:
         print(f"\n[P0] Step 1: Essential Matrix (8-Point Algorithm)...")
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
 
-        # Step 1: Essential Matrix
-        E, mask = cv2.findEssentialMat(pts_i, pts_j, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        # Step 1: Essential Matrix (normalized rays, supports different intrinsics)
+        pts_i_norm = cv2.undistortPoints(pts_i.reshape(-1, 1, 2), K_i, None).reshape(-1, 2)
+        pts_j_norm = cv2.undistortPoints(pts_j.reshape(-1, 1, 2), K_j, None).reshape(-1, 2)
+        E, mask = cv2.findEssentialMat(
+            pts_i_norm,
+            pts_j_norm,
+            focal=1.0,
+            pp=(0.0, 0.0),
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1e-3,
+        )
         
         if E is None or E.shape != (3, 3):
             raise RuntimeError("[P0 FAIL] Essential Matrix computation failed")
         
         # Step 2: Recover Pose (R, t)
-        n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(E, pts_i, pts_j, K)
+        n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(
+            E, pts_i_norm, pts_j_norm, focal=1.0, pp=(0.0, 0.0)
+        )
         
         print(f"  Inliers: {n_inliers} / {len(pts_i)}")
         
@@ -235,16 +292,16 @@ class PinholeBootstrapP0:
         print(f"\n[P0] Step 2: Triangulation & Scale Recovery...")
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
         
         # Projection matrices (cam_i at origin)
-        P_i = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        P_j = K @ np.hstack([R_rel, t_rel])
+        P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
+        P_j = np.hstack([R_rel, t_rel])
         
         # Triangulate all points
-        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i.T, pts_j.T)
+        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
         pts_3d = (pts_4d_hom[:3] / pts_4d_hom[3]).T  # (N, 3)
         
         # Compute wand lengths
@@ -276,7 +333,7 @@ class PinholeBootstrapP0:
         print(f"\n[P0] Step 3: Extrinsic Refinement (frozen intrinsics)...")
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
         
@@ -333,6 +390,10 @@ class PinholeBootstrapP0:
             t_j = p_j[3:6].reshape(3, 1)
             
             res = []
+            sq_err_len = 0.0
+            n_len = 0
+            sq_err_proj = 0.0
+            n_proj = 0
             for idx, fid in enumerate(valid_frames):
                 uvA_i, uvB_i = observations[fid][cam_i]
                 uvA_j, uvB_j = observations[fid][cam_j]
@@ -342,18 +403,29 @@ class PinholeBootstrapP0:
                 
                 # Wand length
                 wand_len = np.linalg.norm(ptB - ptA)
-                res.append(wand_len - self.config.wand_length_mm)
+                d_len = wand_len - self.config.wand_length_mm
+                res.append(d_len)
+                sq_err_len += d_len * d_len
+                n_len += 1
                 
                 # Reprojections with frozen K
-                proj_Ai = self._project(ptA, R_i, t_i, K)
-                proj_Bi = self._project(ptB, R_i, t_i, K)
-                res.extend((proj_Ai - uvA_i).tolist())
-                res.extend((proj_Bi - uvB_i).tolist())
-                
-                proj_Aj = self._project(ptA, R_j, t_j, K)
-                proj_Bj = self._project(ptB, R_j, t_j, K)
-                res.extend((proj_Aj - uvA_j).tolist())
-                res.extend((proj_Bj - uvB_j).tolist())
+                proj_Ai = self._project(ptA, R_i, t_i, K_i)
+                proj_Bi = self._project(ptB, R_i, t_i, K_i)
+                diff_Ai = (proj_Ai - uvA_i)
+                diff_Bi = (proj_Bi - uvB_i)
+                res.extend(diff_Ai.tolist())
+                res.extend(diff_Bi.tolist())
+                sq_err_proj += float(np.sum(diff_Ai**2) + np.sum(diff_Bi**2))
+                n_proj += 4
+
+                proj_Aj = self._project(ptA, R_j, t_j, K_j)
+                proj_Bj = self._project(ptB, R_j, t_j, K_j)
+                diff_Aj = (proj_Aj - uvA_j)
+                diff_Bj = (proj_Bj - uvB_j)
+                res.extend(diff_Aj.tolist())
+                res.extend(diff_Bj.tolist())
+                sq_err_proj += float(np.sum(diff_Aj**2) + np.sum(diff_Bj**2))
+                n_proj += 4
 
             # To numpy
             res_arr = np.array(res)
@@ -362,19 +434,18 @@ class PinholeBootstrapP0:
             self._res_call_count += 1
             if progress_callback and self._res_call_count % 5 == 0:
                 try:
-                    # Parse residuals
-                    # Structure: [len_err, 8x ray_err] per frame
-                    # Reshape to (N_frames, 9)
-                    res_mat = res_arr.reshape(-1, 9)
-                    
-                    len_errs = res_mat[:, 0]
-                    ray_errs = res_mat[:, 1:].flatten()
-                    
-                    rmse_len = np.sqrt(np.mean(len_errs**2))
-                    rmse_ray = np.sqrt(np.mean(ray_errs**2))
+                    rmse_len = np.sqrt(sq_err_len / max(1, n_len))
+                    rmse_proj = np.sqrt(sq_err_proj / max(1, n_proj))
+                    rmse_ray = -1.0
                     cost = 0.5 * np.sum(res_arr**2)
-                    
-                    progress_callback("Use PinHole model to initialize camera parameters...", rmse_ray, rmse_len, cost)
+
+                    progress_callback(
+                        "Use PinHole model to initialize camera parameters...",
+                        rmse_ray,
+                        rmse_len,
+                        rmse_proj,
+                        cost,
+                    )
                 except:
                     pass
             
@@ -403,7 +474,7 @@ class PinholeBootstrapP0:
         # Compute diagnostics
         report = self._compute_diagnostics(
             cam_i, cam_j, params_i_opt, params_j_opt,
-            observations, valid_frames, K
+            observations, valid_frames, K_i, K_j
         )
         report['scale_factor'] = scale_factor
         report['n_inliers'] = n_inliers
@@ -432,6 +503,28 @@ class PinholeBootstrapP0:
         pt_norm = pt_cam[:2] / pt_cam[2]
         pt_px = K[:2, :2] @ pt_norm + K[:2, 2]
         return pt_px
+
+    def _ray_dir_world(self, uv: np.ndarray, K: np.ndarray, R: np.ndarray) -> np.ndarray:
+        """Build world-space pinhole ray direction from pixel coordinate."""
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+        x = (float(uv[0]) - cx) / max(abs(fx), 1e-12)
+        y = (float(uv[1]) - cy) / max(abs(fy), 1e-12)
+        d_cam = np.array([x, y, 1.0], dtype=np.float64)
+        d_cam /= (np.linalg.norm(d_cam) + 1e-12)
+        d_world = R.T @ d_cam
+        d_world /= (np.linalg.norm(d_world) + 1e-12)
+        return d_world
+
+    def _point_to_ray_dist(self, X: np.ndarray, C: np.ndarray, d: np.ndarray) -> float:
+        """Distance from 3D point to 3D ray (half-line), in mm."""
+        v = X - C
+        t = float(np.dot(v, d))
+        if t < 0.0:
+            return float(np.linalg.norm(v))
+        return float(np.linalg.norm(v - t * d))
     
     def _collect_valid_frames(
         self,
@@ -457,7 +550,8 @@ class PinholeBootstrapP0:
         params_j: np.ndarray,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
         valid_frames: List[int],
-        K: np.ndarray,
+        K_i: np.ndarray,
+        K_j: np.ndarray,
     ) -> dict:
         """Compute diagnostics after optimization."""
         # Build projection matrices
@@ -466,8 +560,8 @@ class PinholeBootstrapP0:
         R_j, _ = cv2.Rodrigues(params_j[:3])
         t_j = params_j[3:6].reshape(3, 1)
         
-        P_i = K @ np.hstack([R_i, t_i])
-        P_j = K @ np.hstack([R_j, t_j])
+        P_i = K_i @ np.hstack([R_i, t_i])
+        P_j = K_j @ np.hstack([R_j, t_j])
         
         wand_lengths = []
         reproj_errors = []
@@ -488,8 +582,8 @@ class PinholeBootstrapP0:
             wand_lengths.append(np.linalg.norm(ptB - ptA))
             
             # Reprojection error
-            proj_Ai = self._project(ptA, R_i, t_i, K)
-            proj_Aj = self._project(ptA, R_j, t_j, K)
+            proj_Ai = self._project(ptA, R_i, t_i, K_i)
+            proj_Aj = self._project(ptA, R_j, t_j, K_j)
             
             reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
             reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
@@ -535,7 +629,7 @@ class PinholeBootstrapP0:
         cam_params: Dict[int, np.ndarray],
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
         points_3d: Dict[int, Tuple[np.ndarray, np.ndarray]],
-        image_size: Tuple[int, int],
+        camera_settings: Dict[int, dict],
         all_cam_ids: List[int],
     ) -> Dict[int, np.ndarray]:
         """
@@ -545,17 +639,6 @@ class PinholeBootstrapP0:
         - Collect 2D-3D correspondences from points_3d
         - Solve PnP with frozen intrinsics
         """
-        W, H = image_size
-        cx, cy = W / 2, H / 2
-        f_ui = self.config.ui_focal_px
-        
-        # Camera matrix (frozen)
-        K = np.array([
-            [f_ui, 0, cx],
-            [0, f_ui, cy],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        
         dist_coeffs = np.zeros(5)
         
         calibrated_cams = set(cam_params.keys())
@@ -601,6 +684,7 @@ class PinholeBootstrapP0:
             
             print(f"    Correspondences: {len(pts_2d)}")
             
+            K, _, _, _ = self._get_camera_intrinsics(cid, camera_settings)
             # Solve PnP with frozen intrinsics (EPNP + ITERATIVE, like original)
             success, rvec, tvec = cv2.solvePnP(
                 pts_3d_arr, pts_2d, K, dist_coeffs,
@@ -671,22 +755,19 @@ class PinholeBootstrapP0:
         params_i: np.ndarray,
         params_j: np.ndarray,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
-        image_size: Tuple[int, int],
+        camera_settings: Dict[int, dict],
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         """Triangulate all 3D wand points using Phase 1 cameras."""
-        W, H = image_size
-        cx, cy = W / 2, H / 2
-        f_ui = self.config.ui_focal_px
-        
-        K = np.array([[f_ui, 0, cx], [0, f_ui, cy], [0, 0, 1]], dtype=np.float64)
+        K_i, _, _, _ = self._get_camera_intrinsics(cam_i, camera_settings)
+        K_j, _, _, _ = self._get_camera_intrinsics(cam_j, camera_settings)
         
         R_i, _ = cv2.Rodrigues(params_i[:3])
         t_i = params_i[3:6].reshape(3, 1)
         R_j, _ = cv2.Rodrigues(params_j[:3])
         t_j = params_j[3:6].reshape(3, 1)
         
-        P_i = K @ np.hstack([R_i, t_i])
-        P_j = K @ np.hstack([R_j, t_j])
+        P_i = K_i @ np.hstack([R_i, t_i])
+        P_j = K_j @ np.hstack([R_j, t_j])
         
         points_3d = {}
         valid_frames = self._collect_valid_frames(observations, cam_i, cam_j)
@@ -711,7 +792,7 @@ class PinholeBootstrapP0:
         self,
         cam_params: Dict[int, np.ndarray],
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
-        image_size: Tuple[int, int],
+        camera_settings: Dict[int, dict],
         progress_callback=None
     ) -> Dict[int, np.ndarray]:
         """
@@ -719,11 +800,9 @@ class PinholeBootstrapP0:
         
         Joint optimization of all camera extrinsics + 3D points.
         """
-        W, H = image_size
-        cx, cy = W / 2, H / 2
-        f_ui = self.config.ui_focal_px
-        
-        K = np.array([[f_ui, 0, cx], [0, f_ui, cy], [0, 0, 1]], dtype=np.float64)
+        K_by_cam = {}
+        for cid in cam_params.keys():
+            K_by_cam[cid], _, _, _ = self._get_camera_intrinsics(cid, camera_settings)
         
         all_cam_ids = sorted(cam_params.keys())
         n_cams = len(all_cam_ids)
@@ -733,7 +812,7 @@ class PinholeBootstrapP0:
         print(f"[P0 Phase 3] Global BA with frozen intrinsics")
         print(f"{'='*60}")
         print(f"  Cameras: {all_cam_ids}")
-        print(f"  Frozen focal: {f_ui:.1f} px")
+        print("  Frozen intrinsics: per-camera table values")
         
         # Collect valid frames (seen by at least 2 calibrated cameras)
         valid_frames = []
@@ -767,8 +846,8 @@ class PinholeBootstrapP0:
             R2, _ = cv2.Rodrigues(p2[:3])
             t2 = p2[3:6].reshape(3, 1)
             
-            P1 = K @ np.hstack([R1, t1])
-            P2 = K @ np.hstack([R2, t2])
+            P1 = K_by_cam[c1] @ np.hstack([R1, t1])
+            P2 = K_by_cam[c2] @ np.hstack([R2, t2])
             
             uvA_1, uvB_1 = observations[fid][c1]
             uvA_2, uvB_2 = observations[fid][c2]
@@ -859,8 +938,8 @@ class PinholeBootstrapP0:
             # Track stats for progress reporting
             sq_err_len = 0.0
             n_len = 0
-            sq_err_ray = 0.0
-            n_ray = 0
+            sq_err_proj = 0.0
+            n_proj = 0
             
             for frame_idx, (fid, cams_in_frame) in enumerate(frame_cams):
                 ptA = pts[frame_idx * 2]
@@ -880,30 +959,40 @@ class PinholeBootstrapP0:
                     uvA, uvB = observations[fid][cid]
                     
                     # Project ptA
-                    proj_A = self._project(ptA, R, t, K)
+                    proj_A = self._project(ptA, R, t, K_by_cam[cid])
                     diffA = proj_A - uvA
                     res.extend(diffA.tolist())
+                    sq_err_proj += float(np.sum(diffA**2))
+                    n_proj += 2
                     
                     # Project ptB
-                    proj_B = self._project(ptB, R, t, K)
+                    proj_B = self._project(ptB, R, t, K_by_cam[cid])
                     diffB = proj_B - uvB
                     res.extend(diffB.tolist())
-                    
-                    sq_err_ray += np.sum(diffA**2) + np.sum(diffB**2)
-                    n_ray += 4 # 2 points * 2 coords
-            
+                    sq_err_proj += float(np.sum(diffB**2))
+                    n_proj += 2
+
+            res_arr = np.array(res)
+
             # Report progress
             self._phase3_res_count += 1
             if progress_callback and self._phase3_res_count % 5 == 0:
                 try:
                     rmse_len = np.sqrt(sq_err_len / max(1, n_len))
-                    rmse_ray = np.sqrt(sq_err_ray / max(1, n_ray))
-                    cost = 0.5 * (sq_err_len + sq_err_ray)
-                    progress_callback("Use PinHole model to initialize camera parameters...", rmse_ray, rmse_len, cost)
+                    rmse_ray = -1.0
+                    rmse_proj = np.sqrt(sq_err_proj / max(1, n_proj))
+                    cost = 0.5 * float(np.sum(res_arr**2))
+                    progress_callback(
+                        "Use PinHole model to initialize camera parameters...",
+                        rmse_ray,
+                        rmse_len,
+                        rmse_proj,
+                        cost,
+                    )
                 except:
                     pass
             
-            return np.array(res)
+            return res_arr
 
         
         # Run global BA
@@ -940,7 +1029,7 @@ class PinholeBootstrapP0:
         cam_i: int,
         cam_j: int,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
-        image_size: Tuple[int, int],
+        camera_settings: Dict[int, dict],
         all_cam_ids: List[int],
         progress_callback=None
     ) -> Tuple[Dict[int, np.ndarray], dict]:
@@ -950,7 +1039,9 @@ class PinholeBootstrapP0:
         All phases use frozen intrinsics (fixed focal length).
         """
         # Phase 1: Calibrate best pair
-        params_i, params_j, report = self.run(cam_i, cam_j, observations, image_size, progress_callback=progress_callback)
+        params_i, params_j, report = self.run(
+            cam_i, cam_j, observations, camera_settings, progress_callback=progress_callback
+        )
         
         cam_params = {
             cam_i: params_i,
@@ -961,12 +1052,12 @@ class PinholeBootstrapP0:
         print(f"\n[P0] Triangulating 3D points for Phase 2...")
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
 
         points_3d = self.triangulate_all_points(
-            cam_i, cam_j, params_i, params_j, observations, image_size
+            cam_i, cam_j, params_i, params_j, observations, camera_settings
         )
         report['points_3d'] = points_3d
         print(f"  Triangulated {len(points_3d)} frames")
@@ -974,23 +1065,23 @@ class PinholeBootstrapP0:
         # Phase 2: Calibrate remaining cameras
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
         
         cam_params = self.run_phase2(
-            cam_params, observations, points_3d, image_size, all_cam_ids
+            cam_params, observations, points_3d, camera_settings, all_cam_ids
         )
         
         # Phase 3: Global BA with all cameras
         if progress_callback:
             try:
-                progress_callback("Use PinHole model to initialize camera parameters...", 0, 0, 0)
+                progress_callback("Use PinHole model to initialize camera parameters...", -1, 0, 0, 0)
             except:
                 pass
 
         cam_params = self.run_phase3(
-            cam_params, observations, image_size, progress_callback=progress_callback
+            cam_params, observations, camera_settings, progress_callback=progress_callback
         )
 
         

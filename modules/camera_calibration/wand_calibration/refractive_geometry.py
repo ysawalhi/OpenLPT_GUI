@@ -1,6 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import traceback
 
 @dataclass
 class Ray:
@@ -263,7 +264,19 @@ def build_pinplate_rays_cpp_batch(cam, uv_list, *, meta_list=None) -> list:
         return out
 
     pt2_list = [lpt.Pt2D(float(uv[0]), float(uv[1])) for uv in uv_list]
-    batch = cam.lineOfSightBatchStatus(pt2_list)
+    try:
+        batch = cam.lineOfSightBatchStatus(pt2_list)
+    except Exception as e:
+        uv0 = uv_list[0] if uv_list else None
+        uv1 = uv_list[-1] if uv_list else None
+        print(
+            "[CRASH-LOC][lineOfSightBatchStatus] "
+            f"cam={getattr(cam, '_cam_id', 'unknown')} n={len(pt2_list)} "
+            f"uv_first={uv0} uv_last={uv1} err={repr(e)}",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
+        raise
 
     rays = []
     for idx, (ok, line, err) in enumerate(batch):
@@ -699,73 +712,143 @@ def apply_coordinate_rotation(
 def align_world_y_to_plane_intersection(
     window_planes: dict,
     cam_params: dict,
-    points_3d: Optional[list] = None
-) -> Tuple[dict, dict, Optional[list], np.ndarray]:
+    points_3d: Optional[list] = None,
+    align_mode: str = "yz",
+) -> Tuple[dict, dict, Optional[list], np.ndarray, np.ndarray]:
     """
-    Align world Y-axis to the intersection line of two window planes.
+    Align world axes using window plane geometry.
+
+    - Two-window mode: one axis aligns to the plane intersection line and one axis
+      aligns to first plane normal, controlled by `align_mode`:
+        * "yz": line->Y, normal->Z (default)
+        * "xz": line->X, normal->Z
+        * "xy": line->X, normal->Y
+    - Single-window mode: plane normal aligns to normal-axis from `align_mode`
+      (2nd char), and in-plane axis is chosen from projected line-axis
+      (1st char) with robust fallback.
     
     Returns:
-        (new_cam_params, new_window_planes, new_points_3d, R_world)
+        (new_cam_params, new_window_planes, new_points_3d, R_world, t_shift)
     """
+    mode = str(align_mode).lower()
+    if mode not in ("yz", "xz", "xy"):
+        mode = "yz"
+
+    axis_line = mode[0]
+    axis_normal = mode[1]
+
+    axis_basis = {
+        'x': np.array([1.0, 0.0, 0.0]),
+        'y': np.array([0.0, 1.0, 0.0]),
+        'z': np.array([0.0, 0.0, 1.0]),
+    }
+
+    def _build_basis_from_axes(ax_map: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = ax_map.get('x')
+        y = ax_map.get('y')
+        z = ax_map.get('z')
+
+        if x is not None and y is not None:
+            z = np.cross(x, y)
+            z = z / (np.linalg.norm(z) + 1e-12)
+            y = np.cross(z, x)
+            y = y / (np.linalg.norm(y) + 1e-12)
+            x = np.cross(y, z)
+            x = x / (np.linalg.norm(x) + 1e-12)
+        elif y is not None and z is not None:
+            x = np.cross(y, z)
+            x = x / (np.linalg.norm(x) + 1e-12)
+            z = np.cross(x, y)
+            z = z / (np.linalg.norm(z) + 1e-12)
+            y = np.cross(z, x)
+            y = y / (np.linalg.norm(y) + 1e-12)
+        elif x is not None and z is not None:
+            y = np.cross(z, x)
+            y = y / (np.linalg.norm(y) + 1e-12)
+            x = np.cross(y, z)
+            x = x / (np.linalg.norm(x) + 1e-12)
+            z = np.cross(x, y)
+            z = z / (np.linalg.norm(z) + 1e-12)
+        else:
+            x = np.array([1.0, 0.0, 0.0])
+            y = np.array([0.0, 1.0, 0.0])
+            z = np.array([0.0, 0.0, 1.0])
+
+        return x, y, z
+
     wids = list(window_planes.keys())
-    
-    if len(wids) < 2:
-        # Only one plane, no intersection line
-        print("[Coordinate Alignment] Only one window plane, skipping Y-axis alignment.")
-        return cam_params, window_planes, points_3d, np.eye(3)
-    
-    # Use first two planes
+    if len(wids) < 1:
+        print("[Coordinate Alignment] No window planes, skipping alignment.")
+        return cam_params, window_planes, points_3d, np.eye(3), np.zeros(3)
+
     pl0 = window_planes[wids[0]]
-    pl1 = window_planes[wids[1]]
-    
-    n0 = np.array(pl0['plane_n'])
-    pt0 = np.array(pl0['plane_pt'])
-    n1 = np.array(pl1['plane_n'])
-    pt1 = np.array(pl1['plane_pt'])
-    
-    # Compute intersection line
-    line_dir, line_pt = compute_plane_intersection_line(n0, pt0, n1, pt1)
-    
-    # Sign stabilization: ensure line_dir points towards +Y hemisphere
-    line_dir = line_dir / (np.linalg.norm(line_dir) + 1e-12)
-    if np.dot(line_dir, np.array([0.0, 1.0, 0.0])) < 0:
-        line_dir = -line_dir
-    
-    print(f"[Coordinate Alignment] Intersection line direction: [{line_dir[0]:.4f}, {line_dir[1]:.4f}, {line_dir[2]:.4f}]")
-    
-    print(f"[Coordinate Alignment] Intersection line direction: [{line_dir[0]:.4f}, {line_dir[1]:.4f}, {line_dir[2]:.4f}]")
-    
-    # [USER REQUEST] Strict Alignment:
-    # 1. Y-axis = Intersection Line (lies on Plane 0)
-    # 2. X-axis = Parallel to Plane 0 (orthogonal to n0)
-    # 3. Z-axis = Normal of Plane 0 (n0)
-    
-    # New Basis Vectors (in Old Frame)
-    y_new = line_dir
-    z_new = n0 / (np.linalg.norm(n0) + 1e-12)
-    
-    # Check if Z points roughly "Forward" (usually Z > 0). If n0 is pointing back, flip it?
-    # But usually window normal points Out or In. 
-    # Let's verify orthogonality. Y is on Plane 0, so Y.dot(n0) should be 0.
-    # Force strict orthogonality for numerical stability
-    z_new = z_new - np.dot(z_new, y_new) * y_new
-    z_new = z_new / (np.linalg.norm(z_new) + 1e-12)
-    
-    # Construct X = Y cross Z (Right-handed)
-    x_new = np.cross(y_new, z_new)
-    x_new = x_new / (np.linalg.norm(x_new) + 1e-12)
-    
+    n0 = np.array(pl0['plane_n'], dtype=float)
+    n0 = n0 / (np.linalg.norm(n0) + 1e-12)
+
+    if n0[2] < 0:
+        n0 = -n0
+
+    if len(wids) >= 2:
+        pl1 = window_planes[wids[1]]
+        n1 = np.array(pl1['plane_n'])
+        pt0 = np.array(pl0['plane_pt'])
+        pt1 = np.array(pl1['plane_pt'])
+
+        # Compute intersection line
+        line_dir, _ = compute_plane_intersection_line(n0, pt0, n1, pt1)
+
+        # Sign stabilization: ensure line_dir points towards +Y hemisphere
+        line_dir = line_dir / (np.linalg.norm(line_dir) + 1e-12)
+        if np.dot(line_dir, np.array([0.0, 1.0, 0.0])) < 0:
+            line_dir = -line_dir
+
+        print(f"[Coordinate Alignment] Intersection line direction: [{line_dir[0]:.4f}, {line_dir[1]:.4f}, {line_dir[2]:.4f}]")
+
+        # Two-plane mode
+        line_vec = line_dir
+        normal_vec = n0 - np.dot(n0, line_vec) * line_vec
+        normal_vec = normal_vec / (np.linalg.norm(normal_vec) + 1e-12)
+
+        ax_map = {
+            axis_line: line_vec,
+            axis_normal: normal_vec,
+        }
+        x_new, y_new, z_new = _build_basis_from_axes(ax_map)
+
+        print(f"[Coordinate Alignment] Two-window mode ({mode}): {axis_line.upper()}<-intersection, {axis_normal.upper()}<-plane0 normal")
+    else:
+        # Single-plane mode
+        normal_vec = n0
+        preferred = axis_basis[axis_line]
+        in_plane = preferred - np.dot(preferred, normal_vec) * normal_vec
+        if np.linalg.norm(in_plane) < 1e-8:
+            for k in ('x', 'y', 'z'):
+                if k == axis_normal:
+                    continue
+                cand = axis_basis[k]
+                in_plane = cand - np.dot(cand, normal_vec) * normal_vec
+                if np.linalg.norm(in_plane) >= 1e-8:
+                    break
+        in_plane = in_plane / (np.linalg.norm(in_plane) + 1e-12)
+
+        ax_map = {
+            axis_line: in_plane,
+            axis_normal: normal_vec,
+        }
+        x_new, y_new, z_new = _build_basis_from_axes(ax_map)
+
+        print(f"[Coordinate Alignment] Single-window mode ({mode}): {axis_normal.upper()}<-plane normal")
+
     # Construct Rotation Matrix R_world (Old -> New)
     # Rows are the new basis vectors expressed in old frame
     R_world = np.vstack([x_new, y_new, z_new])
-    
-    # Verification: R_world @ line_dir should be [0, 1, 0]
-    line_dir_new = R_world @ line_dir
-    # Verification: R_world @ n0 should be [0, 0, 1] (or -1)
+
+    # Verification
     n0_new = R_world @ n0
-    
-    print(f"[ALIGN CHECK] Y-Axis (Intersection): {line_dir_new}")
     print(f"[ALIGN CHECK] Z-Axis (Plane 0 Normal): {n0_new}")
+    if len(wids) >= 2:
+        line_dir_new = R_world @ line_dir
+        print(f"[ALIGN CHECK] Y-Axis (Intersection): {line_dir_new}")
     
     # [USER REQUEST] Translation: Center World Origin at 3D Cloud Centroid
     t_shift = np.zeros(3)
