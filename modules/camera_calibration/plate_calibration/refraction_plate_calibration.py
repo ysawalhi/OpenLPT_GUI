@@ -21,6 +21,30 @@ from modules.camera_calibration.wand_calibration.refractive_geometry import (
 )
 
 
+def _summarize_errors(errs):
+    """Compute comprehensive error statistics from residual array.
+    
+    Args:
+        errs: List or array of error values
+        
+    Returns:
+        dict with keys: mean, std, median, p90, p95, max, count
+        or None if errs is empty
+    """
+    if not errs:
+        return None
+    arr = np.asarray(errs, dtype=np.float64)
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(np.max(arr)),
+        "count": int(arr.size),
+    }
+
+
 @dataclass
 class RefractionPlateConfig:
     method: str = "trf"
@@ -853,14 +877,27 @@ class RefractionPlateCalibrator:
                 except Exception:
                     pass
 
-        proj_stats = {}
-        tri_stats = {}
+        # Compute detailed statistics for each camera
+        proj_detail = {}
+        tri_detail = {}
         for cid in self.cam_ids:
             vp = per_cam_proj[cid]
             vt = per_cam_tri[cid]
-            proj_stats[cid] = (float(np.mean(vp)) if vp else 0.0, float(np.std(vp)) if vp else 0.0)
-            tri_stats[cid] = (float(np.mean(vt)) if vt else 0.0, float(np.std(vt)) if vt else 0.0)
-        return proj_stats, tri_stats
+            
+            # Compute detailed stats
+            proj_detail[cid] = _summarize_errors(vp) if vp else {}
+            tri_detail[cid] = _summarize_errors(vt) if vt else {}
+        
+        # Build legacy tuple format from detailed stats for backward compatibility
+        proj_stats = {}
+        tri_stats = {}
+        for cid in self.cam_ids:
+            pd = proj_detail[cid]
+            td = tri_detail[cid]
+            proj_stats[cid] = (pd.get("mean", 0.0), pd.get("std", 0.0)) if pd else (0.0, 0.0)
+            tri_stats[cid] = (td.get("mean", 0.0), td.get("std", 0.0)) if td else (0.0, 0.0)
+        
+        return proj_stats, tri_stats, proj_detail, tri_detail
 
     def run(self) -> Dict[str, Any]:
         self._init_pinhole_per_camera()
@@ -921,11 +958,11 @@ class RefractionPlateCalibrator:
         aligned_points = self._align_final()
         self._sync_cpp()
         try:
-            proj_stats, tri_stats = self._compute_error_stats()
+            proj_stats, tri_stats, proj_detail, tri_detail = self._compute_error_stats()
         except Exception as exc:
             if self.cfg.verbosity >= 1:
                 print(f"[PlateRefr] Warning: failed to compute final error stats: {exc}")
-            proj_stats, tri_stats = {}, {}
+            proj_stats, tri_stats, proj_detail, tri_detail = {}, {}, {}, {}
 
         cams_out = {}
         for cid in self.cam_ids:
@@ -968,6 +1005,8 @@ class RefractionPlateCalibrator:
             "cam_to_window": {int(k): int(v) for k, v in self.cam_to_window.items()},
             "per_camera_proj_err_stats": proj_stats,
             "per_camera_tri_err_stats": tri_stats,
+            "per_camera_proj_err_detail": proj_detail,
+            "per_camera_tri_err_detail": tri_detail,
             "aligned_points": aligned_points,
         }
 
