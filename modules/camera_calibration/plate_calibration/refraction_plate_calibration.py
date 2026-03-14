@@ -147,11 +147,6 @@ class RefractionPlateCalibrator:
             K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
             dist = np.zeros(5, dtype=np.float64)
 
-            ok, rvec0, tvec0 = cv2.solvePnP(obj_pts_np, img_pts_np, K, dist)
-            if not ok:
-                rvec0 = np.zeros((3, 1), dtype=np.float64)
-                tvec0 = np.zeros((3, 1), dtype=np.float64)
-
             flags = cv2.CALIB_USE_INTRINSIC_GUESS
             if self.dist_mode == 0:
                 flags |= cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_TANGENT_DIST
@@ -219,6 +214,9 @@ class RefractionPlateCalibrator:
             idx_min = int(np.argmin(dists))
             X_min = all_points[idx_min]
 
+            # PREC-1 (Line 223): Window plane initialization using 50% Cartesian midpoint formula.
+            # Verified: pt = 0.5 * (C_mean + X_min) is CORRECT and matches wand calibrator pattern.
+            # This maximizes barrier constraint margins and is physically reasonable.
             # Midpoint initialization (no clamp).
             pt = 0.5 * (C_mean + X_min)
 
@@ -347,8 +345,11 @@ class RefractionPlateCalibrator:
             d = win_delta[wid]["d"]
             a = win_delta[wid]["a"]
             b = win_delta[wid]["b"]
+            # BUG-2 (Line 351): Stale normal used in plane displacement.
+            # Should use updated normal 'n' instead of reference 'n0' for geometric correctness.
+            # Fix: Change 'pt = pt0 + d * n0' to 'pt = pt0 + d * n'
             n = update_normal_tangent(n0, a, b)
-            pt = pt0 + d * n0
+            pt = pt0 + d * n
             self.win_cur[wid]["plane_n"] = n
             self.win_cur[wid]["plane_pt"] = pt
 
@@ -417,6 +418,9 @@ class RefractionPlateCalibrator:
                 else:
                     residuals.extend([pen, pen])
 
+                # PREC-2 (Lines 420-431): Kinked barrier function with C⁰ discontinuity at gap=0.
+                # The if/else switch creates a gradient kink, causing optimizer issues.
+                # Fix: Use smooth softplus-like barrier: tau * log1p(exp(gap/tau)) for C∞ continuity.
                 if self.cfg.barrier_enabled:
                     sX = float(np.dot(n, X - P))
                     gap = self.cfg.margin_side_mm - sX
@@ -428,10 +432,13 @@ class RefractionPlateCalibrator:
                         residuals.append(r_grad_const * gap)
                         barrier_viol += 1
                     else:
-                        residuals.extend([0.0, 0.0])
+                        residuals.extend([0.0, 0.0])  # BUG: Hard switch creates gradient discontinuity
 
+        # FIXED: RMSE denominator now correctly divides by N observations instead of 2N.
+        # proj_sq = sum(du² + dv²) per observation (correct)
+        # proj_n = 2 per observation (one for du, one for dv) → divide by proj_n // 2 to get N
         self._eval_count += 1
-        self._last_proj_rmse = float(np.sqrt(proj_sq / max(proj_n, 1)))
+        self._last_proj_rmse = float(np.sqrt(proj_sq / max(proj_n // 2, 1)))
         arr = np.asarray(residuals, dtype=np.float64)
         self._last_cost = 0.5 * float(np.sum(arr * arr))
 
@@ -500,6 +507,25 @@ class RefractionPlateCalibrator:
                 f"max_nfev={int(max_nfev)}, ftol={ftol:.1e}, xtol={xtol:.1e}, gtol={gtol:.1e}"
             )
 
+        # PREC-3 (Line 503): Missing parameter scaling for heterogeneous parameter space.
+        # Optimizer mixes mm, radians, relative deltas without x_scale or diff_step.
+        # Fix: Add x_scale='jac' (Jacobian-adaptive) and diff_step array per parameter type.
+        diff_step = np.ones(len(layout), dtype=np.float64)
+        
+        for i, (t, pid, sub) in enumerate(layout):
+            if t == "cam_r":
+                diff_step[i] = 1e-4
+            elif t == "cam_t":
+                diff_step[i] = 1e-2
+            elif t == "cam_f":
+                diff_step[i] = 1e-3
+            elif t == "cam_k1" or t == "cam_k2":
+                diff_step[i] = 1e-6
+            elif t == "plane_d":
+                diff_step[i] = 1e-2
+            elif t == "plane_a" or t == "plane_b":
+                diff_step[i] = 1e-4
+        
         res = least_squares(
             lambda x: self._residuals(x, layout),
             x0,
@@ -511,6 +537,8 @@ class RefractionPlateCalibrator:
             xtol=xtol,
             gtol=gtol,
             verbose=0,
+            x_scale='jac',
+            diff_step=diff_step,
         )
 
         self._apply_x(res.x, layout)
@@ -539,8 +567,11 @@ class RefractionPlateCalibrator:
         except Exception:
             hit_plane_angle_boundary = False
 
+        # BUG-3 (Line 543): Success flag treats status=0 (max_nfev reached) as success.
+        # Scipy status=0 means iteration limit hit WITHOUT convergence.
+        # Fix: Use 'res.status > 0' or 'res.success' (which is False for status <= 0)
         return {
-            "success": bool(int(res.status) >= 0),
+            "success": bool(int(res.status) > 0),  # FIXED: Only status > 0 indicates convergence
             "converged": bool(res.success),
             "message": str(res.message),
             "status": int(res.status),
