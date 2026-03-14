@@ -418,21 +418,26 @@ class RefractionPlateCalibrator:
                 else:
                     residuals.extend([pen, pen])
 
-                # PREC-2 (Lines 420-431): Kinked barrier function with C⁰ discontinuity at gap=0.
-                # The if/else switch creates a gradient kink, causing optimizer issues.
-                # Fix: Use smooth softplus-like barrier: tau * log1p(exp(gap/tau)) for C∞ continuity.
+                # PREC-2: Smooth softplus barrier (C∞ continuous, no kink at gap=0)
+                # Replaces hard if/else switch with smooth approximation: softplus(gap) ≈ max(gap, 0)
                 if self.cfg.barrier_enabled:
                     sX = float(np.dot(n, X - P))
                     gap = self.cfg.margin_side_mm - sX
+                    
+                    # Smooth barrier using softplus: tau * log1p(exp(gap/tau))
+                    tau = max(self.cfg.tau, 1e-9)
+                    gap_smooth = tau * np.log1p(np.exp(gap / tau))
+                    
+                    c_gate = self.cfg.alpha_side_gate
+                    r_fix_const = np.sqrt(2.0 * c_gate)
+                    r_grad_const = np.sqrt(2.0 * self.cfg.beta_side_dir)
+                    
+                    residuals.append(r_fix_const * (1.0 - np.exp(-gap_smooth / tau)))
+                    residuals.append(r_grad_const * gap_smooth)
+                    
+                    # Track violations for diagnostics (when gap > 0)
                     if gap > 0:
-                        c_gate = self.cfg.alpha_side_gate
-                        r_fix_const = np.sqrt(2.0 * c_gate)
-                        r_grad_const = np.sqrt(2.0 * self.cfg.beta_side_dir)
-                        residuals.append(r_fix_const * (1.0 - np.exp(-gap / max(self.cfg.tau, 1e-9))))
-                        residuals.append(r_grad_const * gap)
                         barrier_viol += 1
-                    else:
-                        residuals.extend([0.0, 0.0])  # BUG: Hard switch creates gradient discontinuity
 
         # FIXED: RMSE denominator now correctly divides by N observations instead of 2N.
         # proj_sq = sum(du² + dv²) per observation (correct)
