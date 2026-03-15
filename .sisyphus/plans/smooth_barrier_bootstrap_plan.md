@@ -127,9 +127,9 @@ conda run -n OpenLPT python -m pytest \
   - Commit: `"test: add bootstrap test infrastructure with synthetic data factories"`
 
 #### Wave 1: Bootstrap HIGH-Priority Fixes (9 bugs total)
-- [ ] **W1a**: Fix Phase 3 RMS mis-slice (interleaved residual layout)
-  - Parallel: YES (independent of 1b)
-  - Commit: `"fix: correct Phase 3 RMS residual slicing to separate wand from reproj"`
+- [x] **W1a**: Fix Phase 3 RMS mis-slice (interleaved residual layout)
+   - Parallel: YES (independent of 1b)
+   - Commit: `"fix: correct Phase 3 RMS residual slicing to separate wand from reproj"`
 
 - [ ] **W1b**: Fix homogeneous division unguarded (4 locations: 305, 580-581, 786-787, 860-861)
   - Parallel: YES (independent of 1a)

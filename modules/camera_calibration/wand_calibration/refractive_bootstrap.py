@@ -196,6 +196,19 @@ class PinholeBootstrapP0:
         cx, cy = w / 2.0, h / 2.0
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
         return K, f, cx, cy
+
+    @staticmethod
+    def _compute_phase3_wand_rms(final_res: np.ndarray, n_frames: int, n_cameras: int) -> float:
+        """Compute Phase 3 wand RMS from interleaved per-frame residual layout.
+
+        Residual blocks are laid out per frame as:
+            [wand_k, reproj_k_cam0_uvA(2), reproj_k_cam0_uvB(2), ...]
+        so wand residuals are every ``(1 + 2*n_cameras)`` elements.
+        """
+        residuals_per_frame = 1 + 2 * n_cameras
+        wand_indices = np.arange(n_frames, dtype=np.int64) * residuals_per_frame
+        wand_residuals = final_res[wand_indices]
+        return float(np.sqrt(np.mean(wand_residuals**2)))
         
     def run(
         self,
@@ -1019,10 +1032,9 @@ class PinholeBootstrapP0:
             idx = cam_id_to_idx[cid]
             cam_params_opt[cid] = result.x[idx * n_cam_params:(idx + 1) * n_cam_params]
         
-        # Compute final reprojection error
+        # Compute final RMS using wand residuals from interleaved frame blocks
         final_res = residuals_phase3(result.x)
-        reproj_res = final_res[n_frames:]  # Skip wand residuals
-        rms = np.sqrt(np.mean(reproj_res**2))
+        rms = self._compute_phase3_wand_rms(final_res, n_frames, n_cams)
         print(f"  Final RMS: {rms:.2f}px")
         
         return cam_params_opt

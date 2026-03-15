@@ -30,6 +30,8 @@ import numpy as np
 from typing import Dict, Tuple, List
 from dataclasses import dataclass
 
+from modules.camera_calibration.wand_calibration.refractive_bootstrap import PinholeBootstrapP0
+
 # Import bootstrap classes (ensure these resolve correctly)
 # Note: If BootstrapObservations/FrameObservations don't exist as formal classes,
 # we'll use dict-based structures matching the actual bootstrap code's expectations
@@ -504,3 +506,41 @@ def extract_wand_residuals(
 # W1e: Test wand constraint Jacobian sign consistency
 #
 # Each wave will add ~3-5 test functions to this file.
+
+
+def test_phase3_rms_residual_slicing(phase3_data_fixture):
+    """W1a: Phase 3 RMS must extract interleaved wand residuals per frame."""
+    n_frames = phase3_data_fixture['n_frames']
+    n_cameras = phase3_data_fixture['n_cameras']
+
+    residuals_per_frame = 1 + 2 * n_cameras
+
+    # Synthetic interleaved residual layout:
+    # [wand_0, reproj_0(...), wand_1, reproj_1(...), ...]
+    wand_residuals_gt = np.linspace(1.0, float(n_frames), n_frames)
+    reproj_residuals = np.full((n_frames, 2 * n_cameras), 50.0, dtype=np.float64)
+
+    residual_blocks = np.column_stack([wand_residuals_gt, reproj_residuals])
+    final_res = residual_blocks.reshape(-1)
+    assert final_res.shape == (n_frames * residuals_per_frame,)
+
+    # Historical buggy logic (wrong for interleaved layout).
+    wrong_rms = float(np.sqrt(np.mean(final_res[n_frames:] ** 2)))
+
+    # Ground truth from helper: every block's first element is wand residual.
+    wand_residuals = extract_wand_residuals(final_res, n_frames, n_cameras)
+    expected_rms = float(np.sqrt(np.mean(wand_residuals**2)))
+
+    assert not np.isclose(wrong_rms, expected_rms), (
+        "Bug reproducer broken: old slicing unexpectedly matched wand RMS"
+    )
+
+    fixed_rms = PinholeBootstrapP0._compute_phase3_wand_rms(
+        final_res,
+        n_frames,
+        n_cameras,
+    )
+
+    assert np.isclose(fixed_rms, expected_rms), (
+        f"Fixed RMS mismatch: got {fixed_rms}, expected {expected_rms}"
+    )
