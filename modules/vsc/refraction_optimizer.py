@@ -462,7 +462,7 @@ class RefractionVSCOptimizer:
             else:
                 n_new = n_new / n_norm
 
-            pt_new = pt0 + dd * n0
+            pt_new = pt0 + dd * n_new
 
             self._window_planes[wid]["plane_pt"] = np.asarray(pt_new, dtype=np.float64).reshape(3)
             self._window_planes[wid]["plane_n"] = np.asarray(n_new, dtype=np.float64).reshape(3)
