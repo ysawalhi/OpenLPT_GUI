@@ -666,7 +666,15 @@ class PinholeBootstrapP0:
         wand_lengths = []
         reproj_errors = []
         
-        for fid in valid_frames[:200]:
+        DIAG_FRAME_CAP = 200
+        frames_to_process = valid_frames[:DIAG_FRAME_CAP]
+        if len(valid_frames) >= DIAG_FRAME_CAP:
+            print(
+                f"  [WARN] Diagnostics frame count hit {DIAG_FRAME_CAP}-frame cap "
+                f"({len(valid_frames)} total frames truncated to {DIAG_FRAME_CAP})"
+            )
+        
+        for fid in frames_to_process:
             uvA_i, uvB_i = observations[fid][cam_i]
             uvA_j, uvB_j = observations[fid][cam_j]
             
@@ -684,14 +692,20 @@ class PinholeBootstrapP0:
             
             wand_lengths.append(np.linalg.norm(ptB - ptA))
             
-            # Reprojection error (skip behind-camera NaN projections)
+            # Reprojection error for BOTH endpoints (skip behind-camera NaN projections)
             proj_Ai = self._project(ptA, R_i, t_i, K_i)
             proj_Aj = self._project(ptA, R_j, t_j, K_j)
+            proj_Bi = self._project(ptB, R_i, t_i, K_i)
+            proj_Bj = self._project(ptB, R_j, t_j, K_j)
             
             if not np.isnan(proj_Ai[0]):
                 reproj_errors.append(np.linalg.norm(proj_Ai - uvA_i))
             if not np.isnan(proj_Aj[0]):
                 reproj_errors.append(np.linalg.norm(proj_Aj - uvA_j))
+            if not np.isnan(proj_Bi[0]):
+                reproj_errors.append(np.linalg.norm(proj_Bi - uvB_i))
+            if not np.isnan(proj_Bj[0]):
+                reproj_errors.append(np.linalg.norm(proj_Bj - uvB_j))
         
         return {
             'baseline_mm': np.linalg.norm(params_j[3:6]),
@@ -700,6 +714,7 @@ class PinholeBootstrapP0:
             'wand_length_error': abs(np.median(wand_lengths) - self.config.wand_length_mm) if wand_lengths else float('inf'),
             'reproj_err_mean': np.mean(reproj_errors) if reproj_errors else 0,
             'reproj_err_max': np.max(reproj_errors) if reproj_errors else 0,
+            'reproj_n_samples': len(reproj_errors),
             'valid_frames': len(valid_frames),
         }
     

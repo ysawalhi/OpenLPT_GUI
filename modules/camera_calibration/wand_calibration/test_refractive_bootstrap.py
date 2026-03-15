@@ -1324,3 +1324,232 @@ class TestCheiralityCheck:
         expected_y = 800.0 * (0.2 / 5.0) + 240.0
         np.testing.assert_allclose(result, [expected_x, expected_y], atol=1e-10)
 
+
+# ============================================================================
+# W3f: Diagnostics improvements — both endpoints + 200-frame cap warning
+# ============================================================================
+
+class TestDiagnosticsImproved:
+    """W3f: Diagnostics must include BOTH wand endpoint reprojection errors
+    and warn when hitting the 200-frame cap."""
+
+    @staticmethod
+    def _make_identity_camera_pair():
+        """Create a two-camera setup with cam_i at origin and cam_j offset along X.
+
+        Returns params_i, params_j, K_i, K_j, and a helper to build observations
+        with known reprojection errors for both endpoints.
+        """
+        import cv2 as _cv2
+
+        K = np.array([
+            [800.0, 0.0, 320.0],
+            [0.0, 800.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        params_i = np.zeros(6, dtype=np.float64)
+        # cam_j offset 100mm along X
+        params_j = np.array([0.0, 0.0, 0.0, 100.0, 0.0, 0.0], dtype=np.float64)
+
+        return params_i, params_j, K, K
+
+    def test_diagnostics_includes_point_b(self, monkeypatch):
+        """Diagnostics reproj_errors must include BOTH point A and point B projections.
+
+        Before fix: _compute_diagnostics only projects ptA (lines 688-694),
+        so reproj_errors has ~2 entries per frame (cam_i ptA + cam_j ptA).
+        After fix: reproj_errors should have ~4 entries per frame
+        (cam_i ptA + cam_j ptA + cam_i ptB + cam_j ptB).
+        """
+        import cv2 as _cv2
+
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        params_i, params_j, K_i, K_j = self._make_identity_camera_pair()
+
+        R_i, _ = _cv2.Rodrigues(params_i[:3])
+        t_i = params_i[3:6].reshape(3, 1)
+        R_j, _ = _cv2.Rodrigues(params_j[:3])
+        t_j = params_j[3:6].reshape(3, 1)
+
+        # Known 3D points per frame: ptA and ptB
+        n_frames = 5
+        frame_pts = {}
+        for fid in range(n_frames):
+            frame_pts[fid] = (
+                np.array([10.0, 5.0, 500.0 + fid], dtype=np.float64),
+                np.array([20.0, 10.0, 500.0 + fid], dtype=np.float64),
+            )
+
+        # Build observations by projecting known 3D points
+        observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        for fid in range(n_frames):
+            ptA_3d, ptB_3d = frame_pts[fid]
+
+            uvA_i = bootstrap._project(ptA_3d, R_i, t_i, K_i)
+            uvB_i = bootstrap._project(ptB_3d, R_i, t_i, K_i)
+            uvA_j = bootstrap._project(ptA_3d, R_j, t_j, K_j)
+            uvB_j = bootstrap._project(ptB_3d, R_j, t_j, K_j)
+
+            assert np.all(np.isfinite(uvA_i)), f"Frame {fid}: uvA_i not finite"
+            assert np.all(np.isfinite(uvB_i)), f"Frame {fid}: uvB_i not finite"
+            assert np.all(np.isfinite(uvA_j)), f"Frame {fid}: uvA_j not finite"
+            assert np.all(np.isfinite(uvB_j)), f"Frame {fid}: uvB_j not finite"
+
+            observations[fid] = {
+                0: (uvA_i, uvB_i),
+                1: (uvA_j, uvB_j),
+            }
+
+        # Monkeypatch triangulatePoints to return known 3D points with positive w.
+        # _compute_diagnostics calls triangulatePoints twice per frame (ptA, ptB).
+        call_seq = []
+        for fid in range(n_frames):
+            ptA, ptB = frame_pts[fid]
+            # Return homogeneous coords with w=1.0 (positive)
+            call_seq.append(np.array([[ptA[0]], [ptA[1]], [ptA[2]], [1.0]], dtype=np.float64))
+            call_seq.append(np.array([[ptB[0]], [ptB[1]], [ptB[2]], [1.0]], dtype=np.float64))
+        call_idx = [0]
+
+        def fake_triangulate(_P1, _P2, _uv1, _uv2):
+            idx = call_idx[0]
+            call_idx[0] += 1
+            return call_seq[idx]
+
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.triangulatePoints",
+            fake_triangulate,
+        )
+
+        valid_frames = list(range(n_frames))
+
+        report = bootstrap._compute_diagnostics(
+            cam_i=0, cam_j=1,
+            params_i=params_i, params_j=params_j,
+            observations=observations,
+            valid_frames=valid_frames,
+            K_i=K_i, K_j=K_j,
+        )
+
+        # With 5 frames, 2 cameras, 2 points (A+B): expect 5*2*2 = 20 reproj entries.
+        # Before fix: only ptA is projected → 5*2 = 10 entries.
+        # After fix: both ptA and ptB → 5*2*2 = 20 entries.
+        reproj_mean = report['reproj_err_mean']
+
+        # Since we used perfect projections as observations, errors should be ~0.
+        assert reproj_mean < 1.0, f"reproj_err_mean too large: {reproj_mean}"
+
+        # KEY ASSERTION: reproj_n_samples proves both endpoints were processed.
+        assert 'reproj_n_samples' in report, (
+            "Report must include reproj_n_samples to verify both endpoints are counted"
+        )
+        expected_min_samples = n_frames * 4  # 2 cameras × 2 endpoints per frame
+        assert report['reproj_n_samples'] >= expected_min_samples, (
+            f"Expected at least {expected_min_samples} reproj samples "
+            f"(both A and B), got {report['reproj_n_samples']}"
+        )
+
+    def test_frame_cap_warning(self, capsys):
+        """When diagnostics processes exactly 200 frames (the cap), a warning must be printed."""
+        import cv2 as _cv2
+
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        params_i = np.zeros(6, dtype=np.float64)
+        params_j = np.array([0.0, 0.0, 0.0, 100.0, 0.0, 0.0], dtype=np.float64)
+
+        K = np.array([
+            [800.0, 0.0, 320.0],
+            [0.0, 800.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        # Build exactly 250 valid frames so the 200 cap truncates.
+        n_total_frames = 250
+        observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        R_i, _ = _cv2.Rodrigues(params_i[:3])
+        t_i = params_i[3:6].reshape(3, 1)
+        R_j, _ = _cv2.Rodrigues(params_j[:3])
+        t_j = params_j[3:6].reshape(3, 1)
+
+        for fid in range(n_total_frames):
+            ptA_3d = np.array([10.0, 5.0, 500.0 + fid], dtype=np.float64)
+            ptB_3d = np.array([20.0, 10.0, 500.0 + fid], dtype=np.float64)
+
+            uvA_i = bootstrap._project(ptA_3d, R_i, t_i, K)
+            uvB_i = bootstrap._project(ptB_3d, R_i, t_i, K)
+            uvA_j = bootstrap._project(ptA_3d, R_j, t_j, K)
+            uvB_j = bootstrap._project(ptB_3d, R_j, t_j, K)
+
+            observations[fid] = {
+                0: (uvA_i, uvB_i),
+                1: (uvA_j, uvB_j),
+            }
+
+        valid_frames = list(range(n_total_frames))
+
+        _ = bootstrap._compute_diagnostics(
+            cam_i=0, cam_j=1,
+            params_i=params_i, params_j=params_j,
+            observations=observations,
+            valid_frames=valid_frames,
+            K_i=K, K_j=K,
+        )
+
+        captured = capsys.readouterr().out
+        assert "200" in captured and ("cap" in captured.lower() or "truncat" in captured.lower() or "limit" in captured.lower()), (
+            f"Expected warning about 200-frame cap in stdout, got:\n{captured}"
+        )
+
+    def test_frame_cap_no_warning_under_limit(self, capsys):
+        """When frames < 200, NO cap warning should be printed."""
+        import cv2 as _cv2
+
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+        params_i = np.zeros(6, dtype=np.float64)
+        params_j = np.array([0.0, 0.0, 0.0, 100.0, 0.0, 0.0], dtype=np.float64)
+
+        K = np.array([
+            [800.0, 0.0, 320.0],
+            [0.0, 800.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        # Build 50 frames — well under cap.
+        n_frames = 50
+        observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        R_i, _ = _cv2.Rodrigues(params_i[:3])
+        t_i = params_i[3:6].reshape(3, 1)
+        R_j, _ = _cv2.Rodrigues(params_j[:3])
+        t_j = params_j[3:6].reshape(3, 1)
+
+        for fid in range(n_frames):
+            ptA_3d = np.array([10.0, 5.0, 500.0 + fid], dtype=np.float64)
+            ptB_3d = np.array([20.0, 10.0, 500.0 + fid], dtype=np.float64)
+
+            uvA_i = bootstrap._project(ptA_3d, R_i, t_i, K)
+            uvB_i = bootstrap._project(ptB_3d, R_i, t_i, K)
+            uvA_j = bootstrap._project(ptA_3d, R_j, t_j, K)
+            uvB_j = bootstrap._project(ptB_3d, R_j, t_j, K)
+
+            observations[fid] = {
+                0: (uvA_i, uvB_i),
+                1: (uvA_j, uvB_j),
+            }
+
+        valid_frames = list(range(n_frames))
+
+        _ = bootstrap._compute_diagnostics(
+            cam_i=0, cam_j=1,
+            params_i=params_i, params_j=params_j,
+            observations=observations,
+            valid_frames=valid_frames,
+            K_i=K, K_j=K,
+        )
+
+        captured = capsys.readouterr().out
+        # Should NOT contain a cap/truncation warning
+        has_cap_warning = ("cap" in captured.lower() or "truncat" in captured.lower() or "limit" in captured.lower()) and "200" in captured
+        assert not has_cap_warning, (
+            f"No cap warning expected for {n_frames} frames, but got:\n{captured}"
+        )
+

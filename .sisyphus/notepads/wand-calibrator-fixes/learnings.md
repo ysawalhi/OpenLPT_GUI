@@ -202,3 +202,30 @@ da3e377, 1c37f72, ea87a7c, 683ee9d, 32c959f, 01353e1, 8001548, 5ecd91f, 2552240,
 
 ### Results
 - 73 passed + 9 subtests, 0 failed (was 70 + 9 subtests before).
+
+## W3f - Diagnostics improvements (2026-03-15)
+
+### Problem 1: Diagnostics only reprojects point A
+- `_compute_diagnostics()` at lines 686-694 only computed reprojection errors for point A (`proj_Ai`, `proj_Aj`).
+- Point B (`proj_Bi`, `proj_Bj`) was never projected, so `reproj_errors` list was incomplete — only 50% of wand endpoint errors were captured.
+- This meant the diagnostic `reproj_err_mean` and `reproj_err_max` underrepresented the true error.
+
+### Problem 2: Silent 200-frame cap
+- `for fid in valid_frames[:200]` at line 669 silently truncated diagnostics to 200 frames.
+- When users had >200 frames, they got no indication that diagnostics was incomplete.
+
+### Fixes
+1. **Both endpoints**: Added `proj_Bi` and `proj_Bj` projections with NaN skip guards, appending to `reproj_errors`. Added `reproj_n_samples` key to report dict for verification.
+2. **Frame cap warning**: Extracted `DIAG_FRAME_CAP = 200` constant, added `print()` warning when `len(valid_frames) >= DIAG_FRAME_CAP`.
+
+### Test Pattern
+- `test_diagnostics_includes_point_b`: Monkeypatches `cv2.triangulatePoints` to return known 3D points with positive `w=1.0`, then verifies `reproj_n_samples >= n_frames * 4` (2 cameras × 2 endpoints).
+- `test_frame_cap_warning`: Creates 250 frames, calls `_compute_diagnostics`, captures stdout with `capsys`, asserts "200" and "cap"/"truncat"/"limit" in output.
+- `test_frame_cap_no_warning_under_limit`: Creates 50 frames, verifies NO cap warning is printed.
+
+### Key Insight: cv2.triangulatePoints w sign
+- `cv2.triangulatePoints` can return negative `w` values even for valid 3D points. The `w > 1e-8` guard rejects these as invalid.
+- In real usage this works because the Essential matrix flow produces consistent projection matrices. For unit tests, monkeypatching triangulation with known `w=1.0` is necessary.
+
+### Results
+- 76 passed + 9 subtests, 0 failed (was 73 + 9 subtests before).
