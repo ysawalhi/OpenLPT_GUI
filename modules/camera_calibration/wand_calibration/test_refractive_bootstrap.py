@@ -848,3 +848,46 @@ class TestInlierFiltering:
         assert "RANSAC inliers: 16 / 20 (80.0%)" in stdout
         assert np.isclose(np.linalg.norm(params_j[3:6]), 1.0, atol=1e-8)
         assert np.isclose(report["baseline_mm"], 1.0, atol=1e-8)
+
+
+class TestBarrierConfig:
+    def test_barrier_config_fields_exist(self):
+        """W2a-T1: Verify barrier continuation config exists in RefractiveBAConfig."""
+        from modules.camera_calibration.wand_calibration.refraction_calibration_BA import RefractiveBAConfig
+        
+        config = RefractiveBAConfig()
+        
+        # Check all 5 fields exist
+        assert hasattr(config, 'margin_side_mm')
+        assert hasattr(config, 'alpha_side_gate')
+        assert hasattr(config, 'beta_side_dir')
+        assert hasattr(config, 'beta_side_soft')
+        assert hasattr(config, 'barrier_schedule')
+        
+        # Check types and defaults
+        assert isinstance(config.margin_side_mm, float)
+        assert config.margin_side_mm == 0.05
+        
+        assert isinstance(config.alpha_side_gate, float)
+        assert config.alpha_side_gate == 10.0
+        
+        assert isinstance(config.beta_side_dir, float)
+        assert config.beta_side_dir == 1e4
+        
+        assert isinstance(config.beta_side_soft, float)
+        assert config.beta_side_soft == 100.0
+        
+        assert isinstance(config.barrier_schedule, dict)
+        
+        # Check schedule has required keys
+        assert 'early' in config.barrier_schedule
+        assert 'mid' in config.barrier_schedule
+        assert 'final' in config.barrier_schedule
+        
+        # Verify schedule structure (each phase has required fields)
+        for phase in ['early', 'mid', 'final']:
+            phase_cfg = config.barrier_schedule[phase]
+            assert 'gate_scale' in phase_cfg
+            assert 'beta_dir_scale' in phase_cfg
+            assert 'tau' in phase_cfg
+            assert 'soft_on' in phase_cfg
