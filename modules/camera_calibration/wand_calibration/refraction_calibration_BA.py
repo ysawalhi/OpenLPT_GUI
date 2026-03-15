@@ -46,7 +46,8 @@ from .refractive_geometry import (
     update_normal_tangent, camera_center, angle_between_vectors,
     update_cpp_camera_state, align_world_y_to_plane_intersection,
     enable_ray_tracking, reset_ray_stats, print_ray_stats_report,
-    reset_camera_update_stats, print_camera_update_report
+    reset_camera_update_stats, print_camera_update_report,
+    NativeSafetyValidationError,
 )
 
 
@@ -104,7 +105,7 @@ class CppSyncAdapter:
         if not update_kwargs:
             return
         try:
-            update_cpp_camera_state(cams_cpp[cam_id], **update_kwargs)
+            update_cpp_camera_state(cams_cpp[cam_id], validate_native=False, **update_kwargs)
         except Exception as e:
             intr = update_kwargs.get('intrinsics', {})
             ext = update_kwargs.get('extrinsics', {})
@@ -634,6 +635,32 @@ class RefractiveBAOptimizer:
             ang = angle_between_vectors(normals[0], normals[1])
             print(f"    Angle between Win 0 and Win 1: {ang:.2f}°")
 
+    def _compute_slot_counts(self) -> Tuple[int, int, int, int]:
+        """Return (ray_slots, len_slots, proj_slots, barrier_slots) for penalty vector sizing."""
+        total_ray = 0
+        total_barrier = 0
+        for fid in self.fids_optim:
+            for key in ['obsA', 'obsB']:
+                obs = self.dataset[key].get(fid, {})
+                total_ray += len(obs)
+                if obs:
+                    wids = set()
+                    for cid in obs.keys():
+                        wid = self.cam_to_window.get(cid)
+                        if wid is not None and wid != -1:
+                            wids.add(wid)
+                    total_barrier += 2 * len(wids)
+        total_len = len(self.fids_optim)
+        total_proj = 2 * total_ray if self.config.use_proj_residuals else 0
+        return total_ray, total_len, total_proj, total_barrier
+
+    def _make_full_penalty_residuals(self) -> Tuple[np.ndarray, float, float, int, int, float, int]:
+        """Return a fixed-shape finite penalty residual package for invalid BA states."""
+        pen_ray, pen_len, pen_proj, pen_barrier = self._compute_slot_counts()
+        pen_total = pen_ray + pen_len + pen_proj + pen_barrier
+        penalty_vec = np.full(pen_total, 1e6, dtype=np.float64)
+        return penalty_vec, 1e12, 1e12, max(pen_ray, 1), max(pen_len, 1), 1e12, max(pen_proj, 1)
+
     def evaluate_residuals(self, planes: Dict[int, Dict], cam_params: Dict[int, np.ndarray],
                            lambda_eff: float, window_media: Optional[Dict[int, Dict]] = None,
                            explicit_points: Optional[Dict[int, Dict[str, np.ndarray]]] = None
@@ -645,9 +672,10 @@ class RefractiveBAOptimizer:
         # Apply to C++ objects (Consolidated Update)
         media = window_media or self.window_media
 
+        update_plan: List[Tuple[int, Dict]] = []
         for cid in self.active_cam_ids:
-            if cid not in self.cams_cpp: continue
-
+            if cid not in self.cams_cpp:
+                continue
             update_kwargs = CppSyncAdapter.build_update_kwargs(
                 cam_params=cam_params,
                 window_planes=planes,
@@ -655,6 +683,9 @@ class RefractiveBAOptimizer:
                 cam_to_window=self.cam_to_window,
                 cam_id=cid,
             )
+            update_plan.append((cid, update_kwargs))
+
+        for cid, update_kwargs in update_plan:
             try:
                 CppSyncAdapter.apply(self.cams_cpp, cid, update_kwargs)
             except Exception as e:
@@ -662,9 +693,10 @@ class RefractiveBAOptimizer:
                 ext = update_kwargs.get('extrinsics', {})
                 pl = update_kwargs.get('plane_geom', {})
                 med = update_kwargs.get('media_props', {})
+                err_msg = repr(e)
                 self._diag_log(
-                    "[CRASH-LOC][update_cpp_camera_state] "
-                    f"{self._diag_ctx()} cam={cid} err={repr(e)} "
+                    f"[CRASH-LOC][update_cpp_camera_state] "
+                    f"{self._diag_ctx()} cam={cid} err={err_msg} "
                     f"f={intr.get('f', None)} cx={intr.get('cx', None)} cy={intr.get('cy', None)} "
                     f"rvec={ext.get('rvec', None)} tvec={ext.get('tvec', None)} "
                     f"plane_pt={pl.get('pt', None)} plane_n={pl.get('n', None)} "
@@ -1005,7 +1037,10 @@ class RefractiveBAOptimizer:
 
                 # Soft floor guidance in early/mid stages.
                 if soft_on:
-                    soft_step = r_soft_const * tau * np.log1p(np.exp(gap / tau))
+                    # Numerically stable softplus: tau*log(1+exp(gap/tau))
+                    z = gap / max(tau, 1e-12)
+                    softplus_z = np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))
+                    soft_step = r_soft_const * tau * softplus_z
                     res_barrier_fixed[curr_b_idx] += soft_step
                 
                 curr_b_idx += 2
@@ -1291,7 +1326,11 @@ class RefractiveBAOptimizer:
             if len(reg_residuals) > 0:
                 residuals = np.concatenate([residuals, np.array(reg_residuals)])
 
-        return np.array(residuals)
+        res_arr = np.asarray(residuals, dtype=np.float64)
+        if not np.all(np.isfinite(res_arr)):
+            # Keep optimizer alive under occasional geometric singularities.
+            res_arr = np.nan_to_num(res_arr, nan=1e6, posinf=1e6, neginf=-1e6)
+        return res_arr
 
     def _mode_strategy_key(self, mode: str) -> str:
         """Map internal mode string to round_strategy key."""
@@ -1747,7 +1786,10 @@ class RefractiveBAOptimizer:
         self._last_ray_rmse = np.sqrt(S_ray / max(N_ray, 1))
         self._last_len_rmse = np.sqrt(S_len / max(N_len, 1)) if N_len > 0 else 0.0
         self._last_proj_rmse = np.sqrt(S_proj / max(N_proj, 1)) if N_proj > 0 else 0.0
-        return np.asarray(residuals)
+        res_arr = np.asarray(residuals, dtype=np.float64)
+        if not np.all(np.isfinite(res_arr)):
+            res_arr = np.nan_to_num(res_arr, nan=1e6, posinf=1e6, neginf=-1e6)
+        return res_arr
 
     def _optimize_bundle_generic(self, mode: str, description: str,
                                  enable_planes: bool, enable_cam_t: bool, enable_cam_r: bool,
@@ -2268,38 +2310,38 @@ class RefractiveBAOptimizer:
                         plane_deltas.setdefault(pid, {})['b'] = val
 
                 if cam_deltas:
-                    self.reporter.detail("  Camera Δ:")
+                    self.reporter.detail("  Camera delta:")
                     for cid in sorted(cam_deltas.keys()):
                         cd = cam_deltas[cid]
                         parts = []
                         if 'r' in cd:
                             rot_deg = np.linalg.norm(cd['r']) * 180.0 / np.pi
-                            parts.append(f"Δr={rot_deg:.3f}deg")
+                            parts.append(f"dr={rot_deg:.3f}deg")
                         if 't' in cd:
                             trans = np.linalg.norm(cd['t'])
-                            parts.append(f"Δt={trans:.3f}mm")
+                            parts.append(f"dt={trans:.3f}mm")
                         if 'f' in cd:
-                            parts.append(f"Δf={cd['f']:.4f}")
+                            parts.append(f"df={cd['f']:.4f}")
                         if 'k1' in cd:
-                            parts.append(f"Δk1={cd['k1']:.6f}")
+                            parts.append(f"dk1={cd['k1']:.6f}")
                         if 'k2' in cd:
-                            parts.append(f"Δk2={cd['k2']:.6f}")
+                            parts.append(f"dk2={cd['k2']:.6f}")
                         if parts:
                             self.reporter.detail(f"    Cam {cid}: " + ", ".join(parts))
 
                 if plane_deltas:
-                    self.reporter.detail("  Window Δ:")
+                    self.reporter.detail("  Window delta:")
                     for wid in sorted(plane_deltas.keys()):
                         pd = plane_deltas[wid]
                         parts = []
                         if 'd' in pd:
-                            parts.append(f"Δd={pd['d']:.4f}mm")
+                            parts.append(f"dd={pd['d']:.4f}mm")
                         if 'a' in pd:
-                            parts.append(f"Δa={pd['a'] * 180.0 / np.pi:.4f}deg")
+                            parts.append(f"da={pd['a'] * 180.0 / np.pi:.4f}deg")
                         if 'b' in pd:
-                            parts.append(f"Δb={pd['b'] * 180.0 / np.pi:.4f}deg")
+                            parts.append(f"db={pd['b'] * 180.0 / np.pi:.4f}deg")
                         if 't' in pd:
-                            parts.append(f"Δt={pd['t']:.4f}mm")
+                            parts.append(f"dt={pd['t']:.4f}mm")
                         if parts:
                             self.reporter.detail(f"    Win {wid}: " + ", ".join(parts))
 

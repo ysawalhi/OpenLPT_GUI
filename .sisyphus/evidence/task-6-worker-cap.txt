@@ -1,0 +1,47 @@
+================================================================================
+Task 6 Worker-Count Selection Smoke Tests
+================================================================================
+
+✓ PASS: Single run should bypass pool
+  Input: n_runs=1, enable_parallel=True, requested_max_workers=4
+  Expected: use_parallel=False
+  Actual:   use_parallel=False, effective_workers=1
+  Log: INFO: Parallel requested but bypassed (requested_max_workers=4, n_runs=1, effective_workers=1); using sequential path
+
+✓ PASS: Parallel disabled should use sequential
+  Input: n_runs=3, enable_parallel=False, requested_max_workers=4
+  Expected: use_parallel=False
+  Actual:   use_parallel=False, effective_workers=3
+
+✓ PASS: max_workers=1 should use sequential
+  Input: n_runs=3, enable_parallel=True, requested_max_workers=1
+  Expected: use_parallel=False
+  Actual:   use_parallel=False, effective_workers=1
+  Log: INFO: Parallel requested but bypassed (requested_max_workers=1, n_runs=3, effective_workers=1); using sequential path
+
+✓ PASS: n_runs=3, req=4 should use parallel with 3 workers
+  Input: n_runs=3, enable_parallel=True, requested_max_workers=4
+  Expected: use_parallel=True
+  Actual:   use_parallel=True, effective_workers=3
+  Log: INFO: Task 6: Phase-1 parallel mode with bounded workers (requested_max_workers=4, n_runs=3, effective_workers=3, timeout=7200s)
+
+✓ PASS: n_runs=5, req=2 should use parallel with 2 workers
+  Input: n_runs=5, enable_parallel=True, requested_max_workers=2
+  Expected: use_parallel=True
+  Actual:   use_parallel=True, effective_workers=2
+  Log: INFO: Task 6: Phase-1 parallel mode with bounded workers (requested_max_workers=2, n_runs=5, effective_workers=2, timeout=7200s)
+
+✓ PASS: n_runs=2, req=10 should cap workers at 2
+  Input: n_runs=2, enable_parallel=True, requested_max_workers=10
+  Expected: use_parallel=True
+  Actual:   use_parallel=True, effective_workers=2
+  Log: INFO: Task 6: Phase-1 parallel mode with bounded workers (requested_max_workers=10, n_runs=2, effective_workers=2, timeout=7200s)
+
+✓ PASS: n_runs=10, req=4 should use 4 workers
+  Input: n_runs=10, enable_parallel=True, requested_max_workers=4
+  Expected: use_parallel=True
+  Actual:   use_parallel=True, effective_workers=4
+  Log: INFO: Task 6: Phase-1 parallel mode with bounded workers (requested_max_workers=4, n_runs=10, effective_workers=4, timeout=7200s)
+
+================================================================================
+✓ ALL TESTS PASSED

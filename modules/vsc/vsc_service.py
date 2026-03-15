@@ -61,14 +61,20 @@ class VSCService:
         self.obj_radius = 5.0
         self.obj_type = "Tracer"
         self.image_size = (1024, 1024)
-        self.cam_output_dir = None  # Directory to save optimized cameras
+        self.cam_output_dir = None
+        self.tolerance_mode = 'default'
+        self.tolerance_value = 5.0
+        self._tolerance_thresholds = None
         
-    def set_params(self, min_track_len: int = 15, sample_points: int = 20000, 
-                   min_valid_points: int = 2000):
+    def set_params(self, min_track_len: int = 15, sample_points: int = 20000,
+                   min_valid_points: int = 2000, tolerance_mode: str = 'default',
+                   tolerance_value: float = 5.0):
         """Set VSC parameters."""
         self.min_track_len = min_track_len
         self.sample_points = sample_points
         self.min_valid_points = min_valid_points
+        self.tolerance_mode = tolerance_mode
+        self.tolerance_value = tolerance_value
     
     def _log(self, msg: str):
         """Log message to callback and file."""
@@ -115,6 +121,35 @@ class VSCService:
             # Save initial state using deep copy avoids reference issues
             import copy
             vsc_data['cameras_init'] = copy.deepcopy(self.cameras)
+            
+            # Validate and log tolerance mode
+            if self.tolerance_mode == 'reproj':
+                missing = []
+                for cam_idx, cam in self.cameras.items():
+                    ce = cam.get('calib_error')
+                    if ce is None or not isinstance(ce, tuple) or len(ce) < 2:
+                        missing.append(cam_idx)
+                if missing:
+                    msg = (f"Reprojection Error tolerance mode selected but camera(s) "
+                           f"{missing} lack calibration error stats. "
+                           f"Cannot proceed. Please recalibrate or choose a different mode.")
+                    self._log(f"  ERROR: {msg}")
+                    return False, msg, {}
+                reproj_thresholds = {}
+                for cam_idx, cam in self.cameras.items():
+                    mean, std = cam['calib_error']
+                    reproj_thresholds[cam_idx] = mean + 3.0 * std
+                self._log(f"  Tolerance mode: Reprojection Error Based")
+                for cam_idx in sorted(reproj_thresholds):
+                    mean, std = self.cameras[cam_idx]['calib_error']
+                    self._log(f"    Cam {cam_idx}: reproj_mean={mean:.3f}, reproj_std={std:.3f}, threshold={reproj_thresholds[cam_idx]:.3f} px")
+                self._tolerance_thresholds = reproj_thresholds
+            elif self.tolerance_mode == 'custom':
+                self._log(f"  Tolerance mode: Custom = {self.tolerance_value:.1f} px")
+                self._tolerance_thresholds = None
+            else:
+                self._log(f"  Tolerance mode: Default (point_r + 1)")
+                self._tolerance_thresholds = None
             
             # Step 2: Load object config
             self._log("\n[Step 2] Loading object configuration...")
@@ -819,8 +854,12 @@ class VSCService:
             'obj_radius': self.obj_radius,
             'margin_factor': self.margin_factor,
             'search_radius': self.search_radius,
-            'isolation_margin': self.isolation_margin
+            'isolation_margin': self.isolation_margin,
+            'tolerance_mode': self.tolerance_mode,
+            'tolerance_value': self.tolerance_value,
         }
+        if self.tolerance_mode == 'reproj':
+            params['reproj_thresholds'] = self._tolerance_thresholds
         
         # Use ProcessPoolExecutor to bypass GIL
         # Workers will load their own images using config paths
@@ -1952,9 +1991,18 @@ def process_frame_task(frame_id: int, points: List[Tuple],
                     
                     dist_proj = ((det_x - proj_x)**2 + (det_y - proj_y)**2)**0.5
                     
-                    # Use point_r (object radius) as the search radius/threshold
-                    # If projection is within the particle radius, it's a valid match
-                    if dist_proj > point_r + 1:
+                    tol_mode = params.get('tolerance_mode', 'default')
+                    if tol_mode == 'reproj':
+                        reproj_thresholds = params.get('reproj_thresholds', {})
+                        if cam_idx not in reproj_thresholds:
+                            raise KeyError(f"Missing reprojection threshold for camera {cam_idx}")
+                        dist_threshold = reproj_thresholds[cam_idx]
+                    elif tol_mode == 'custom':
+                        dist_threshold = params.get('tolerance_value', 5.0)
+                    else:
+                        dist_threshold = point_r + 1
+                    
+                    if dist_proj > dist_threshold:
                         all_valid = False
                         fail_reason = "distance"
                         break

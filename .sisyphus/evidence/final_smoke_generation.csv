@@ -1,0 +1,2 @@
+run_id,gen,best_objective,median_objective,worst_objective,feasible_fraction,sigma,cumulative_evals,cumulative_wall_seconds
+0,0,1611580816.5228086,144711003724.2212,3.408833840159589e+17,1.0,0.5618591012323548,14,14.76500000001397

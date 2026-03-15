@@ -1,0 +1,27 @@
+=== Task 5 Smoke Test: Failure Isolation & Serial Fallback ===
+
+[Test 1] BrokenProcessPool import availability...
+  PASS: BrokenProcessPool imported successfully
+[Test 2] Verify parallel branch has failure isolation code...
+  PASS: BrokenProcessPool import
+  PASS: failed_run_ids tracking
+  PASS: fallback_run_ids tracking
+  PASS: pool_broken flag
+  PASS: BrokenProcessPool catch in future.result
+  PASS: serial fallback section
+  PASS: _run_cma_single in fallback
+  PASS: dispatch_mode in diagnostics
+  PASS: failed runs in budget diagnostics
+  PASS: pool_broken budget status
+  OVERALL: PASS
+[Test 3] ParallelConfig and BudgetStatus dataclass integrity...
+  PASS: ParallelConfig and BudgetStatus fields intact
+[Test 4] Simulate failure isolation bookkeeping...
+  PASS: Pending IDs correctly identified: [2]
+  PASS: Fallback bookkeeping correct (1 failed, 1 recovered, 1 direct)
+[Test 5] Budget status dispatch_mode field values...
+  PASS: dispatch_mode correctly assigned (parallel/failed/serial_fallback)
+[Test 6] Budget status total_stopped_by string...
+  PASS: total_stopped_by = "parallel_failures (1 runs failed: [1]); pool_broken (fallback_recovered=1)"
+
+=== ALL TESTS PASSED ===

@@ -12,6 +12,15 @@ This document defines the development environment, build instructions, and manda
 - Build C++ bindings: `python build_local.py` or `python setup.py install`
 - Run GUI: `python GUI.py`
 
+## Python Environment Rule
+- For this repo, agents must use the `OpenLPT` conda environment for Python compilation, script execution, and verification commands.
+- Preferred order:
+  1. use `python ...` only if the active shell is already confirmed to be `OpenLPT`
+  2. otherwise use `conda run -n OpenLPT python ...`
+  3. if `conda run` is unreliable, use `C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe ...`
+- Apply this rule to commands such as `py_compile`, `--help` checks, calibration script runs, and other Python-based validation in this project.
+- Do not assume the default `python` points to the correct environment.
+
 ## Mandatory Coding Protocols
 All AI agents and developers **MUST** adhere to the following protocols defined in the `.agent/skills/` directory:
 

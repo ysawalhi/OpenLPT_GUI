@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import traceback
 
 @dataclass
@@ -870,13 +870,169 @@ def align_world_y_to_plane_intersection(
     return new_cam_params, new_window_planes, new_points_3d, R_world, t_shift
 
 
+# ---------------------------------------------------------------------------
+# Shared native-safety validation
+# ---------------------------------------------------------------------------
+
+_MIN_SIGNED_DEPTH_MM = 1.0
+
+
+class NativeSafetyValidationError(RuntimeError):
+    """Raised when Python-side validation rejects state before native C++ update."""
+
+
+def validate_native_safety(
+    image_size: Optional[Tuple[int, int]] = None,
+    intrinsics: Optional[dict] = None,
+    extrinsics: Optional[dict] = None,
+    plane_geom: Optional[dict] = None,
+    media_props: Optional[dict] = None,
+    *,
+    min_signed_depth_mm: float = _MIN_SIGNED_DEPTH_MM,
+) -> List[str]:
+    """Validate camera/plane/media state before entering C++ native code.
+
+    Returns a list of machine-sortable error strings.  An empty list means the
+    state is safe.  Every tag has the form ``<category>:<detail>`` so that logs
+    can be sorted and filtered programmatically.
+
+    Checks performed:
+      1. image_size positive and finite
+      2. intrinsics fx,fy > 0 and finite; cx,cy finite; dist coeffs finite
+      3. extrinsics rvec/tvec length-3 and all-finite
+      4. plane_geom pt/n finite, ||n|| > eps, normalised for subsequent depth check
+      5. media refractive indices finite and > 0; thickness finite and > 0
+      6. camera-to-plane signed depth >= min_signed_depth_mm
+      7. global finiteness guard on all float conversions
+    """
+    errors: List[str] = []
+
+    # -- 1. image size --
+    if image_size is not None:
+        try:
+            nr, nc = int(image_size[0]), int(image_size[1])
+            if nr <= 0 or nc <= 0:
+                errors.append(f"image_size:non_positive:{nr}x{nc}")
+            if not (np.isfinite(nr) and np.isfinite(nc)):
+                errors.append(f"image_size:non_finite:{nr}x{nc}")
+        except (TypeError, ValueError, IndexError) as exc:
+            errors.append(f"image_size:conversion_error:{exc}")
+
+    # -- 2. intrinsics --
+    intr = intrinsics or {}
+    try:
+        fx = float(intr.get('f', 1.0))
+        fy = fx  # same source key in current codebase
+        cx = float(intr.get('cx', 0.0))
+        cy = float(intr.get('cy', 0.0))
+        if not np.isfinite(fx) or fx <= 0:
+            errors.append(f"intrinsics:fx_invalid:{fx}")
+        if not np.isfinite(fy) or fy <= 0:
+            errors.append(f"intrinsics:fy_invalid:{fy}")
+        if not np.isfinite(cx):
+            errors.append(f"intrinsics:cx_non_finite:{cx}")
+        if not np.isfinite(cy):
+            errors.append(f"intrinsics:cy_non_finite:{cy}")
+        dist_raw = intr.get('dist', None)
+        if dist_raw is not None:
+            dist_arr = np.asarray(dist_raw, dtype=np.float64).ravel()
+            if not np.all(np.isfinite(dist_arr)):
+                errors.append(f"intrinsics:dist_non_finite:{dist_arr.tolist()}")
+    except (TypeError, ValueError) as exc:
+        errors.append(f"intrinsics:conversion_error:{exc}")
+
+    # -- 3. extrinsics --
+    ext = extrinsics or {}
+    try:
+        rvec_np = np.asarray(ext.get('rvec', [0.0, 0.0, 0.0]), dtype=np.float64).flatten()
+        tvec_np = np.asarray(ext.get('tvec', [0.0, 0.0, 0.0]), dtype=np.float64).flatten()
+        if rvec_np.shape != (3,):
+            errors.append(f"extrinsics:rvec_wrong_length:{rvec_np.shape}")
+        elif not np.all(np.isfinite(rvec_np)):
+            errors.append(f"extrinsics:rvec_non_finite:{rvec_np.tolist()}")
+        if tvec_np.shape != (3,):
+            errors.append(f"extrinsics:tvec_wrong_length:{tvec_np.shape}")
+        elif not np.all(np.isfinite(tvec_np)):
+            errors.append(f"extrinsics:tvec_non_finite:{tvec_np.tolist()}")
+    except (TypeError, ValueError) as exc:
+        errors.append(f"extrinsics:conversion_error:{exc}")
+
+    # -- 4. plane geometry --
+    plane_pt_np: Optional[np.ndarray] = None
+    plane_normal: Optional[np.ndarray] = None
+    plane_normal_unit: Optional[np.ndarray] = None
+    thickness_for_cpp: Optional[float] = None
+    if plane_geom is not None:
+        try:
+            plane_pt_np = np.asarray(plane_geom.get('pt', [0.0, 0.0, 0.0]), dtype=np.float64).flatten()
+            plane_normal = np.asarray(plane_geom.get('n', [0.0, 0.0, 1.0]), dtype=np.float64).flatten()
+            if plane_pt_np.shape != (3,):
+                errors.append(f"plane_geom:pt_wrong_length:{plane_pt_np.shape}")
+            elif not np.all(np.isfinite(plane_pt_np)):
+                errors.append(f"plane_geom:pt_non_finite:{plane_pt_np.tolist()}")
+            if plane_normal.shape != (3,):
+                errors.append(f"plane_geom:n_wrong_length:{plane_normal.shape}")
+            else:
+                n_norm = float(np.linalg.norm(plane_normal))
+                if not np.isfinite(n_norm) or n_norm < 1e-9:
+                    errors.append(f"plane_geom:n_degenerate:norm={n_norm}")
+                elif not np.all(np.isfinite(plane_normal)):
+                    errors.append(f"plane_geom:n_non_finite:{plane_normal.tolist()}")
+                else:
+                    plane_normal_unit = plane_normal / n_norm
+        except (TypeError, ValueError) as exc:
+            errors.append(f"plane_geom:conversion_error:{exc}")
+
+    # -- 5. media properties --
+    med = media_props or {}
+    try:
+        thickness = float(med.get('thickness', 10.0))
+        thickness_for_cpp = thickness
+        if not np.isfinite(thickness) or thickness <= 0:
+            errors.append(f"media:thickness_invalid:{thickness}")
+        n1 = float(med.get('n1', med.get('n_air', 1.0)))
+        n2 = float(med.get('n2', med.get('n_window', med.get('n_glass', 1.49))))
+        n3 = float(med.get('n3', med.get('n_object', med.get('n_medium', 1.33))))
+        for label, val in [('n1', n1), ('n2', n2), ('n3', n3)]:
+            if not np.isfinite(val) or val <= 0:
+                errors.append(f"media:{label}_invalid:{val}")
+    except (TypeError, ValueError) as exc:
+        errors.append(f"media:conversion_error:{exc}")
+
+    # -- 6. camera-to-plane signed depth --
+    if (plane_pt_np is not None and plane_normal_unit is not None
+            and 'rvec' in ext and 'tvec' in ext
+            and len(errors) == 0):  # only if no prior errors on these inputs
+        try:
+            R = rodrigues_to_R(rvec_np)
+            C = camera_center(R, tvec_np)
+            signed_depth = float(np.dot(plane_pt_np - C, plane_normal_unit))
+            if not np.isfinite(signed_depth) or signed_depth < min_signed_depth_mm:
+                errors.append(
+                    f"depth:plane_too_close_to_camera:{signed_depth:.4f}<{min_signed_depth_mm}"
+                )
+            if thickness_for_cpp is not None:
+                p_farthest = plane_pt_np + plane_normal_unit * thickness_for_cpp
+                if not np.all(np.isfinite(p_farthest)):
+                    errors.append(f"plane_geom:p_farthest_non_finite:{p_farthest.tolist()}")
+                farthest_depth = float(np.dot(p_farthest - C, plane_normal_unit))
+                if not np.isfinite(farthest_depth) or farthest_depth < min_signed_depth_mm:
+                    errors.append(
+                        f"depth:farthest_plane_too_close_to_camera:{farthest_depth:.4f}<{min_signed_depth_mm}"
+                    )
+        except Exception as exc:
+            errors.append(f"depth:computation_error:{exc}")
+
+    return errors
+
 def update_cpp_camera_state(cam_obj, 
                             extrinsics: Optional[dict] = None,
                             intrinsics: Optional[dict] = None,
                             plane_geom: Optional[dict] = None,
                             media_props: Optional[dict] = None,
                             image_size: Optional[Tuple[int, int]] = None,
-                            solver_opts: Optional[dict] = None) -> None:
+                            solver_opts: Optional[dict] = None,
+                            validate_native: bool = True) -> None:
     """
     Unified function to update C++ Camera parameters (PinPlate model).
     
@@ -910,6 +1066,22 @@ def update_cpp_camera_state(cam_obj,
     if missing:
         _record_camera_update(success=False, reason="missing_grouped_api")
         raise RuntimeError("Hard migration mode requires grouped camera API: missing " + ", ".join(missing))
+
+    # ---- Pre-flight native-safety validation ----
+    if validate_native:
+        safety_errors = validate_native_safety(
+            image_size=image_size,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            plane_geom=plane_geom,
+            media_props=media_props,
+        )
+        if safety_errors:
+            _record_camera_update(success=False, reason="native_safety_rejected")
+            raise NativeSafetyValidationError(
+                "update_cpp_camera_state blocked by native-safety validation: "
+                + "; ".join(safety_errors)
+            )
 
     try:
         if image_size is not None:
@@ -964,6 +1136,7 @@ def update_cpp_camera_state(cam_obj,
         else:
             plane_pt_np = np.asarray(plane_geom.get('pt', [0.0, 0.0, 0.0]), dtype=float).flatten()
             plane_normal = np.asarray(plane_geom.get('n', [0.0, 0.0, 1.0]), dtype=float).flatten()
+        plane_normal = normalize(plane_normal)
 
         # Python-side plane point is at the closest interface; C++ pinplate expects farthest interface.
         p_farthest = plane_pt_np + plane_normal * current_thick
@@ -981,5 +1154,3 @@ def update_cpp_camera_state(cam_obj,
     except Exception as exc:
         _record_camera_update(success=False, reason="grouped_update_failed")
         raise RuntimeError(f"update_cpp_camera_state failed in hard migration mode: {exc}") from exc
-
-

@@ -50,3 +50,5 @@ opencode.jsonc
 tmp/
 
 build-tests
+
+test/

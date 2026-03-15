@@ -1,0 +1,20 @@
+Task 1 — Phase-1 Architecture Scaffolding Verification
+=======================================================
+Date: 2026-03-12
+
+1. py_compile
+   Command: conda run -n OpenLPT python -m py_compile "modules/camera_calibration/wand_calibration/full_global_search.py"
+   Result: PASS (no errors, exit 0)
+
+2. Signature inspection
+   Command: python -c "import inspect; from modules.camera_calibration.wand_calibration.full_global_search import run_global_search; print(inspect.signature(run_global_search))"
+   Result:
+   (camfile_dir: 'str | Path', obs_csv_path: 'str | Path', wand_length: 'float', *, n_runs: 'int' = 5, max_evals_per_run: 'int' = 2500, max_generations: 'Optional[int]' = None, sigma0: 'float' = 0.6, popsize: 'Optional[int]' = None, stagnation_gens: 'int' = 25, sigma_stop: 'float' = 0.001, dedup_threshold: 'float' = 0.1, probe_result: 'Optional[ProbeResult]' = None, probe_max_evals: 'int' = 500, probe_max_wall: 'float' = 300.0, lambda_base_per_cam: 'float' = 2.0, max_frames: 'int' = 50000, dist_coeff_num: 'int' = 0, seed_base: 'Optional[int]' = None, max_total_evals: 'int' = 50000, max_total_wall_seconds: 'float' = 86400.0, budget_config: 'Optional[BudgetConfig]' = None, enable_parallel: 'bool' = False, max_workers: 'int' = 1, worker_timeout: 'float' = 7200.0, parallel_config: 'Optional[ParallelConfig]' = None) -> 'GlobalSearchResult'
+   New params confirmed: enable_parallel, max_workers, worker_timeout, parallel_config ✓
+
+3. ParallelConfig defaults
+   Command: python -c "from modules.camera_calibration.wand_calibration.full_global_search import ParallelConfig; pc = ParallelConfig(); print(f'enable_parallel={pc.enable_parallel}, max_workers={pc.max_workers}, timeout={pc.worker_timeout_seconds}')"
+   Result: enable_parallel=False, max_workers=1, timeout=7200.0
+   All defaults preserve sequential behavior ✓
+
+Verdict: PASS — Task 1 complete.

@@ -1,0 +1,181 @@
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>SET DISTUTILS_USE_SDK=1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>SET MSSdk=1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>SET "VS_VERSION=17.0" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>SET "VS_MAJOR=17" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>SET "VS_YEAR=2022" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "MSYS2_ARG_CONV_EXCL=/AI;/AL;/OUT;/out" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "MSYS2_ENV_CONV_EXCL=CL" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "PY_VCRUNTIME_REDIST=\bin\vcruntime140.dll" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "CXX=cl.exe" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "CC=cl.exe" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "VSINSTALLDIR=" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "NEWER_VS_WITH_OLDER_VC=0" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>for /F "usebackq tokens=*" %i in (`vswhere.exe -nologo -products * -version [17.0,18.0) -property installationPath`) do (set "VSINSTALLDIR=%i\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>(set "VSINSTALLDIR=C:\Program Files\Microsoft Visual Studio\2022\Community\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (for /F "usebackq tokens=*" %i in (`vswhere.exe -nologo -products * -requires Microsoft.VisualStudio.ComponentGroup.VC.Tools.143.x86.x64 -property installationPath`) do (
+set "VSINSTALLDIR=%i\"  
+ set "NEWER_VS_WITH_OLDER_VC=1" 
+) ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (for /F "usebackq tokens=*" %i in (`vswhere.exe -nologo -products * -requires Microsoft.VisualStudio.Component.VC.v143.x86.x64 -property installationPath`) do (
+set "VSINSTALLDIR=%i\"  
+ set "NEWER_VS_WITH_OLDER_VC=1" 
+) ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (set "VSINSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (set "VSINSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (set "VSINSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if not exist "C:\Program Files\Microsoft Visual Studio\2022\Community\" (set "VSINSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>IF NOT "" == "" (
+set "INCLUDE=;"  
+ set "LIB=;"  
+ set "CMAKE_PREFIX_PATH=;" 
+)  else (
+set "INCLUDE=C:\Users\tan_s\miniconda3\envs\OpenLPT\Library\include;"  
+ set "LIB=C:\Users\tan_s\miniconda3\envs\OpenLPT\Library\lib;"  
+ set "CMAKE_PREFIX_PATH=C:\Users\tan_s\miniconda3\envs\OpenLPT\Library;" 
+) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>call :GetWin10SdkDir 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>call :GetWin10SdkDirHelper HKLM\SOFTWARE\Wow6432Node  1>nul 2>&1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if errorlevel 1 call :GetWin10SdkDirHelper HKCU\SOFTWARE\Wow6432Node  1>nul 2>&1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if errorlevel 1 call :GetWin10SdkDirHelper HKLM\SOFTWARE  1>nul 2>&1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if errorlevel 1 call :GetWin10SdkDirHelper HKCU\SOFTWARE  1>nul 2>&1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if errorlevel 1 exit /B 1 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>exit /B 0 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>for /F %i in ('dir /ON /B "C:\Program Files (x86)\Windows Kits\10\\include\10.*"') DO (SET WindowsSDKVer=%~i ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>(SET WindowsSDKVer=10.0.19041.0 ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if errorlevel 1 (echo "Didn't find any windows 10 SDK. I'm not sure if things will work, but let's try..." )  else (echo Windows SDK version found as: "10.0.19041.0" ) 
+Windows SDK version found as: "10.0.19041.0"
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "CMAKE_PLAT=x64" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "VCVARSBAT=64" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set "CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>IF "" == "1" (set "CMAKE_ARGS=-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX= -DPython_FIND_REGISTRY=NEVER -DPython3_FIND_REGISTRY=NEVER -DCMAKE_PROGRAM_PATH=\bin;\Scripts;\Library\bin;\bin;\Scripts;\Library\bin" ) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>IF 2022 GEQ 2019 (
+set "CMAKE_GEN=Visual Studio 17 2022"  
+ set "USE_NEW_CMAKE_GEN_SYNTAX=1" 
+)  ELSE (
+IF "win-64" == "win-64" (set "CMAKE_GEN=Visual Studio 17 2022 Win64" )  else (set "CMAKE_GEN=Visual Studio 17 2022" )  
+ set "USE_NEW_CMAKE_GEN_SYNTAX=0" 
+) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>echo "NEWER_VS_WITH_OLDER_VC=0" 
+"NEWER_VS_WITH_OLDER_VC=0"
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>set /p LATEST_VS= 0<"C:\Program Files\Microsoft Visual Studio\2022\Community\\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>type "C:\Program Files\Microsoft Visual Studio\2022\Community\\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" 
+14.31.31103
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>dir "C:\Program Files\Microsoft Visual Studio\2022\Community\\VC\Redist\MSVC\" 
+ Volume in drive C is OS
+ Volume Serial Number is 4474-6E25
+
+ Directory of C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC
+
+09/04/2024  03:22 PM    <DIR>          .
+04/16/2022  12:33 AM    <DIR>          ..
+09/04/2024  03:22 PM    <DIR>          14.29.30133
+04/16/2022  12:34 AM    <DIR>          14.31.31103
+04/16/2022  12:33 AM    <DIR>          v143
+               0 File(s)              0 bytes
+               5 Dir(s)  27,519,021,056 bytes free
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>if "0" == "1" (
+echo "14.31.31103"  
+ if "14.3" == "14.2" (set "CMAKE_GEN=Visual Studio 16 2019" )  else (set "CMAKE_GEN=Visual Studio 17 2022" )  
+ set "USE_NEW_CMAKE_GEN_SYNTAX=1" 
+) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>IF "" == "" SET "CMAKE_GENERATOR=Visual Studio 17 2022" 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>IF "1" == "1" (
+IF "" == "" SET "CMAKE_GENERATOR_PLATFORM=x64"  
+ IF "" == "" SET "CMAKE_GENERATOR_TOOLSET=v143" 
+) 
+
+(OpenLPT) D:\0.Code\OpenLPTGUI\OpenLPT>pushd C:\Program Files\Microsoft Visual Studio\2022\Community\ 
+
+(OpenLPT) C:\Program Files\Microsoft Visual Studio\2022\Community>if "14.31" LSS "14.44" (
+ 
+ CALL "VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.31 10.0.19041.0 
+)  else (CALL "VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44 10.0.19041.0 ) 
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.1.4
+** Copyright (c) 2022 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+=== Test 1: Multidim with block scales ===
+  scale_1d:       [0.1  0.2  0.05 0.3  0.15]
+  block_scales:   [0.   0.5  0.08 0.   0.4 ]
+  effective:      [0.1  0.5  0.08 0.3  0.4 ]
+  CMA (shrink=0.5): [0.05 0.25 0.04 0.15 0.2 ]
+  block-dominated: 3/5
+  dim 1: coupled, effective=0.5000 >= scale_1d=0.2000 OK
+  dim 2: coupled, effective=0.0800 >= scale_1d=0.0500 OK
+  dim 4: coupled, effective=0.4000 >= scale_1d=0.1500 OK
+
+=== Test 2: Multidim, Stage-2 skipped ===
+  effective:      [0.1  0.2  0.05 0.3  0.15]
+  CMA:            [0.05  0.1   0.025 0.15  0.075]
+  Correctly uses Stage-1 only
+
+=== Test 3: 1-D mode ===
+  scales:  [0.1  0.2  0.05 0.3  0.15]
+  1-D scales pass through unchanged
+
+=== Test 4: Sanity guardrail ===
+  input:   [1.e-01    inf 2.e+03    nan 5.e-01]
+  fixed:   [1.e-01 3.e-01 1.e+03 3.e-01 5.e-01]
+  Guardrail works correctly
+
+=== Test 5: Shrink factor bounds ===
+  shrink_factor=0.0 -> CLAMPED to 0.5
+  shrink_factor=-0.5 -> CLAMPED to 0.5
+  shrink_factor=1.5 -> CLAMPED to 0.5
+  shrink_factor=0.5 -> OK
+  shrink_factor=1.0 -> OK
+
+=== Test 6: CMA scale = effective_scale * shrink_factor ===
+  Verified: cma_scales == effective_scales * 0.5
+
+=== Test 7: Pre-shrink multidim >= 1-D on coupled dims ===
+  All effective_scales >= scale_1d (by construction via max())
+
+ALL SMOKE TESTS PASSED
+The system cannot find the drive specified.
+
+

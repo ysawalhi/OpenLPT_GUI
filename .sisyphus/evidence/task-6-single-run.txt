@@ -1,0 +1,11 @@
+================================================================================
+Test Case: n_runs=1 with parallel enabled
+================================================================================
+
+Input: n_runs=1, enable_parallel=True, requested_max_workers=4
+Result: _use_parallel=False, effective_workers=1
+Logs:
+INFO: Parallel requested but bypassed (requested_max_workers=4, n_runs=1, effective_workers=1); using sequential path
+
+
+✓ PASS: Single-run bypass works correctly — pool creation is skipped

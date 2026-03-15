@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QPushButton, QGroupBox, QGridLayout, QProgressBar,
     QTextEdit, QSplitter, QTabWidget, QLineEdit, QMessageBox,
     QFileDialog, QProgressDialog, QSlider, QCheckBox, QSpinBox, QScrollArea,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QButtonGroup
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QButtonGroup,
+    QComboBox, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QProcess, QIODevice, Signal, Slot, QObject, QThread, QCoreApplication, QSize, QTimer, QPoint, QPointF, QRectF
 from PySide6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QMouseEvent, QWheelEvent
@@ -240,12 +241,15 @@ class VSCWorker(QObject):
     error = Signal(str)
     log = Signal(str)
 
-    def __init__(self, proj_dir, min_track_len, sample_points, min_valid_points):
+    def __init__(self, proj_dir, min_track_len, sample_points, min_valid_points,
+                 tolerance_mode='default', tolerance_value=5.0):
         super().__init__()
         self.proj_dir = proj_dir
         self.min_track_len = int(min_track_len)
         self.sample_points = int(sample_points)
         self.min_valid_points = int(min_valid_points)
+        self.tolerance_mode = tolerance_mode
+        self.tolerance_value = float(tolerance_value)
 
     def run(self):
         try:
@@ -259,6 +263,8 @@ class VSCWorker(QObject):
                 min_track_len=self.min_track_len,
                 sample_points=self.sample_points,
                 min_valid_points=self.min_valid_points,
+                tolerance_mode=self.tolerance_mode,
+                tolerance_value=self.tolerance_value,
             )
             success, message, vsc_data = service.run()
             self.finished.emit(bool(success), str(message), vsc_data)
@@ -792,7 +798,7 @@ class TrackingView(QWidget):
         
         vsc_layout.addWidget(QLabel("Sample Points:"), 1, 0)
         self.vsc_sample_points = QSpinBox()
-        self.vsc_sample_points.setRange(1000, 100000)
+        self.vsc_sample_points.setRange(1000, 2147483647)
         self.vsc_sample_points.setValue(20000)
         self.vsc_sample_points.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
         vsc_layout.addWidget(self.vsc_sample_points, 1, 1)
@@ -804,6 +810,39 @@ class TrackingView(QWidget):
         self.vsc_min_valid.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
         vsc_layout.addWidget(self.vsc_min_valid, 2, 1)
         
+        vsc_layout.addWidget(QLabel("Proj. Tolerance:"), 3, 0)
+        self.vsc_tolerance_mode = QComboBox()
+        self.vsc_tolerance_mode.addItems(["Default (r+1)", "Reproj. Error", "Custom"])
+        self.vsc_tolerance_mode.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
+        vsc_layout.addWidget(self.vsc_tolerance_mode, 3, 1)
+        
+        self.vsc_tolerance_custom_widget = QWidget()
+        tol_h = QHBoxLayout(self.vsc_tolerance_custom_widget)
+        tol_h.setContentsMargins(0, 0, 0, 0)
+        tol_h.setSpacing(4)
+        self.vsc_tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vsc_tolerance_slider.setRange(1, 200)  # 0.1 to 20.0 px (value / 10)
+        self.vsc_tolerance_slider.setValue(50)  # 5.0 px default
+        self.vsc_tolerance_slider.setStyleSheet("QSlider::groove:horizontal { background: #333; height: 4px; } QSlider::handle:horizontal { background: #2471a3; width: 12px; margin: -4px 0; border-radius: 6px; }")
+        self.vsc_tolerance_spin = QDoubleSpinBox()
+        self.vsc_tolerance_spin.setRange(0.1, 20.0)
+        self.vsc_tolerance_spin.setValue(5.0)
+        self.vsc_tolerance_spin.setSingleStep(0.1)
+        self.vsc_tolerance_spin.setDecimals(1)
+        self.vsc_tolerance_spin.setSuffix(" px")
+        self.vsc_tolerance_spin.setFixedWidth(80)
+        self.vsc_tolerance_spin.setStyleSheet("background-color: #222; color: #fff; border: 1px solid #444;")
+        tol_h.addWidget(self.vsc_tolerance_slider, 1)
+        tol_h.addWidget(self.vsc_tolerance_spin)
+        self.vsc_tolerance_custom_widget.setVisible(False)
+        vsc_layout.addWidget(self.vsc_tolerance_custom_widget, 4, 0, 1, 2)
+        
+        self.vsc_tolerance_slider.valueChanged.connect(lambda v: self.vsc_tolerance_spin.setValue(v / 10.0))
+        self.vsc_tolerance_spin.valueChanged.connect(lambda v: self.vsc_tolerance_slider.setValue(int(v * 10)))
+        self.vsc_tolerance_mode.currentIndexChanged.connect(
+            lambda idx: self.vsc_tolerance_custom_widget.setVisible(idx == 2)
+        )
+        
         # Run VSC Button
         self.vsc_btn = QPushButton(" Run VSC")
         self.vsc_btn.setIcon(qta.icon("fa5s.crosshairs", color="white"))
@@ -814,7 +853,7 @@ class TrackingView(QWidget):
             QPushButton:disabled { background-color: #333; color: #666; }
         """)
         self.vsc_btn.clicked.connect(self._run_vsc)
-        vsc_layout.addWidget(self.vsc_btn, 3, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_btn, 5, 0, 1, 2)
         
         # Frame List Table for VSC
         self.vsc_frame_table = QTableWidget()
@@ -832,7 +871,7 @@ class TrackingView(QWidget):
             QTableWidget::item:selected { background-color: #005a8c; color: #fff; }
         """)
         self.vsc_frame_table.itemClicked.connect(self._on_vsc_frame_selected)
-        vsc_layout.addWidget(self.vsc_frame_table, 4, 0, 1, 2)
+        vsc_layout.addWidget(self.vsc_frame_table, 6, 0, 1, 2)
 
         
         layout.addWidget(vsc_group)
@@ -1068,11 +1107,16 @@ class TrackingView(QWidget):
 
         # Run VSC in background thread to keep UI responsive.
         self.vsc_thread = QThread()
+        tolerance_modes = ['default', 'reproj', 'custom']
+        tol_mode = tolerance_modes[self.vsc_tolerance_mode.currentIndex()]
+        tol_value = self.vsc_tolerance_spin.value()
         self.vsc_worker = VSCWorker(
             proj_dir,
             self.vsc_min_track_len.value(),
             self.vsc_sample_points.value(),
             self.vsc_min_valid.value(),
+            tolerance_mode=tol_mode,
+            tolerance_value=tol_value,
         )
         self.vsc_worker.moveToThread(self.vsc_thread)
 
