@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# pyright: reportMissingImports=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false
 """
 Test Infrastructure for Refractive Bootstrap Bug Fixes
 =======================================================
@@ -714,3 +715,136 @@ class TestPhase3Gauge:
         assert any(
             np.linalg.norm(cam_params_opt[cid]) > 1e-12 for cid in other_cam_ids
         ), "Other cameras should remain optimizable (non-zero extrinsics)"
+
+
+class TestInlierFiltering:
+    def test_ransac_outliers_filtered(self, monkeypatch, capsys):
+        """RANSAC inlier masks should filter correspondences and improve robustness."""
+        bootstrap = PinholeBootstrapP0(config=PinholeBootstrapP0Config())
+
+        # Build deterministic 10-frame, 2-camera observations (20 correspondences total).
+        observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        for fid in range(10):
+            base_u = 300.0 + 3.0 * fid
+            base_v = 240.0 + 2.0 * fid
+            observations[fid] = {
+                0: (
+                    np.array([base_u, base_v], dtype=np.float64),
+                    np.array([base_u + 20.0, base_v + 10.0], dtype=np.float64),
+                ),
+                1: (
+                    np.array([base_u + 2.0, base_v - 1.0], dtype=np.float64),
+                    np.array([base_u + 22.0, base_v + 9.0], dtype=np.float64),
+                ),
+            }
+
+        camera_settings = make_camera_settings(n_cameras=2)
+
+        calls = {}
+
+        def fake_find_essential(pts_i_norm, pts_j_norm, **_kwargs):
+            n = len(pts_i_norm)
+            calls["find_essential_n"] = n
+            assert n == 20, "Expected 20 correspondences before essential-matrix filtering"
+
+            # ~10% essential outliers: last frame's two endpoints are rejected.
+            mask_ess = np.ones((n, 1), dtype=np.uint8)
+            mask_ess[-2:] = 0
+            return np.eye(3, dtype=np.float64), mask_ess
+
+        def fake_recover_pose(_E, pts_i_inliers, pts_j_inliers, **_kwargs):
+            n = len(pts_i_inliers)
+            calls["recover_pose_n"] = n
+
+            # Keep first 16/18 pose inliers (drops one additional frame's two endpoints).
+            mask_pose = np.zeros((n, 1), dtype=np.uint8)
+            mask_pose[:16] = 1
+
+            return (
+                int(mask_pose.sum()),
+                np.eye(3, dtype=np.float64),
+                np.array([[1.0], [0.0], [0.0]], dtype=np.float64),
+                mask_pose,
+            )
+
+        def fake_triangulate_points(_P_i, _P_j, pts_i_inliers_t, _pts_j_inliers_t):
+            n = int(pts_i_inliers_t.shape[1])
+            calls["triangulate_n"] = n
+
+            # Emit pairwise points with exact 10 mm wand length.
+            pts_4d = np.ones((4, n), dtype=np.float64)
+            for idx in range(0, n, 2):
+                pts_4d[0, idx] = float(idx)
+                pts_4d[1, idx] = 0.0
+                pts_4d[2, idx] = 100.0
+                if idx + 1 < n:
+                    pts_4d[0, idx + 1] = float(idx) + 10.0
+                    pts_4d[1, idx + 1] = 0.0
+                    pts_4d[2, idx + 1] = 100.0
+            return pts_4d
+
+        class _FakeResult:
+            def __init__(self, x):
+                self.x = x
+                self.cost = float(np.sum(x**2))
+
+        def fake_least_squares(_fun, x0, **_kwargs):
+            return _FakeResult(x0.copy())
+
+        def fake_compute_diagnostics(
+            self,
+            _cam_i,
+            _cam_j,
+            _params_i,
+            params_j,
+            _observations,
+            valid_frames,
+            _K_i,
+            _K_j,
+        ):
+            return {
+                "baseline_mm": float(np.linalg.norm(params_j[3:6])),
+                "wand_length_median": self.config.wand_length_mm,
+                "wand_length_std": 0.0,
+                "wand_length_error": 0.0,
+                "reproj_err_mean": 1.0,
+                "reproj_err_max": 1.0,
+                "valid_frames": len(valid_frames),
+            }
+
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.findEssentialMat",
+            fake_find_essential,
+        )
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.recoverPose",
+            fake_recover_pose,
+        )
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.cv2.triangulatePoints",
+            fake_triangulate_points,
+        )
+        monkeypatch.setattr(
+            "modules.camera_calibration.wand_calibration.refractive_bootstrap.least_squares",
+            fake_least_squares,
+        )
+        monkeypatch.setattr(PinholeBootstrapP0, "_compute_diagnostics", fake_compute_diagnostics)
+        monkeypatch.setattr(PinholeBootstrapP0, "_validate", lambda self, report: None)
+
+        _params_i, params_j, report = bootstrap.run(
+            cam_i=0,
+            cam_j=1,
+            observations=observations,
+            camera_settings=camera_settings,
+        )
+
+        # RED (before fix): recoverPose receives all 20 and triangulation uses all 20.
+        # GREEN (after fix): recoverPose sees 18 essential inliers, triangulation sees 16 combined inliers.
+        assert calls["recover_pose_n"] == 18
+        assert calls["triangulate_n"] == 16
+
+        # Verify inlier-rate reporting and baseline stability from deterministic mock geometry.
+        stdout = capsys.readouterr().out
+        assert "RANSAC inliers: 16 / 20 (80.0%)" in stdout
+        assert np.isclose(np.linalg.norm(params_j[3:6]), 1.0, atol=1e-8)
+        assert np.isclose(report["baseline_mm"], 1.0, atol=1e-8)

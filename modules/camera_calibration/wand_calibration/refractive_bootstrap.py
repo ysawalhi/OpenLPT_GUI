@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false, reportUninitializedInstanceVariable=false
 """
 Refractive Bootstrap (P0 Stage)
 ===============================
@@ -281,7 +282,7 @@ class PinholeBootstrapP0:
         # Step 1: Essential Matrix (normalized rays, supports different intrinsics)
         pts_i_norm = cv2.undistortPoints(pts_i.reshape(-1, 1, 2), K_i, None).reshape(-1, 2)
         pts_j_norm = cv2.undistortPoints(pts_j.reshape(-1, 1, 2), K_j, None).reshape(-1, 2)
-        E, mask = cv2.findEssentialMat(
+        E, mask_ess = cv2.findEssentialMat(
             pts_i_norm,
             pts_j_norm,
             focal=1.0,
@@ -293,13 +294,70 @@ class PinholeBootstrapP0:
         
         if E is None or E.shape != (3, 3):
             raise RuntimeError("[P0 FAIL] Essential Matrix computation failed")
+
+        if mask_ess is None:
+            raise RuntimeError("[P0 FAIL] Essential Matrix did not return an inlier mask")
+
+        mask_ess_flat = np.asarray(mask_ess).reshape(-1) > 0
+        if mask_ess_flat.shape[0] != len(pts_i_norm):
+            raise RuntimeError(
+                f"[P0 FAIL] Essential mask shape mismatch: {mask_ess_flat.shape[0]} vs {len(pts_i_norm)}"
+            )
+
+        inlier_idx_ess = np.where(mask_ess_flat)[0]
+        if len(inlier_idx_ess) < 8:
+            raise RuntimeError(
+                f"[P0 FAIL] Insufficient inliers from essential matrix: {len(inlier_idx_ess)} < 8"
+            )
+
+        pts_i_ess = pts_i_norm[inlier_idx_ess]
+        pts_j_ess = pts_j_norm[inlier_idx_ess]
         
         # Step 2: Recover Pose (R, t)
-        n_inliers, R_rel, t_rel, mask_pose = cv2.recoverPose(
-            E, pts_i_norm, pts_j_norm, focal=1.0, pp=(0.0, 0.0)
+        n_inliers_pose, R_rel, t_rel, mask_pose = cv2.recoverPose(
+            E, pts_i_ess, pts_j_ess, focal=1.0, pp=(0.0, 0.0)
         )
+
+        if mask_pose is None:
+            raise RuntimeError("[P0 FAIL] recoverPose did not return inlier mask")
+
+        mask_pose_flat = np.asarray(mask_pose).reshape(-1) > 0
+        if mask_pose_flat.shape[0] != len(inlier_idx_ess):
+            raise RuntimeError(
+                f"[P0 FAIL] recoverPose mask shape mismatch: {mask_pose_flat.shape[0]} vs {len(inlier_idx_ess)}"
+            )
+
+        # Combined inlier mask in original correspondence indexing.
+        combined_mask = np.zeros(len(pts_i_norm), dtype=bool)
+        combined_mask[inlier_idx_ess] = mask_pose_flat
+        n_inliers = int(np.sum(combined_mask))
+
+        if n_inliers < 8:
+            raise RuntimeError(
+                f"[P0 FAIL] Insufficient inliers after pose recovery: {n_inliers} < 8"
+            )
         
-        print(f"  Inliers: {n_inliers} / {len(pts_i)}")
+        print(f"  RANSAC inliers: {n_inliers} / {len(pts_i)} ({100.0 * n_inliers / max(1, len(pts_i)):.1f}%)")
+
+        # Build per-frame inlier summary (2 correspondences per frame: A and B endpoint).
+        frame_inlier_flags = []
+        for frame_idx, fid in enumerate(valid_frames):
+            corr_start = frame_idx * 2
+            frame_inliers = int(np.sum(combined_mask[corr_start:corr_start + 2]))
+            frame_inlier_flags.append(frame_inliers == 2)
+            print(f"    Frame {fid}: {frame_inliers}/2 inliers ({50.0 * frame_inliers:.1f}%)")
+
+        valid_frames_inlier = [fid for idx, fid in enumerate(valid_frames) if frame_inlier_flags[idx]]
+        if len(valid_frames_inlier) < 5:
+            raise RuntimeError(
+                f"[P0 FAIL] Insufficient inlier frames after RANSAC filtering: {len(valid_frames_inlier)} < 5"
+            )
+
+        inlier_to_original_idx = []
+        for idx, keep in enumerate(frame_inlier_flags):
+            if keep:
+                inlier_to_original_idx.extend([idx * 2, idx * 2 + 1])
+        inlier_to_original_idx = np.array(inlier_to_original_idx, dtype=np.int64)
         
         # Step 3: Triangulate to compute scale
         print(f"\n[P0] Step 2: Triangulation & Scale Recovery...")
@@ -313,8 +371,10 @@ class PinholeBootstrapP0:
         P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
         P_j = np.hstack([R_rel, t_rel])
         
-        # Triangulate all points
-        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_norm.T, pts_j_norm.T)
+        # Triangulate inlier-only correspondences
+        pts_i_tri = pts_i_norm[inlier_to_original_idx]
+        pts_j_tri = pts_j_norm[inlier_to_original_idx]
+        pts_4d_hom = cv2.triangulatePoints(P_i, P_j, pts_i_tri.T, pts_j_tri.T)
         # Guard homogeneous division: near-zero or invalid w indicates point at infinity/unstable geometry.
         w_hom = pts_4d_hom[3]
         pts_3d = np.full((pts_4d_hom.shape[1], 3), np.nan, dtype=np.float64)
@@ -364,7 +424,7 @@ class PinholeBootstrapP0:
         from scipy.sparse import lil_matrix
         
         # Residuals: for each frame: wand(1) + reproj(8) = 9
-        n_frames = len(valid_frames)
+        n_frames = len(valid_frames_inlier)
         n_res = n_frames * 9
         n_cams = 1
         n_cam_params = 6
@@ -373,7 +433,7 @@ class PinholeBootstrapP0:
         
         A_sparsity = lil_matrix((n_res, n_params), dtype=int)
         
-        for i, fid in enumerate(valid_frames):
+        for i, fid in enumerate(valid_frames_inlier):
             idx_ptA = pt_start + i * 6
             idx_ptB = pt_start + i * 6 + 3
             base_res = i * 9
@@ -410,7 +470,7 @@ class PinholeBootstrapP0:
             n_len = 0
             sq_err_proj = 0.0
             n_proj = 0
-            for idx, fid in enumerate(valid_frames):
+            for idx, fid in enumerate(valid_frames_inlier):
                 uvA_i, uvB_i = observations[fid][cam_i]
                 uvA_j, uvB_j = observations[fid][cam_j]
                 
@@ -491,10 +551,13 @@ class PinholeBootstrapP0:
         # Compute diagnostics
         report = self._compute_diagnostics(
             cam_i, cam_j, params_i_opt, params_j_opt,
-            observations, valid_frames, K_i, K_j
+            observations, valid_frames_inlier, K_i, K_j
         )
         report['scale_factor'] = scale_factor
         report['n_inliers'] = n_inliers
+        report['n_inliers_pose'] = int(n_inliers_pose)
+        report['n_inlier_frames'] = len(valid_frames_inlier)
+        report['phase1_inlier_frames'] = list(valid_frames_inlier)
         
         # Sanity checks
         self._validate(report)
@@ -1090,6 +1153,27 @@ class PinholeBootstrapP0:
             cam_i: params_i,
             cam_j: params_j,
         }
+
+        # Propagate Phase 1 inlier-validated frame set into Phase 2/3.
+        inlier_frames_phase1 = report.get('phase1_inlier_frames', [])
+        if inlier_frames_phase1:
+            observations_phase23 = {
+                fid: observations[fid]
+                for fid in inlier_frames_phase1
+                if fid in observations
+            }
+        else:
+            observations_phase23 = observations
+
+        valid_frames_phase23 = [
+            fid for fid, cams in observations_phase23.items() if len(cams) >= 2
+        ]
+        print(f"  Phase 2: {len(valid_frames_phase23)} valid frames (≥2 cameras)")
+        if len(valid_frames_phase23) < len(observations_phase23):
+            print(
+                "  [WARN] Some Phase 2/3 frames have <2 cameras and will be skipped "
+                f"({len(observations_phase23) - len(valid_frames_phase23)} frames)."
+            )
         
         # Triangulate 3D points
         print(f"\n[P0] Triangulating 3D points for Phase 2...")
@@ -1100,7 +1184,7 @@ class PinholeBootstrapP0:
                 pass
 
         points_3d = self.triangulate_all_points(
-            cam_i, cam_j, params_i, params_j, observations, camera_settings
+            cam_i, cam_j, params_i, params_j, observations_phase23, camera_settings
         )
         report['points_3d'] = points_3d
         print(f"  Triangulated {len(points_3d)} frames")
@@ -1113,7 +1197,7 @@ class PinholeBootstrapP0:
                 pass
         
         cam_params = self.run_phase2(
-            cam_params, observations, points_3d, camera_settings, all_cam_ids
+            cam_params, observations_phase23, points_3d, camera_settings, all_cam_ids
         )
         
         # Phase 3: Global BA with all cameras
@@ -1123,12 +1207,18 @@ class PinholeBootstrapP0:
             except:
                 pass
 
+        valid_frames_phase3 = [
+            fid for fid, cams in observations_phase23.items() if len(cams) >= 2
+        ]
+        print(f"  Phase 3: {len(valid_frames_phase3)} valid frames (≥2 cameras)")
+
         cam_params = self.run_phase3(
-            cam_params, observations, camera_settings, progress_callback=progress_callback
+            cam_params, observations_phase23, camera_settings, progress_callback=progress_callback
         )
 
         
         report['all_cam_ids'] = list(cam_params.keys())
+        report['phase23_frames'] = list(observations_phase23.keys())
         
         return cam_params, report
 
