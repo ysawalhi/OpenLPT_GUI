@@ -2227,13 +2227,14 @@ class RefractiveWandCalibrator:
             rs, rl = self._estimate_and_log_sphere_radii(
                 dataset, cam_params, X_A_scaled, X_B_scaled, tag="BA Pre-Calc", cams_cpp=cams_cpp
             )
-            dataset['est_radius_small_mm'] = rs
-            dataset['est_radius_large_mm'] = rl
             rs_pr4, rl_pr4 = rs, rl
             if not (np.isfinite(rs_pr4) and rs_pr4 > 0 and np.isfinite(rl_pr4) and rl_pr4 > 0):
                 self.reporter.info(f"BA: Radius estimate invalid (rs={rs_pr4}, rl={rl_pr4}), reverting to defaults (1.5, 2.0)")
                 rs_pr4, rl_pr4 = 1.5, 2.0
-            self.reporter.info(f"BA: Updated estimated radii: Small={rs:.3f}mm, Large={rl:.3f}mm")
+            # Write validated radii to dataset so BA consumer reads safe values
+            dataset['est_radius_small_mm'] = rs_pr4
+            dataset['est_radius_large_mm'] = rl_pr4
+            self.reporter.info(f"BA: Updated estimated radii: Small={rs_pr4:.3f}mm, Large={rl_pr4:.3f}mm")
 
         # Pass verbosity to config
         ba_config = RefractiveBAConfig(
