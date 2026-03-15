@@ -1088,3 +1088,91 @@ class TestPinholeBootstrapP0ConfigValidation:
         """Inf xtol should raise ValueError."""
         with pytest.raises(ValueError, match="xtol must be finite"):
             PinholeBootstrapP0Config(xtol=float('inf'))
+
+
+class TestPhase2OutlierFiltering:
+    """W3c: Test residual-based outlier filtering in Phase 2 PnP refinement."""
+    
+    def test_phase2_filters_outliers_and_refines(
+        self,
+        synthetic_observations_3cams,
+        synthetic_camera_settings,
+    ):
+        """Phase 2 should filter outliers with residuals > 3*median and re-optimize."""
+        config = PinholeBootstrapP0Config(wand_length_mm=300.0, ui_focal_px=9000.0)
+        bootstrap = PinholeBootstrapP0(config)
+        
+        observations, all_cam_ids = synthetic_observations_3cams
+        
+        # Run Phase 1 to get initial camera pair
+        cam_i, cam_j = 0, 1
+        params_i, params_j, report = bootstrap.run(
+            cam_i, cam_j, observations, synthetic_camera_settings
+        )
+        
+        cam_params = {cam_i: params_i, cam_j: params_j}
+        
+        # Triangulate 3D points
+        points_3d = bootstrap.triangulate_all_points(
+            cam_i, cam_j, params_i, params_j, observations, synthetic_camera_settings
+        )
+        
+        # Add synthetic outlier to observations for camera 2
+        observations_with_outlier = {k: v.copy() for k, v in observations.items()}
+        first_frame = list(observations.keys())[0]
+        if 2 in observations_with_outlier[first_frame]:
+            # Corrupt one observation with large error
+            uvA, uvB = observations_with_outlier[first_frame][2]
+            observations_with_outlier[first_frame][2] = (
+                uvA + np.array([100.0, 100.0]),  # Large outlier
+                uvB
+            )
+        
+        # Run Phase 2 - should filter outlier
+        cam_params_phase2 = bootstrap.run_phase2(
+            cam_params, observations_with_outlier, points_3d, 
+            synthetic_camera_settings, all_cam_ids
+        )
+        
+        # Verify camera 2 was calibrated despite outlier
+        assert 2 in cam_params_phase2
+        assert cam_params_phase2[2].shape == (6,)
+        assert np.all(np.isfinite(cam_params_phase2[2]))
+    
+    def test_phase2_handles_no_outliers(
+        self,
+        synthetic_observations_3cams,
+        synthetic_camera_settings,
+    ):
+        """Phase 2 should work normally when no outliers are present."""
+        config = PinholeBootstrapP0Config(wand_length_mm=300.0, ui_focal_px=9000.0)
+        bootstrap = PinholeBootstrapP0(config)
+        
+        observations, all_cam_ids = synthetic_observations_3cams
+        
+        # Run Phase 1
+        cam_i, cam_j = 0, 1
+        params_i, params_j, report = bootstrap.run(
+            cam_i, cam_j, observations, synthetic_camera_settings
+        )
+        
+        cam_params = {cam_i: params_i, cam_j: params_j}
+        
+        # Triangulate 3D points
+        points_3d = bootstrap.triangulate_all_points(
+            cam_i, cam_j, params_i, params_j, observations, synthetic_camera_settings
+        )
+        
+        # Run Phase 2 with clean data
+        cam_params_phase2 = bootstrap.run_phase2(
+            cam_params, observations, points_3d, 
+            synthetic_camera_settings, all_cam_ids
+        )
+        
+        # Verify all cameras calibrated
+        assert len(cam_params_phase2) == len(all_cam_ids)
+        for cid in all_cam_ids:
+            assert cid in cam_params_phase2
+            assert cam_params_phase2[cid].shape == (6,)
+            assert np.all(np.isfinite(cam_params_phase2[cid]))
+

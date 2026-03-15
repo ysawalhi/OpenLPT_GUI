@@ -841,7 +841,53 @@ class PinholeBootstrapP0:
             # Compute final reprojection error
             pts_reproj_opt, _ = cv2.projectPoints(pts_3d_arr, rvec_opt, tvec_opt, K, dist_coeffs)
             pts_reproj_opt = pts_reproj_opt.reshape(-1, 2)
-            reproj_err_final = np.sqrt(np.mean(np.sum((pts_2d - pts_reproj_opt)**2, axis=1)))
+            
+            # Compute per-point residuals
+            residuals = np.sqrt(np.sum((pts_2d - pts_reproj_opt)**2, axis=1))
+            median_residual = np.median(residuals)
+            threshold = 3.0 * median_residual
+            
+            # Filter outliers
+            inlier_mask = residuals <= threshold
+            n_outliers = np.sum(~inlier_mask)
+            
+            if n_outliers > 0:
+                print(f"    Filtering {n_outliers}/{len(pts_2d)} outliers (threshold={threshold:.2f}px)")
+                
+                # Re-optimize with inliers only
+                pts_2d_inliers = pts_2d[inlier_mask]
+                pts_3d_inliers = pts_3d_arr[inlier_mask]
+                
+                if len(pts_2d_inliers) >= 6:
+                    x0_cam_refined = np.concatenate([rvec_opt, tvec_opt])
+                    
+                    def residuals_cam_refined(x):
+                        r = x[:3].reshape(3, 1)
+                        t = x[3:6].reshape(3, 1)
+                        pts_proj, _ = cv2.projectPoints(pts_3d_inliers, r, t, K, dist_coeffs)
+                        pts_proj = pts_proj.reshape(-1, 2)
+                        return (pts_2d_inliers - pts_proj).flatten()
+                    
+                    result_refined = least_squares(
+                        residuals_cam_refined, x0_cam_refined,
+                        method='lm',
+                        ftol=self.config.ftol,
+                        xtol=self.config.xtol,
+                        max_nfev=100,
+                    )
+                    
+                    rvec_opt = result_refined.x[:3]
+                    tvec_opt = result_refined.x[3:6]
+                    
+                    # Compute final error on inliers
+                    pts_reproj_final, _ = cv2.projectPoints(pts_3d_inliers, rvec_opt, tvec_opt, K, dist_coeffs)
+                    pts_reproj_final = pts_reproj_final.reshape(-1, 2)
+                    reproj_err_final = np.sqrt(np.mean(np.sum((pts_2d_inliers - pts_reproj_final)**2, axis=1)))
+                else:
+                    print(f"    [WARN] Too few inliers after filtering ({len(pts_2d_inliers)} < 6), using original solution")
+                    reproj_err_final = np.sqrt(np.mean(residuals[inlier_mask]**2)) if np.any(inlier_mask) else np.sqrt(np.mean(residuals**2))
+            else:
+                reproj_err_final = np.sqrt(np.mean(residuals**2))
             
             print(f"    rvec: [{rvec_opt[0]:.4f}, {rvec_opt[1]:.4f}, {rvec_opt[2]:.4f}]")
             print(f"    tvec: [{tvec_opt[0]:.2f}, {tvec_opt[1]:.2f}, {tvec_opt[2]:.2f}]")
