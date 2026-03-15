@@ -78,3 +78,100 @@
 - `RefractiveBAConfig` at line 173 — pure `@dataclass`, no need to mock (per MUST NOT rules)
 - `cam_to_window` maps cam_id → window_id; `wand_length` is float in mm
 - Constructor signature: `(dataset, cam_params, cams_cpp, cam_to_window, window_media, window_planes, wand_length, config=None, progress_callback=None)`
+
+## 2026-03-15 PROJECT COMPLETE — Final Verification Wave PASSED
+
+### Final Wave Results
+- F1 Plan Compliance Audit: **APPROVE** — Oracle verified 13 commits since 2f994e5, 42 tests pass, B5/B1/B3 all grounded in source code, P2 median init at wand_calibrator.py:486-500, P3 recompute at refraction_calibration_BA.py:2901+2942-2943. AST lint passes. Smoke test passes.
+- F2 Code Quality Review: **APPROVE** — B5 dataset wiring confirmed correct (validated radii written AFTER guard), all 4 files quality-reviewed.
+- F3 Real Manual QA: **APPROVE** — Import smoke test passed; all key classes importable, reporter.warning() verified, sigma_schedule + tolerance_schedule present in config.
+- F4 Scope Fidelity: **APPROVE** — 10 files changed, all in-scope; no unrelated refactoring.
+
+### Key Fixes Summary
+1. **B5** (`refraction_wand_calibrator.py:2225-2237`): Added validity guard + fallback defaults (rs=1.5, rl=2.0); dataset written AFTER guard so BA consumer reads safe values.
+2. **B1** (`refraction_optimizer.py:458-468`): Stale normal replaced with `n_new` for correct plane-point displacement.
+3. **B3** (`refraction_calibration_BA.py:70-71, 2000-2007, 2303-2310`): status==-1 → RuntimeError, status==0 → reporter.warning() (not raise). `RefractiveCalibReporter.warning()` method added.
+
+### Key Improvements Summary
+- P1: barrier_schedule parameters tuned in RefractiveBAConfig
+- P2: Median aggregation for plane-point init (wand_calibrator.py:486-500)
+- P3: `_compute_physical_sigmas()` called at round boundaries (refraction_calibration_BA.py:2901, 2942-2943)
+- P4: tolerance_schedule in RefractiveBAConfig for parameterized ftol/xtol/gtol
+
+### Evidence Files
+- `.sisyphus/evidence/task-13-regression-final.log` — 42 passed
+- `.sisyphus/evidence/f3-smoke-test.log` — F3 SMOKE TEST: PASS
+- `.sisyphus/evidence/f-lint-ast-check.log` — AST LINT: ALL 4 TARGET FILES PASS
+
+### Commits (13 since 2f994e5)
+da3e377, 1c37f72, ea87a7c, 683ee9d, 32c959f, 01353e1, 8001548, 5ecd91f, 2552240, 6fcb6ad, 9f13e48, 3be7f92, ac4c883
+
+## 2026-03-15 W1a: Phase 3 residual slicing bug (interleaved layout)
+
+### Residual Layout Rule
+- Phase 3 residuals are interleaved per frame, not grouped by residual type:
+  `[wand_k, reproj_k_cam0_uvA(2), reproj_k_cam0_uvB(2), ...]`
+- Correct extraction stride for wand-only residuals is:
+  `residuals_per_frame = 1 + 2*n_cameras`, `wand_indices = np.arange(n_frames) * residuals_per_frame`.
+
+### Anti-Pattern Caught
+- `final_res[n_frames:]` is invalid for this layout; it slices an arbitrary tail mixing wand+reprojection terms and can hide real optimization quality.
+
+### Test Pattern
+- Use synthetic interleaved residual blocks with high reprojection terms and known wand terms to force clear RMS separation.
+- Validate expected wand RMS via `extract_wand_residuals(...)` helper and assert old slicing does **not** match expected value.
+
+
+## W1b - Homogeneous division guard pattern (2026-03-15)
+- Triangulation outputs in homogeneous coordinates must never divide by `w` unguarded.
+- Use a consistent threshold `w > 1e-8` before Euclidean conversion.
+- If `w <= 1e-8`, return `np.full(3, np.nan, dtype=np.float64)` as sentinel to avoid `inf` propagation and optimizer corruption.
+- Apply this guard at every triangulation conversion site (not just one phase) to prevent downstream instability in diagnostics and BA initialization.
+
+## W1c - Phase 1 gauge anchoring pattern (2026-03-15)
+- In two-camera Phase 1 BA, `cam_i` must remain outside the optimization vector to anchor gauge freedom.
+- Correct state vector layout is `[cam_j(6), pts_3d(N*3)]`; `cam_i` is always reconstructed as `np.zeros(6)` in residuals and outputs.
+- Jacobian sparsity must not allocate any `cam_i` columns; with one optimized camera, `pt_start` shifts from 12 to 6.
+- A robust regression test pattern is monkeypatching `least_squares` to force the first six optimized parameters non-zero; this fails on old layout and passes once `cam_i` is frozen.
+
+## W1d - Phase 3 gauge anchoring pattern (2026-03-15)
+- Global BA must freeze the first calibrated camera (`min(cam_id)`) outside the state vector to remove rigid gauge freedom.
+- Correct Phase 3 layout is `[free_cams(6 each), pts_3d]`; first camera is injected in residuals as `(R=I, t=0)` and output as `np.zeros(6)`.
+- Jacobian sparsity for first-camera reprojection rows should include only point columns (no camera columns), while free cameras keep camera+point coupling.
+- Regression test pattern: monkeypatch `least_squares` to force `x[:6]` non-zero and assert cam_0 remains exact zero while other cameras remain non-zero.
+
+## W2b - Smooth C∞ side barrier ported to wand BA (2026-03-15)
+- Replaced hard gated barrier branch (`if gap > 0 ... else 0`) with softplus/logaddexp smoothing in wand BA:
+  - `tau_eff = max(tau, 1e-12)`
+  - `gap_smooth = tau_eff * np.logaddexp(0.0, gap / tau_eff)`
+  - residual slots preserved as 2 per barrier point:
+    - `r_fix_const * (1.0 - np.exp(-gap_smooth / tau_eff))`
+    - `r_grad_const * gap_smooth`
+- Kept violation diagnostics behavior (`violations_count` still increments only for raw `gap > 0`).
+- Preserved point-radius-aware gap definition exactly: `gap = (margin_mm + r_val) - sX`.
+- Kept early/mid `soft_on` augmentation unchanged (additive soft floor on first barrier slot).
+- Added `TestBarrierResiduals` to `test_refractive_bootstrap.py` covering:
+  - feasible case (`gap < 0`) residuals near zero,
+  - violating case (`gap > 0`) residual positivity + monotonicity with larger radius,
+  - smooth no-kink behavior near `gap = 0` via left/right finite-difference derivative continuity check.
+
+## W3d - Huber loss in Phase 3 BA (2026-03-15)
+
+### Implementation Choice
+- Phase 3 BA uses `scipy.optimize.least_squares` with `method='trf'` at line 1171 of `refractive_bootstrap.py`.
+- The `trf` method natively supports `loss='huber'` — no manual residual transformation needed.
+- One-line change: added `loss='huber'` to the `least_squares` call. `f_scale=1.0` was already present (controls the Huber transition threshold).
+
+### Huber Loss Behavior (scipy)
+- scipy's Huber: `rho(z) = z` if `z <= 1`, else `2*sqrt(z) - 1`, where `z = (r/f_scale)^2`.
+- For small residuals (`|r| << f_scale`): identical to L2 least squares.
+- For large residuals (`|r| >> f_scale`): cost grows as `sqrt(z)` instead of `z`, strongly downweighting outliers.
+- `f_scale=1.0` means the transition between quadratic and linear behavior occurs at `|r| = 1.0` pixel.
+
+### Test Pattern
+- Monkeypatch `least_squares` to capture kwargs, assert `loss='huber'` and `f_scale > 0`.
+- Second test validates Huber mathematical properties: identity for small residuals, strong downweighting for large residuals.
+- Tests in `TestPhase3HuberLoss` class in `test_refractive_bootstrap.py`.
+
+### Results
+- 70 passed + 9 subtests, 0 failed (was 68 + 9 subtests before).

@@ -1172,6 +1172,7 @@ class PinholeBootstrapP0:
             residuals_phase3, x0,
             jac_sparsity=A_sparsity,
             method='trf',
+            loss='huber',
             x_scale='jac',
             f_scale=1.0,
             verbose=1,
