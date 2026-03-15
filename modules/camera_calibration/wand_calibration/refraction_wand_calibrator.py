@@ -483,20 +483,22 @@ class PlaneInitializer:
                 raise RuntimeError(f"Win {wid}: degenerate optical-axis average")
             n_win = n_win / nn
 
-            # Midpoint between camera reference and closest 3D point (no clamp).
+            # Robust plane-point initialization from all 3D points.
             dists = np.linalg.norm(X_arr - C_mean.reshape(1, 3), axis=1)
             if dists.size == 0:
                 raise RuntimeError(f"Win {wid}: no valid 3D points for midpoint initialization")
-            i_min = int(np.argmin(dists))
-            X_min = X_arr[i_min]
-            depth_med = float(dists[i_min])
+            plane_pt = np.median(X_arr, axis=0)
+            if not np.all(np.isfinite(plane_pt)):
+                raise RuntimeError(
+                    f"Win {wid}: plane_pt initialization failed — non-finite median of {len(X_arr)} points"
+                )
+            depth_med = float(np.median(dists))
             d0_mm = 0.5 * depth_med
-            plane_pt = 0.5 * (C_mean + X_min)
             thick_mm = window_media.get(wid, {}).get('thickness', 10.0)
 
             if verbose:
-                print(f"  X_min (closest to C_mean) = {X_min.round(2)}")
-                print(f"  depth_min = {depth_med:.1f} mm, midpoint d0 = {d0_mm:.1f} mm")
+                print(f"  plane_pt (median init) = {plane_pt.round(2)}")
+                print(f"  depth_med = {depth_med:.1f} mm, midpoint d0 = {d0_mm:.1f} mm")
                 print(f"  n_win (axis-parallel init) = {n_win.round(4)}")
                 print(f"  plane_pt (midpoint init) = {plane_pt.round(2)}")
 
@@ -2221,7 +2223,7 @@ class RefractiveWandCalibrator:
         # === Phase: Bundle Adjustment (Selective BA) ===
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
         # [USER REQUEST] Re-estimate Radii with latest params (P1 result)
-        # rs_pr4, rl_pr4 = 1.5, 2.0 # Defaults
+        rs_pr4, rl_pr4 = 1.5, 2.0  # Defaults
         if X_A_scaled and X_B_scaled:
             rs, rl = self._estimate_and_log_sphere_radii(
                 dataset, cam_params, X_A_scaled, X_B_scaled, tag="BA Pre-Calc", cams_cpp=cams_cpp

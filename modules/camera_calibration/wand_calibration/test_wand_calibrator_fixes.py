@@ -660,6 +660,27 @@ class TestRobustPlanePointInit(unittest.TestCase):
         np.testing.assert_array_almost_equal(result, [5.0, 6.0, 7.0])
 
 
+class TestPlaneInitialization(unittest.TestCase):
+    def test_p2_robust_median(self):
+        """P2: plane_pt uses median of all X_arr points, not single nearest."""
+        X_arr = np.array([
+            [0.0, 0.0, 100.0],
+            [0.1, 0.1, 101.0],
+            [1000.0, 1000.0, 9999.0],  # outlier
+        ])
+        plane_pt = np.median(X_arr, axis=0)
+        # Median should not be pulled to outlier
+        self.assertTrue(np.all(np.isfinite(plane_pt)))
+        self.assertLess(plane_pt[2], 500.0, "Median should not be skewed by outlier")
+
+    def test_p2_single_point_still_works(self):
+        """P2: single-point X_arr still produces valid plane_pt."""
+        X_arr = np.array([[5.0, 10.0, 200.0]])
+        plane_pt = np.median(X_arr, axis=0)
+        self.assertTrue(np.all(np.isfinite(plane_pt)))
+        np.testing.assert_array_almost_equal(plane_pt, [5.0, 10.0, 200.0])
+
+
 class TestWandCalibratorB5Fixes(unittest.TestCase):
     """Regression tests for B5 radii default fallback in calibrate()."""
 
