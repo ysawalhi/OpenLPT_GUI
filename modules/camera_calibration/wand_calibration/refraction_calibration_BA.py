@@ -67,6 +67,9 @@ class RefractiveCalibReporter:
     def detail(self, message: str):
         print(message)
 
+    def warning(self, message: str):
+        print(f"[WARN] {message}")
+
 
 class CppSyncAdapter:
     @staticmethod
