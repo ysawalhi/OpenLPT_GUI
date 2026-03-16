@@ -1037,13 +1037,12 @@ class RefractiveBAOptimizer:
                 gap = (margin_mm + r_val) - sX
                 if gap > 0:
                     violations_count += 1
-                    # Violation: Smooth Step + Gradient
-                    res_barrier_fixed[curr_b_idx] = r_fix_const * (1.0 - np.exp(-gap / tau))
-                    res_barrier_fixed[curr_b_idx + 1] = r_grad_const * gap
-                else:
-                    # Feasible
-                    res_barrier_fixed[curr_b_idx] = 0.0
-                    res_barrier_fixed[curr_b_idx + 1] = 0.0
+
+                # Smooth C∞ barrier (softplus approximation of max(gap, 0))
+                tau_eff = max(tau, 1e-12)
+                gap_smooth = tau_eff * np.logaddexp(0.0, gap / tau_eff)
+                res_barrier_fixed[curr_b_idx] = r_fix_const * (1.0 - np.exp(-gap_smooth / tau_eff))
+                res_barrier_fixed[curr_b_idx + 1] = r_grad_const * gap_smooth
 
                 # Soft floor guidance in early/mid stages.
                 if soft_on:
