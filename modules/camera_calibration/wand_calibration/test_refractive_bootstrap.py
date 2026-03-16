@@ -1670,3 +1670,22 @@ class TestBareExceptReplaced:
         assert call_count[0] >= 1, "broken_callback must have been called"
         assert params_i is not None, "run() should complete despite callback errors"
 
+
+# ============================================================================
+# TEST: Dead Code Removal (W4a-T1)
+# ============================================================================
+
+
+class TestDeadCodeRemoved:
+    """Verify that unused methods _ray_dir_world and _point_to_ray_dist were removed."""
+
+    def test_ray_dir_world_removed(self):
+        """Method _ray_dir_world must not exist in PinholeBootstrapP0."""
+        assert not hasattr(PinholeBootstrapP0, "_ray_dir_world"), \
+            "_ray_dir_world should have been removed from PinholeBootstrapP0"
+
+    def test_point_to_ray_dist_removed(self):
+        """Method _point_to_ray_dist must not exist in PinholeBootstrapP0."""
+        assert not hasattr(PinholeBootstrapP0, "_point_to_ray_dist"), \
+            "_point_to_ray_dist should have been removed from PinholeBootstrapP0"
+

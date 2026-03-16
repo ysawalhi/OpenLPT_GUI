@@ -608,28 +608,7 @@ class PinholeBootstrapP0:
         pt_px = K[:2, :2] @ pt_norm + K[:2, 2]
         return pt_px
 
-    def _ray_dir_world(self, uv: np.ndarray, K: np.ndarray, R: np.ndarray) -> np.ndarray:
-        """Build world-space pinhole ray direction from pixel coordinate."""
-        fx = float(K[0, 0])
-        fy = float(K[1, 1])
-        cx = float(K[0, 2])
-        cy = float(K[1, 2])
-        x = (float(uv[0]) - cx) / max(abs(fx), 1e-12)
-        y = (float(uv[1]) - cy) / max(abs(fy), 1e-12)
-        d_cam = np.array([x, y, 1.0], dtype=np.float64)
-        d_cam /= (np.linalg.norm(d_cam) + 1e-12)
-        d_world = R.T @ d_cam
-        d_world /= (np.linalg.norm(d_world) + 1e-12)
-        return d_world
 
-    def _point_to_ray_dist(self, X: np.ndarray, C: np.ndarray, d: np.ndarray) -> float:
-        """Distance from 3D point to 3D ray (half-line), in mm."""
-        v = X - C
-        t = float(np.dot(v, d))
-        if t < 0.0:
-            return float(np.linalg.norm(v))
-        return float(np.linalg.norm(v - t * d))
-    
     def _collect_valid_frames(
         self,
         observations: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray]]],
