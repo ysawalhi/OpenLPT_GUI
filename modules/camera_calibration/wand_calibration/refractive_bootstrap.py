@@ -492,7 +492,7 @@ class PinholeBootstrapP0:
             verbose=1,
             ftol=self.config.ftol,
             xtol=self.config.xtol,
-            max_nfev=2000,
+            max_nfev=1000,
         )
 
         if not result.success and result.cost > 1e8:
