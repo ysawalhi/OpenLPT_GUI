@@ -6621,6 +6621,7 @@ class CameraCalibrationView(QWidget):
         self._refr_cost_values = []
         self._refr_len_values = []
         self._refr_proj_values = []
+        self._refr_proj_iterations = []
         self._refr_cost_line, = self._refr_cost_ax.plot([], [], color='#2196F3', marker='o', markersize=3, linewidth=1.5, alpha=0.85, label='Ray')
         self._refr_len_line, = self._refr_cost_ax.plot([], [], 'orange', marker='s', markersize=3, linewidth=1.5, alpha=0.8, linestyle='--', label='Len')
         self._refr_proj_line, = self._refr_proj_ax.plot([], [], color='#ff5bd2', marker='^', markersize=3, linewidth=1.5, alpha=0.85, linestyle='-.', label='Proj')
@@ -6680,13 +6681,13 @@ class CameraCalibrationView(QWidget):
         self._refr_cost_ax.yaxis.tick_left()
         self._refr_cost_ax.yaxis.label.set_visible(True)
         self._refr_cost_ax.yaxis.label.set_clip_on(False)
-        self._refr_cost_ax.yaxis.set_label_coords(-0.08, 0.5)
+        self._refr_cost_ax.yaxis.set_label_coords(-0.11, 0.5)
 
         self._refr_proj_ax.yaxis.set_label_position('right')
         self._refr_proj_ax.yaxis.tick_right()
         self._refr_proj_ax.yaxis.label.set_visible(show_proj)
         self._refr_proj_ax.yaxis.label.set_clip_on(False)
-        self._refr_proj_ax.yaxis.set_label_coords(1.03, 0.5)
+        self._refr_proj_ax.yaxis.set_label_coords(1.1, 0.5)
         self._refr_proj_ax.tick_params(axis='y', which='both', right=show_proj, labelright=show_proj)
         self._refr_proj_ax.spines['right'].set_visible(show_proj)
         self._refr_proj_ax.set_visible(show_proj)
@@ -6702,7 +6703,8 @@ class CameraCalibrationView(QWidget):
 
         phase_l = str(phase).lower() if phase is not None else ""
         is_p0 = ("p0" in phase_l) or ("pinhole model" in phase_l)
-        self._refr_force_show_proj_for_p0 = bool(is_p0)
+        if is_p0:
+            self._refr_force_show_proj_for_p0 = True
         
         # Only update metrics buffer if it's a real cost update (not evaluating placeholder)
         if cost > 0:
@@ -6748,7 +6750,10 @@ class CameraCalibrationView(QWidget):
                 self._refr_len_label.setText(f"Len: {len_rmse:.4f} mm")
 
             if show_proj and hasattr(self, '_refr_proj_label'):
-                self._refr_proj_label.setText(f"Proj: {proj_rmse:.4f} px")
+                if proj_rmse is None or proj_rmse <= 0:
+                    self._refr_proj_label.setText("Proj: N.A.")
+                else:
+                    self._refr_proj_label.setText(f"Proj: {proj_rmse:.4f} px")
 
             # Update plot
             if hasattr(self, '_refr_cost_iterations'):
@@ -6760,7 +6765,10 @@ class CameraCalibrationView(QWidget):
                     self._refr_cost_values.append(ray_rmse)
                 self._refr_len_values.append(len_rmse)
                 if show_proj:
-                    self._refr_proj_values.append(max(float(proj_rmse), 1e-12))
+                    proj_valid = not (proj_rmse is None or proj_rmse <= 0)
+                    if proj_valid:
+                        self._refr_proj_iterations.append(iteration)
+                        self._refr_proj_values.append(float(proj_rmse))
 
                 if hasattr(self, '_refr_cost_line'):
                     self._refr_cost_line.set_visible(bool(ray_valid))
@@ -6768,7 +6776,7 @@ class CameraCalibrationView(QWidget):
                 self._refr_cost_line.set_data(self._refr_cost_iterations, self._refr_cost_values)
                 self._refr_len_line.set_data(self._refr_cost_iterations, self._refr_len_values)
                 if show_proj:
-                    self._refr_proj_line.set_data(self._refr_cost_iterations, self._refr_proj_values)
+                    self._refr_proj_line.set_data(self._refr_proj_iterations, self._refr_proj_values)
 
                 # Keep axis styling stable across redraws.
                 self._refr_cost_ax.set_xlabel('Iteration', color='white', fontsize=9)

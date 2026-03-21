@@ -52,3 +52,12 @@ tmp/
 build-tests
 
 test/
+
+# ignore everything
+.sisyphus/*
+
+# but keep plans folder
+!.sisyphus/plans/
+!.sisyphus/plans/**
+
+scripts/

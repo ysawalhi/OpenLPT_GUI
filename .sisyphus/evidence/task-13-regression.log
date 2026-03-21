@@ -1,8 +1,0 @@
-============================= test session starts =============================
-platform win32 -- Python 3.11.14, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\tan_s\miniconda3\envs\OpenLPT\python.exe
-cachedir: .pytest_cache
-rootdir: D:\0.Code\OpenLPTGUI\OpenLPT
-configfile: pyproject.toml
-collecting ... collected 0 items
-
-============================ no tests ran in 0.80s ============================
