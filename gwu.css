@@ -1,0 +1,418 @@
+/* @theme gwu */
+
+/*
+  GWU Brand Marp Theme
+  ─────────────────────────────────────────────────
+  Colors
+    GW Blue    #033C5A   (primary headings, bars)
+    GW Buff    #D6BF91   (warm accent)
+    Buff 20%   #F6F1E8   (code bg, subtle fills)
+    Potomac    #0075C8   (links, h3, highlights)
+    Potomac 20%#CCE3F4   (inline code bg)
+    Navy Yard  #00223E   (code block bg, dark slides)
+    White      #ffffff
+
+  Fonts (Google Fonts approximations)
+    Merriweather  → Gazzetta (headline serif)
+    Nunito Sans   → Avenir Next (body sans-serif)
+    Source Serif 4→ Source Serif (accent serif)
+*/
+
+@import url('https://fonts.googleapis.com/css2?family=Merriweather:ital,wght@0,300;0,400;0,700;0,900;1,300;1,400&family=Nunito+Sans:ital,wght@0,300;0,400;0,600;0,700;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Root variables ─────────────────────────────── */
+:root {
+  --gw-blue:       #033C5A;
+  --gw-buff:       #D6BF91;
+  --gw-buff-80:    #DAC8A3;
+  --gw-buff-20:    #F6F1E8;
+  --potomac:       #0075C8;
+  --potomac-20:    #CCE3F4;
+  --navy-yard:     #00223E;
+  --row-house:     #EF4343;
+  --white:         #ffffff;
+  --text-body:     #2c2c2c;
+  --text-subtle:   #555555;
+}
+
+/* ── Base slide ─────────────────────────────────── */
+section {
+  font-family: 'Nunito Sans', 'Avenir Next', 'Avenir', sans-serif;
+  font-size: 28px;
+  font-weight: 400;
+  line-height: 1.55;
+  color: var(--text-body);
+  background-color: var(--white);
+  width: 1280px;
+  height: 720px;
+  padding: 60px 72px 72px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  overflow: hidden;
+  position: relative;
+  box-sizing: border-box;
+}
+
+/* Bottom accent bar — only on slides with pagination enabled */
+section[data-marpit-pagination]::before {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  background: linear-gradient(to right, var(--gw-blue) 88%, var(--gw-buff) 88%);
+  z-index: 1;
+}
+
+/* ── Pagination ──────────────────────────────────── */
+/* Marp sets content via section[data-marpit-pagination]::after automatically.
+   Position it inside the bar so number and bar form one integrated element.  */
+section[data-marpit-pagination]::after {
+  font-family: 'Nunito Sans', sans-serif;
+  font-size: 0.8em;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.8);
+  letter-spacing: 0.05em;
+  position: absolute;
+  bottom: -75px;  /* centers ~13px text within the 32px bar */
+  right: 0px;
+  z-index: 2;
+}
+
+/* ── Headings ────────────────────────────────────── */
+h1, h2 {
+  font-family: 'Merriweather', 'Georgia', serif;
+  color: var(--gw-blue);
+  line-height: 1.2;
+  margin: 0.5em 0 0.5em;
+}
+
+h1 {
+  font-size: 1.85em;
+  font-weight: 700;
+}
+
+h2 {
+  font-size: 1.35em;
+  font-weight: 700;
+}
+
+h3 {
+  font-family: 'Nunito Sans', sans-serif;
+  font-size: 1em;
+  font-weight: 700;
+  color: var(--potomac);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin: 0.7em 0 0.25em;
+}
+
+/* Buff underline accent after slide title */
+h1::after {
+  content: '';
+  display: block;
+  width: 52px;
+  height: 4px;
+  background-color: var(--gw-buff);
+  margin-top: 0.35em;
+  border-radius: 2px;
+}
+
+/* ── Body text ───────────────────────────────────── */
+p {
+  margin: 0.4em 0;
+}
+
+strong {
+  font-weight: 700;
+  color: var(--gw-blue);
+}
+
+em {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-style: italic;
+}
+
+a {
+  color: var(--potomac);
+  text-decoration: none;
+}
+
+/* ── Lists ───────────────────────────────────────── */
+ul, ol {
+  padding-left: 2.4em;
+  margin: 0.3em 0;
+}
+
+li {
+  margin-bottom: 0.35em;
+  line-height: 1.5;
+}
+
+ul li::marker {
+  color: var(--gw-buff-80);
+}
+
+/* ── Blockquote ──────────────────────────────────── */
+blockquote {
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-style: italic;
+  font-size: 1.5em;
+  color: var(--gw-blue);
+  border-left: 4px solid var(--gw-buff);
+  margin: 0.6em 0;
+  padding: 0.3em 0 0.3em 1em;
+  background-color: var(--gw-buff-20);
+  border-radius: 0 4px 4px 0;
+}
+
+/* ── Code ────────────────────────────────────────── */
+code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  font-size: 0.8em;
+  background-color: var(--potomac-20);
+  color: var(--navy-yard);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+
+pre {
+  background-color: var(--navy-yard);
+  border-left: 5px solid var(--gw-buff);
+  border-radius: 0 6px 6px 0;
+  padding: 1em 1.2em;
+  margin: 0.6em 0;
+  overflow: hidden;
+  font-size: 0.72em;
+  line-height: 1.55;
+}
+
+pre code {
+  background: none;
+  color: #e8dfc8;   /* warm off-white — readable on Navy Yard */
+  padding: 0;
+  font-size: 1em;
+}
+
+/* Marp / highlight.js token colors (Navy Yard bg palette) */
+pre .hljs-keyword,
+pre .hljs-built_in        { color: #7FBAE3; }   /* Potomac 50% */
+pre .hljs-string          { color: #D6BF91; }   /* GW Buff */
+pre .hljs-number          { color: #ADCAB8; }   /* Patina */
+pre .hljs-comment         { color: #8a9aa8; font-style: italic; }
+pre .hljs-function,
+pre .hljs-title           { color: #D1A0B9; }   /* Blossom */
+pre .hljs-params          { color: #e8dfc8; }
+
+/* ── Tables ──────────────────────────────────────── */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.82em;
+  margin: 0.6em 0;
+}
+
+thead tr {
+  background-color: var(--gw-blue);
+  color: var(--white);
+}
+
+th {
+  padding: 0.5em 0.8em;
+  text-align: left;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+td {
+  padding: 0.4em 0.8em;
+  border-bottom: 1px solid var(--gw-buff-80);
+}
+
+tbody tr:nth-child(even) td {
+  background-color: var(--gw-buff-20);
+}
+
+/* ── MathJax / KaTeX ─────────────────────────────── */
+mjx-container,
+.katex {
+  color: inherit;
+  font-size: 1em;
+}
+
+
+/* ══════════════════════════════════════════════════
+   VARIANT: Title / Cover slide
+   Usage: <!-- _class: title -->
+   GW Blue bg, Buff headings, centered layout
+   ══════════════════════════════════════════════════ */
+section.title {
+  background-color: var(--gw-blue);
+  color: rgba(255, 255, 255, 0.9);
+  justify-content: center;
+}
+
+section.title[data-marpit-pagination]::before {
+  background: linear-gradient(to right, var(--gw-buff) 88%, var(--potomac) 88%);
+}
+
+section.title h1 {
+  color: var(--white);
+  font-size: 2em;
+  font-weight: 900;
+}
+
+section.title h1::after {
+  background-color: var(--gw-buff);
+  width: 70px;
+  height: 5px;
+  margin-top: 0.4em;
+}
+
+section.title h2 {
+  font-family: 'Nunito Sans', sans-serif;
+  font-size: 1.05em;
+  font-weight: 400;
+  color: var(--gw-buff);
+  margin-top: 0.5em;
+}
+
+section.title h2::after { display: none; }
+
+section.title h3 {
+  color: rgba(255, 255, 255, 0.65);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  font-size: 0.9em;
+  margin-top: 0.8em;
+}
+
+section.title p {
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.9em;
+}
+
+section.title a        { color: var(--gw-buff); }
+section.title strong   { color: var(--gw-buff); }
+section.title code     { background-color: rgba(255,255,255,0.12); color: var(--gw-buff); }
+
+
+
+/* ══════════════════════════════════════════════════
+   VARIANT: Section divider
+   Usage: <!-- _class: section -->
+   Navy Yard bg, centered, Buff headings
+   ══════════════════════════════════════════════════ */
+section.section {
+  background-color: var(--navy-yard);
+  color: rgba(255, 255, 255, 0.85);
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+
+section.section[data-marpit-pagination]::before {
+  background: linear-gradient(to right, var(--gw-buff) 88%, var(--potomac) 88%);
+}
+
+section.section h1,
+section.section h2 {
+  color: var(--gw-buff);
+  text-align: center;
+}
+
+section.section h1::after,
+section.section h2::after {
+  margin: 0.4em auto 0;
+  background-color: var(--potomac);
+}
+
+section.section p {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.9em;
+}
+
+
+
+/* ══════════════════════════════════════════════════
+   VARIANT: Dark content slide
+   Usage: <!-- _class: dark -->
+   GW Blue bg, readable on dark
+   ══════════════════════════════════════════════════ */
+section.dark {
+  background-color: var(--gw-blue);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+section.dark[data-marpit-pagination]::before {
+  background: linear-gradient(to right, var(--gw-buff) 88%, var(--potomac) 88%);
+}
+
+section.dark h1,
+section.dark h2 { color: var(--gw-buff); }
+section.dark h1::after,
+section.dark h2::after { background-color: rgba(255,255,255,0.35); }
+section.dark h3        { color: var(--potomac-20); }
+section.dark strong    { color: var(--gw-buff); }
+section.dark a         { color: #7FBAE3; }
+
+section.dark code {
+  background-color: rgba(255,255,255,0.12);
+  color: var(--gw-buff);
+}
+
+section.dark pre {
+  background-color: var(--navy-yard);
+}
+
+section.dark table thead tr { background-color: var(--navy-yard); }
+section.dark tbody tr:nth-child(even) td { background-color: rgba(0,0,0,0.25); }
+section.dark td { border-color: rgba(255,255,255,0.15); }
+
+
+
+/* ══════════════════════════════════════════════════
+   VARIANT: Impact slide
+   Usage: <!-- _class: impact -->
+   Row House red bg, large centered white Merriweather
+   ══════════════════════════════════════════════════ */
+section.impact {
+  background-color: var(--row-house);
+  color: var(--white);
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  padding: 60px 100px;
+}
+
+section.impact[data-marpit-pagination]::before {
+  background: linear-gradient(to right, var(--navy-yard) 88%, var(--gw-buff) 88%);
+}
+
+section.impact h1,
+section.impact h2 {
+  font-family: 'Merriweather', 'Georgia', serif;
+  color: var(--white);
+  font-size: 2.4em;
+  font-weight: 900;
+  line-height: 1.25;
+  text-align: center;
+  margin: 0;
+}
+
+section.impact h1::after,
+section.impact h2::after { display: none; }
+
+section.impact p {
+  font-family: 'Merriweather', 'Georgia', serif;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 1em;
+  font-weight: 300;
+  font-style: italic;
+  margin-top: 0.8em;
+  text-align: center;
+}
+
